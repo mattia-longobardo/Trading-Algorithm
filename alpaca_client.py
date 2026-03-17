@@ -1,0 +1,351 @@
+"""Alpaca trading and market data client wrappers."""
+
+from __future__ import annotations
+
+import logging
+import math
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import uuid4
+
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.enums import DataFeed
+from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, ReplaceOrderRequest, StopLossRequest, TakeProfitRequest, TrailingStopOrderRequest
+
+from utils import AppConfig, retry, utc_now
+
+
+class AlpacaClient:
+    """Thin wrapper around alpaca-py with retries and normalization."""
+
+    def __init__(self, config: AppConfig, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger.getChild("alpaca")
+        self.trading_client = TradingClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key,
+            paper=config.paper,
+            raw_data=False,
+        )
+        self.stock_data_client = StockHistoricalDataClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key,
+        )
+        self.crypto_data_client = CryptoHistoricalDataClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key,
+        )
+
+    @retry()
+    def get_account(self) -> Any:
+        self.logger.debug("Fetching Alpaca account details")
+        return self.trading_client.get_account()
+
+    def get_available_cash(self) -> float:
+        account = self.get_account()
+        return float(getattr(account, "cash", 0.0) or 0.0)
+
+    @retry()
+    def list_assets(self, asset_class: str) -> list[Any]:
+        request = GetAssetsRequest(asset_class=AssetClass[asset_class])
+        self.logger.debug("Listing Alpaca assets for class %s", asset_class)
+        return self.trading_client.get_all_assets(request)
+
+    @retry()
+    def list_orders(self, status: QueryOrderStatus = QueryOrderStatus.ALL, nested: bool = True) -> list[Any]:
+        request = GetOrdersRequest(status=status, nested=nested, after=utc_now() - timedelta(days=30))
+        return self.trading_client.get_orders(filter=request)
+
+    @retry()
+    def get_order(self, order_id: str) -> Any:
+        self.logger.debug("Fetching order %s", order_id)
+        return self.trading_client.get_order_by_id(order_id, nested=True)
+
+    @retry()
+    def get_open_position(self, symbol: str) -> Any | None:
+        try:
+            return self.trading_client.get_open_position(symbol)
+        except Exception as exc:
+            if "position does not exist" in str(exc).lower():
+                return None
+            raise
+
+    @retry()
+    def close_position_market(self, symbol: str) -> Any:
+        self.logger.info("Closing position at market for %s", symbol)
+        return self.trading_client.close_position(symbol)
+
+    @retry()
+    def cancel_order(self, order_id: str) -> None:
+        self.logger.info("Cancelling order %s", order_id)
+        self.trading_client.cancel_order_by_id(order_id)
+
+    @retry()
+    def replace_order(self, order_id: str, limit_price: float | None = None, stop_price: float | None = None) -> Any:
+        self.logger.info("Replacing order %s", order_id)
+        request = ReplaceOrderRequest(limit_price=limit_price, stop_price=stop_price)
+        return self.trading_client.replace_order_by_id(order_id, order_data=request)
+
+    def _order_type_name(self, order: Any) -> str:
+        return str(getattr(order, "type", getattr(order, "order_type", ""))).lower()
+
+    def _order_status_name(self, order: Any) -> str:
+        return str(getattr(order, "status", "")).lower()
+
+    def _is_cancelable_order(self, order: Any) -> bool:
+        return self._order_status_name(order) not in {"filled", "canceled", "cancelled", "expired", "rejected", "replaced"}
+
+    def _classify_exit_leg(self, order: Any) -> str | None:
+        order_type = self._order_type_name(order)
+        if "stop" in order_type:
+            return "stop_loss"
+        if "limit" in order_type:
+            return "take_profit"
+        return None
+
+    def get_order_legs(self, order_id: str) -> dict[str, Any]:
+        order = self.get_order(order_id)
+        classified: dict[str, Any] = {"parent": order}
+        for leg in getattr(order, "legs", None) or []:
+            leg_kind = self._classify_exit_leg(leg)
+            if leg_kind and leg_kind not in classified:
+                classified[leg_kind] = leg
+        return classified
+
+    def cancel_order_chain(self, order_id: str) -> None:
+        orders = self.get_order_legs(order_id)
+        for leg_name in ("take_profit", "stop_loss"):
+            leg = orders.get(leg_name)
+            if leg and self._is_cancelable_order(leg):
+                self.cancel_order(str(getattr(leg, "id")))
+        parent = orders["parent"]
+        if self._is_cancelable_order(parent):
+            self.cancel_order(str(getattr(parent, "id")))
+
+    def replace_bracket_exit_orders(
+        self,
+        parent_order_id: str,
+        take_profit: float | None = None,
+        stop_loss: float | None = None,
+    ) -> dict[str, Any]:
+        orders = self.get_order_legs(parent_order_id)
+        replacements: dict[str, Any] = {}
+        if take_profit is not None:
+            take_profit_leg = orders.get("take_profit")
+            if take_profit_leg is None:
+                raise ValueError(f"Bracket order {parent_order_id} has no take-profit leg to replace")
+            replacements["take_profit"] = self.replace_order(
+                str(getattr(take_profit_leg, "id")),
+                limit_price=take_profit,
+            )
+        if stop_loss is not None:
+            stop_loss_leg = orders.get("stop_loss")
+            if stop_loss_leg is None:
+                raise ValueError(f"Bracket order {parent_order_id} has no stop-loss leg to replace")
+            replacements["stop_loss"] = self.replace_order(
+                str(getattr(stop_loss_leg, "id")),
+                stop_price=stop_loss,
+            )
+        return replacements
+
+    def _time_in_force_for_category(self, category: str) -> TimeInForce:
+        return TimeInForce.GTC if category == "CRYPTO" else TimeInForce.DAY
+
+    def _protection_time_in_force_for_category(self, category: str) -> TimeInForce:
+        return TimeInForce.GTC
+
+    def _calculate_quantity(self, symbol_price: float, allocated_capital: float, category: str) -> float:
+        if symbol_price <= 0:
+            raise ValueError("symbol_price must be positive")
+        raw_qty = allocated_capital / symbol_price
+        if category == "STOCK":
+            return math.floor(raw_qty * 1000000) / 1000000
+        return math.floor(raw_qty * 1000000) / 1000000
+
+    def supports_advanced_orders(self, category: str, quantity: float | None = None) -> bool:
+        if category == "CRYPTO":
+            return False
+        if quantity is None:
+            return True
+        return float(quantity).is_integer()
+
+    def supports_broker_side_trailing_stop(self, category: str, quantity: float | None = None) -> bool:
+        if category == "CRYPTO":
+            return False
+        if quantity is None:
+            return True
+        return float(quantity).is_integer()
+
+    @retry()
+    def place_limit_entry_order(
+        self,
+        symbol: str,
+        category: str,
+        entry_price: float,
+        allocated_capital: float,
+    ) -> dict[str, Any]:
+        qty = self._calculate_quantity(entry_price, allocated_capital, category)
+        if qty <= 0:
+            raise ValueError(f"Allocated capital {allocated_capital} is insufficient to buy any quantity of {symbol} at {entry_price}")
+        client_order_id = f"entry-{symbol.replace('/', '-')}-{uuid4().hex[:18]}"
+        order = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=self._time_in_force_for_category(category),
+            limit_price=entry_price,
+            client_order_id=client_order_id,
+        )
+        self.logger.info("Submitting simple limit entry order for %s (%s)", symbol, category)
+        submitted = self.trading_client.submit_order(order_data=order)
+        return {"order": submitted, "quantity": qty, "client_order_id": client_order_id}
+
+    @retry()
+    def place_limit_bracket_order(
+        self,
+        symbol: str,
+        category: str,
+        entry_price: float,
+        take_profit: float,
+        stop_loss: float,
+        allocated_capital: float,
+    ) -> dict[str, Any]:
+        qty = self._calculate_quantity(entry_price, allocated_capital, category)
+        if qty <= 0:
+            raise ValueError(f"Allocated capital {allocated_capital} is insufficient to buy any quantity of {symbol} at {entry_price}")
+        client_order_id = f"bot-{symbol.replace('/', '-')}-{uuid4().hex[:18]}"
+        if self.supports_advanced_orders(category, qty):
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=self._time_in_force_for_category(category),
+                limit_price=entry_price,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit),
+                stop_loss=StopLossRequest(stop_price=stop_loss),
+                client_order_id=client_order_id,
+                extended_hours=False,
+            )
+            self.logger.info("Submitting bracket order for %s (%s)", symbol, category)
+        else:
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=self._time_in_force_for_category(category),
+                limit_price=entry_price,
+                client_order_id=client_order_id,
+            )
+            self.logger.info(
+                "Submitting simple limit entry for %s (%s); advanced bracket order not available for this quantity/category",
+                symbol,
+                category,
+            )
+        submitted = self.trading_client.submit_order(order_data=order)
+        return {"order": submitted, "quantity": qty, "client_order_id": client_order_id}
+
+    @retry()
+    def place_market_exit_order(self, symbol: str, quantity: float, category: str) -> Any:
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            side=OrderSide.SELL,
+            time_in_force=self._time_in_force_for_category(category),
+            client_order_id=f"exit-{symbol.replace('/', '-')}-{uuid4().hex[:18]}",
+        )
+        self.logger.info("Submitting market exit order for %s", symbol)
+        return self.trading_client.submit_order(order_data=order)
+
+    @retry()
+    def place_trailing_stop_order(self, symbol: str, quantity: float, category: str, trail_price: float) -> dict[str, Any]:
+        if trail_price <= 0:
+            raise ValueError("trail_price must be positive")
+        client_order_id = f"trail-{symbol.replace('/', '-')}-{uuid4().hex[:18]}"
+        order = TrailingStopOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            side=OrderSide.SELL,
+            type=OrderType.TRAILING_STOP,
+            time_in_force=self._protection_time_in_force_for_category(category),
+            trail_price=trail_price,
+            client_order_id=client_order_id,
+        )
+        self.logger.info("Submitting trailing stop order for %s with trail price %s", symbol, trail_price)
+        submitted = self.trading_client.submit_order(order_data=order)
+        return {"order": submitted, "client_order_id": client_order_id}
+
+    @retry()
+    def replace_trailing_stop_order(self, order_id: str, trail_price: float) -> Any:
+        if trail_price <= 0:
+            raise ValueError("trail_price must be positive")
+        self.logger.info("Replacing trailing stop order %s with trail price %s", order_id, trail_price)
+        request = ReplaceOrderRequest(trail=trail_price)
+        return self.trading_client.replace_order_by_id(order_id, order_data=request)
+
+    @retry()
+    def get_bars(self, symbol: str, category: str, start: datetime, end: datetime | None = None) -> list[dict[str, Any]]:
+        end = end or utc_now()
+        if category == "STOCK":
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+                feed=DataFeed.IEX,
+            )
+            bars = self.stock_data_client.get_stock_bars(request)
+        else:
+            request = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end)
+            bars = self.crypto_data_client.get_crypto_bars(request)
+
+        frame = bars.df.reset_index() if hasattr(bars, "df") else []
+        normalized: list[dict[str, Any]] = []
+        if len(frame) == 0:
+            return normalized
+        for _, row in frame.iterrows():
+            normalized.append(
+                {
+                    "symbol": symbol,
+                    "timestamp": row["timestamp"].to_pydatetime().astimezone(UTC).isoformat(),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+            )
+        self.logger.debug("Downloaded %s bars for %s", len(normalized), symbol)
+        return normalized
+
+    def infer_close_reason(self, order: Any) -> str:
+        """Infer the close reason from nested orders when possible."""
+
+        order_type = self._order_type_name(order)
+        if "trailing" in order_type and self._order_status_name(order) == str(OrderStatus.FILLED).lower():
+            return "TRAILING_STOP"
+        legs = getattr(order, "legs", None) or []
+        for leg in legs:
+            leg_type = self._order_type_name(leg)
+            status = self._order_status_name(leg)
+            if status != str(OrderStatus.FILLED).lower():
+                continue
+            if "limit" in leg_type:
+                return "TAKE_PROFIT"
+            if "stop" in leg_type:
+                return "STOP_LOSS"
+        return "GPT_SIGNAL"
+
+    def supports_eur(self, symbol: str) -> bool:
+        """Best-effort currency support check."""
+
+        if self.config.currency != "EUR":
+            return False
+        if "/" in symbol and symbol.endswith("/USD"):
+            return False
+        return False

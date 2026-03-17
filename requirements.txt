@@ -1,0 +1,9 @@
+alpaca-py
+openai
+apscheduler
+python-dotenv
+pandas
+numpy
+requests
+filelock
+pytz
