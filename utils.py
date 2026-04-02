@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from uuid import uuid4
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -14,7 +15,8 @@ from typing import Any, Callable, TypeVar
 from dotenv import load_dotenv
 
 F = TypeVar("F", bound=Callable[..., Any])
-UNIVERSE_FILE = Path("data/universe.json")
+BASE_DIR = Path(__file__).resolve().parent
+UNIVERSE_FILE = BASE_DIR / "data/universe.json"
 
 
 @dataclass(slots=True)
@@ -29,23 +31,43 @@ class AppConfig:
     max_open_trades_crypto: int = 3
     weekly_universe_stocks: int = 5
     weekly_universe_crypto: int = 5
+    risk_tolerance: int = 5
     currency: str = "EUR"
+    strategy_horizon_days_min: int = 90
+    strategy_horizon_days_max: int = 120
+    log_profile: str = "PRODUCTION"
     log_level: str = "INFO"
     log_file: str = "logs/trading_bot.log"
     universe_log_file: str = "logs/universe_candidates.log"
+    report_dir: str = "data/reports"
     db_market_data: str = "data/market_data.sqlite"
     db_trades: str = "data/trades.sqlite"
     lock_file: str = "run/trading_scheduler.lock"
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
 
     @property
     def paper(self) -> bool:
         return "paper" in self.alpaca_base_url.lower() or "sandbox" in self.alpaca_base_url.lower()
+
+    @property
+    def debug_logging(self) -> bool:
+        return self.log_profile.upper() == "DEBUG" or self.log_level.upper() == "DEBUG"
 
 
 def ensure_parent_dir(file_path: str | Path) -> None:
     """Create the parent directory for a file path if it does not exist."""
 
     Path(file_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_runtime_path(file_path: str | Path) -> str:
+    """Resolve application runtime files relative to the project root."""
+
+    candidate = Path(file_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    return str(candidate.resolve())
 
 
 def load_config() -> AppConfig:
@@ -61,16 +83,30 @@ def load_config() -> AppConfig:
         max_open_trades_crypto=int(os.getenv("MAX_OPEN_TRADES_CRYPTO", "3")),
         weekly_universe_stocks=int(os.getenv("WEEKLY_UNIVERSE_STOCKS", "5")),
         weekly_universe_crypto=int(os.getenv("WEEKLY_UNIVERSE_CRYPTO", "5")),
+        risk_tolerance=max(1, min(10, int(os.getenv("RISK_TOLERANCE", "5")))),
         currency=os.getenv("CURRENCY", "EUR").upper(),
+        strategy_horizon_days_min=int(os.getenv("STRATEGY_HORIZON_DAYS_MIN", "90")),
+        strategy_horizon_days_max=int(os.getenv("STRATEGY_HORIZON_DAYS_MAX", "120")),
+        log_profile=os.getenv("LOG_PROFILE", "PRODUCTION").upper(),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         log_file=os.getenv("LOG_FILE", "logs/trading_bot.log"),
         universe_log_file=os.getenv("UNIVERSE_LOG_FILE", "logs/universe_candidates.log"),
+        report_dir=os.getenv("REPORT_DIR", "data/reports"),
         db_market_data=os.getenv("DB_MARKET_DATA", "data/market_data.sqlite"),
         db_trades=os.getenv("DB_TRADES", "data/trades.sqlite"),
         lock_file=os.getenv("LOCK_FILE", "run/trading_scheduler.lock"),
+        api_host=os.getenv("API_HOST", "0.0.0.0"),
+        api_port=int(os.getenv("API_PORT", "8000")),
     )
+    config.log_file = resolve_runtime_path(config.log_file)
+    config.universe_log_file = resolve_runtime_path(config.universe_log_file)
+    config.report_dir = resolve_runtime_path(config.report_dir)
+    config.db_market_data = resolve_runtime_path(config.db_market_data)
+    config.db_trades = resolve_runtime_path(config.db_trades)
+    config.lock_file = resolve_runtime_path(config.lock_file)
     ensure_parent_dir(config.log_file)
     ensure_parent_dir(config.universe_log_file)
+    Path(config.report_dir).mkdir(parents=True, exist_ok=True)
     ensure_parent_dir(config.db_market_data)
     ensure_parent_dir(config.db_trades)
     ensure_parent_dir(config.lock_file)
@@ -121,14 +157,33 @@ def retry(
                 except exceptions as exc:  # type: ignore[arg-type]
                     last_error = exc
                     if logger:
-                        logger.warning(
-                            "Attempt %s/%s failed in %s: %s",
-                            attempt,
-                            max_attempts,
-                            func.__name__,
-                            exc,
-                            exc_info=True,
-                        )
+                        config = getattr(args[0], "config", None) if args else None
+                        debug_logging = bool(getattr(config, "debug_logging", False))
+                        if debug_logging:
+                            logger.warning(
+                                "Attempt %s/%s failed in %s: %s",
+                                attempt,
+                                max_attempts,
+                                func.__name__,
+                                exc,
+                                exc_info=True,
+                            )
+                        elif attempt == max_attempts:
+                            logger.warning(
+                                "Attempt %s/%s failed in %s: %s",
+                                attempt,
+                                max_attempts,
+                                func.__name__,
+                                exc,
+                            )
+                        else:
+                            logger.debug(
+                                "Attempt %s/%s failed in %s: %s",
+                                attempt,
+                                max_attempts,
+                                func.__name__,
+                                exc,
+                            )
                     if attempt == max_attempts:
                         break
                     time.sleep(base_delay * (2 ** (attempt - 1)))
@@ -165,7 +220,19 @@ def write_universe_file(payload: dict[str, list[str]]) -> None:
     """Persist the current universe to disk."""
 
     ensure_parent_dir(UNIVERSE_FILE)
-    UNIVERSE_FILE.write_text(to_json(payload), encoding="utf-8")
+    temp_path = UNIVERSE_FILE.with_name(f"{UNIVERSE_FILE.name}.{uuid4().hex}.tmp")
+    temp_path.write_text(to_json(payload), encoding="utf-8")
+    temp_path.replace(UNIVERSE_FILE)
+
+
+def write_json_file(file_path: str | Path, payload: Any) -> None:
+    """Persist arbitrary JSON payloads to disk."""
+
+    destination = Path(file_path)
+    ensure_parent_dir(destination)
+    temp_path = destination.with_name(f"{destination.name}.{uuid4().hex}.tmp")
+    temp_path.write_text(to_json(payload), encoding="utf-8")
+    temp_path.replace(destination)
 
 
 def market_data_start(first_download: bool) -> datetime:

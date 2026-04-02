@@ -2,23 +2,18 @@ services:
   trading:
     build: .
     container_name: trading
+    user: 1000:1000
+    init: true
     restart: always
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
       - ./run:/app/run
+      - ./.env:/app/.env
     environment:
       - TZ=Europe/Rome
-    networks:
-      - projects
-
-  log-trading:
-    image: tsl0922/ttyd
-    container_name: log-trading
-    restart: unless-stopped
-    command: ttyd -p 8080 tail -n 1000 -f /app/logs/trading_bot.log
-    volumes:
-      - ./logs:/app/logs
     networks:
       - proxy_public
     labels:
@@ -26,10 +21,8 @@ services:
       - "traefik.docker.network=proxy_public"
       - "traefik.http.routers.log-trading-router.rule=Host(`trading.local`)"
       - "traefik.http.routers.log-trading-router.entrypoints=web"
-      - "traefik.http.services.log-trading-service.loadbalancer.server.port=8080"
+      - "traefik.http.services.log-trading-service.loadbalancer.server.port=8000"
 
 networks:
-  projects:
-    external: true
   proxy_public:
     external: true
