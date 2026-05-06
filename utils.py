@@ -27,12 +27,20 @@ class AppConfig:
     alpaca_api_key: str
     alpaca_secret_key: str
     alpaca_base_url: str
+    openai_model_heavy: str = "gpt-5.4"
+    openai_model_mid: str = "gpt-5.4-mini"
+    openai_model_light: str = "gpt-5.4-nano"
+    openai_reasoning_effort: str = "medium"
     max_open_trades_stock: int = 3
     max_open_trades_crypto: int = 3
     weekly_universe_stocks: int = 5
     weekly_universe_crypto: int = 5
     risk_tolerance: int = 5
     currency: str = "EUR"
+    crypto_entry_limit_collar_bps: int = 15
+    crypto_entry_max_chase_bps: int = 40
+    crypto_pending_reprice_minutes: int = 2
+    crypto_pending_cancel_minutes: int = 12
     strategy_horizon_days_min: int = 90
     strategy_horizon_days_max: int = 120
     log_profile: str = "PRODUCTION"
@@ -79,12 +87,20 @@ def load_config() -> AppConfig:
         alpaca_api_key=os.getenv("ALPACA_API_KEY", ""),
         alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
         alpaca_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
+        openai_model_heavy=os.getenv("OPENAI_MODEL_HEAVY", "gpt-5.4"),
+        openai_model_mid=os.getenv("OPENAI_MODEL_MID", "gpt-5.4-mini"),
+        openai_model_light=os.getenv("OPENAI_MODEL_LIGHT", "gpt-5.4-nano"),
+        openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "medium").lower(),
         max_open_trades_stock=int(os.getenv("MAX_OPEN_TRADES_STOCK", "3")),
         max_open_trades_crypto=int(os.getenv("MAX_OPEN_TRADES_CRYPTO", "3")),
         weekly_universe_stocks=int(os.getenv("WEEKLY_UNIVERSE_STOCKS", "5")),
         weekly_universe_crypto=int(os.getenv("WEEKLY_UNIVERSE_CRYPTO", "5")),
         risk_tolerance=max(1, min(10, int(os.getenv("RISK_TOLERANCE", "5")))),
         currency=os.getenv("CURRENCY", "EUR").upper(),
+        crypto_entry_limit_collar_bps=max(0, int(os.getenv("CRYPTO_ENTRY_LIMIT_COLLAR_BPS", "15"))),
+        crypto_entry_max_chase_bps=max(0, int(os.getenv("CRYPTO_ENTRY_MAX_CHASE_BPS", "40"))),
+        crypto_pending_reprice_minutes=max(1, int(os.getenv("CRYPTO_PENDING_REPRICE_MINUTES", "2"))),
+        crypto_pending_cancel_minutes=max(1, int(os.getenv("CRYPTO_PENDING_CANCEL_MINUTES", "12"))),
         strategy_horizon_days_min=int(os.getenv("STRATEGY_HORIZON_DAYS_MIN", "90")),
         strategy_horizon_days_max=int(os.getenv("STRATEGY_HORIZON_DAYS_MAX", "120")),
         log_profile=os.getenv("LOG_PROFILE", "PRODUCTION").upper(),
@@ -136,6 +152,8 @@ def parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
 
 
@@ -194,18 +212,75 @@ def retry(
     return decorator
 
 
-def trim_ohlcv_payload(rows: list[dict[str, Any]], max_rows: int = 600) -> list[dict[str, Any]]:
-    """Reduce token usage while still giving the model long context."""
+def build_mixed_timeframe_ohlcv(
+    rows: list[dict[str, Any]],
+    recent_daily: int = 60,
+    weekly_count: int = 30,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return last N daily bars plus older period aggregated to weekly bars."""
 
-    if len(rows) <= max_rows:
-        return rows
-    return rows[:120] + rows[-480:]
+    if not rows:
+        return {"daily": [], "weekly": []}
+
+    sorted_rows = sorted(rows, key=lambda r: r.get("timestamp") or "")
+    if len(sorted_rows) <= recent_daily:
+        return {"daily": sorted_rows, "weekly": []}
+    daily_part = sorted_rows[-recent_daily:]
+    older_part = sorted_rows[:-recent_daily]
+    weekly_part = _aggregate_daily_to_weekly(older_part)[-weekly_count:]
+    return {"daily": daily_part, "weekly": weekly_part}
+
+
+def _aggregate_daily_to_weekly(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    bars: list[dict[str, Any]] = []
+    bucket: list[dict[str, Any]] = []
+    current_key: tuple[int, int] | None = None
+    for row in rows:
+        ts_value = row.get("timestamp")
+        dt = parse_datetime(ts_value) if isinstance(ts_value, str) else ts_value
+        if dt is None:
+            continue
+        iso = dt.isocalendar()
+        key = (iso[0], iso[1])
+        if current_key is None:
+            current_key = key
+        if key != current_key:
+            bars.append(_build_weekly_bar(bucket))
+            bucket = []
+            current_key = key
+        bucket.append(row)
+    if bucket:
+        bars.append(_build_weekly_bar(bucket))
+    return bars
+
+
+def _build_weekly_bar(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    highs = [float(r["high"]) for r in rows if r.get("high") is not None]
+    lows = [float(r["low"]) for r in rows if r.get("low") is not None]
+    volumes = [float(r["volume"]) for r in rows if r.get("volume") is not None]
+    return {
+        "timestamp": rows[0].get("timestamp"),
+        "open": rows[0].get("open"),
+        "high": max(highs) if highs else None,
+        "low": min(lows) if lows else None,
+        "close": rows[-1].get("close"),
+        "volume": sum(volumes) if volumes else 0.0,
+    }
 
 
 def to_json(data: Any) -> str:
     """Serialize data in a stable JSON format."""
 
     return json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True)
+
+
+def to_toon(data: Any) -> str:
+    """Serialize data in TOON format for reduced token usage."""
+
+    from toon_format import encode  # type: ignore[import]
+    return encode(data)
 
 
 def read_universe_file() -> dict[str, list[str]]:

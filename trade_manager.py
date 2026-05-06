@@ -25,6 +25,7 @@ class TradeManager:
     }
     TERMINAL_EXIT_STATUSES = {"canceled", "cancelled", "expired", "rejected"}
     FILLED_ENTRY_STATUSES = {"filled", "partially_filled"}
+    LIVE_PENDING_ENTRY_STATUSES = {"new", "accepted", "pending_new", "accepted_for_bidding", "held"}
 
     def __init__(
         self,
@@ -65,6 +66,12 @@ class TradeManager:
                 return parse_datetime(value)
         return None
 
+    @staticmethod
+    def _minutes_since(timestamp: datetime | None) -> float | None:
+        if timestamp is None:
+            return None
+        return max((utc_now() - timestamp).total_seconds() / 60.0, 0.0)
+
     def _resolve_current_price(
         self,
         symbol: str,
@@ -91,15 +98,21 @@ class TradeManager:
     @staticmethod
     def _compute_trailing_take_profit_price(
         high_water_mark: float,
-        take_profit: float | None,
+        entry_price: float | None,
         trailing_take_profit_distance: float | None,
+        trailing_take_profit_activation_pct: float | None,
     ) -> float | None:
         if (
-            take_profit is None
+            entry_price is None
+            or entry_price <= 0
             or trailing_take_profit_distance is None
             or trailing_take_profit_distance <= 0
-            or high_water_mark < take_profit
+            or trailing_take_profit_activation_pct is None
+            or trailing_take_profit_activation_pct <= 0
         ):
+            return None
+        activation_threshold = entry_price * (1 + trailing_take_profit_activation_pct / 100.0)
+        if high_water_mark < activation_threshold:
             return None
         return round(high_water_mark - trailing_take_profit_distance, 8)
 
@@ -176,6 +189,134 @@ class TradeManager:
         available_slots = max(slots - active, 1)
         return round(cash / available_slots, 2)
 
+    def _cancel_pending_trade_record(
+        self,
+        trade: dict[str, Any],
+        close_reason: str,
+        *,
+        reasoning: str | None = None,
+        close_timestamp: datetime | None = None,
+    ) -> None:
+        with db_cursor(self.config.db_trades) as cursor:
+            cursor.execute(
+                """
+                UPDATE trades
+                SET status = 'CANCELLED', close_reason = ?, close_timestamp = ?, reasoning = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    close_reason,
+                    isoformat_utc(close_timestamp or utc_now()),
+                    reasoning or trade.get("reasoning"),
+                    trade["id"],
+                ),
+            )
+
+    def _update_pending_trade_submission(self, trade: dict[str, Any], order_payload: dict[str, Any]) -> None:
+        order = order_payload["order"]
+        submitted_entry_price = (
+            self._as_float(order_payload.get("submitted_entry_price"))
+            or self._as_float(getattr(order, "limit_price", None))
+            or self._as_float(trade.get("entry_price"))
+            or self._as_float(trade.get("target_entry_price"))
+            or 0.0
+        )
+        quantity = self._as_float(order_payload.get("quantity")) or float(trade["quantity"])
+        with db_cursor(self.config.db_trades) as cursor:
+            cursor.execute(
+                """
+                UPDATE trades
+                SET entry_price = ?, quantity = ?, alpaca_order_id = ?, client_order_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    submitted_entry_price,
+                    quantity,
+                    str(getattr(order, "id", "")),
+                    order_payload["client_order_id"],
+                    trade["id"],
+                ),
+            )
+
+    def _max_acceptable_crypto_entry_price(self, target_entry_price: float) -> float:
+        return target_entry_price * (1 + (self.config.crypto_entry_max_chase_bps / 10_000.0))
+
+    def _refresh_live_crypto_pending_trade(self, trade: dict[str, Any], order: Any) -> None:
+        target_entry_price = self._as_float(trade.get("target_entry_price")) or self._as_float(trade.get("entry_price"))
+        if target_entry_price is None or target_entry_price <= 0:
+            return
+
+        trade_age_minutes = self._minutes_since(parse_datetime(trade.get("created_at"))) or 0.0
+        order_age_anchor = self._order_timestamp(order, "updated_at", "submitted_at", "created_at") or parse_datetime(trade.get("created_at"))
+        order_age_minutes = self._minutes_since(order_age_anchor) or 0.0
+
+        try:
+            quote = self.alpaca_client.get_latest_quote(str(trade["symbol"]), str(trade["category"]))
+        except Exception:
+            self.logger.warning("Could not fetch latest quote for pending crypto trade %s", trade["id"], exc_info=True)
+            return
+
+        live_ask = self._as_float(quote.get("ask_price")) or self._as_float(quote.get("bid_price"))
+        if live_ask is None or live_ask <= 0:
+            return
+
+        if live_ask > self._max_acceptable_crypto_entry_price(target_entry_price):
+            order_id = trade.get("alpaca_order_id")
+            if order_id:
+                try:
+                    self.alpaca_client.cancel_order(str(order_id))
+                except Exception as exc:
+                    if "not found" not in str(exc).lower():
+                        raise
+            self._cancel_pending_trade_record(trade, "ENTRY_PRICE_MOVED")
+            self.logger.info(
+                "Cancelled pending crypto trade %s because live ask %s moved above the allowed target drift from %s",
+                trade["id"],
+                live_ask,
+                target_entry_price,
+            )
+            return
+
+        if trade_age_minutes >= self.config.crypto_pending_cancel_minutes:
+            order_id = trade.get("alpaca_order_id")
+            if order_id:
+                try:
+                    self.alpaca_client.cancel_order(str(order_id))
+                except Exception as exc:
+                    if "not found" not in str(exc).lower():
+                        raise
+            self._cancel_pending_trade_record(trade, "CRYPTO_ENTRY_TIMEOUT")
+            self.logger.info("Cancelled pending crypto trade %s after %s minutes without a fill", trade["id"], round(trade_age_minutes, 2))
+            return
+
+        if order_age_minutes < self.config.crypto_pending_reprice_minutes:
+            return
+
+        order_id = trade.get("alpaca_order_id")
+        if order_id:
+            try:
+                self.alpaca_client.cancel_order(str(order_id))
+            except Exception as exc:
+                if "not found" not in str(exc).lower():
+                    raise
+
+        try:
+            replacement_order = self.alpaca_client.place_limit_entry_order(
+                symbol=str(trade["symbol"]),
+                category=str(trade["category"]),
+                entry_price=target_entry_price,
+                allocated_capital=float(trade["allocated_capital"]),
+            )
+        except Exception as exc:
+            if "too far above target" in str(exc).lower():
+                self._cancel_pending_trade_record(trade, "ENTRY_PRICE_MOVED")
+                self.logger.info("Cancelled pending crypto trade %s because the refreshed live price moved away", trade["id"])
+                return
+            raise
+
+        self._update_pending_trade_submission(trade, replacement_order)
+        self.logger.info("Resubmitted pending crypto trade %s with a refreshed marketable IOC limit", trade["id"])
+
     def _save_new_trade(
         self,
         category: str,
@@ -186,26 +327,30 @@ class TradeManager:
     ) -> None:
         order = order_payload["order"]
         trailing_take_profit_distance = self._as_float(signal.get("trailing_take_profit_distance"))
+        trailing_take_profit_activation_pct = self._as_float(signal.get("trailing_take_profit_activation_pct"))
         trailing_stop_distance = self._as_float(signal.get("trailing_stop_distance"))
+        submitted_entry_price = self._as_float(order_payload.get("submitted_entry_price")) or float(signal["entry_price"])
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
                 """
                 INSERT INTO trades (
                     symbol, category, direction, status, entry_price, target_entry_price, quantity, allocated_capital,
-                    take_profit, trailing_take_profit_distance, stop_loss, trailing_stop_distance,
+                    take_profit, trailing_take_profit_distance, trailing_take_profit_activation_pct,
+                    stop_loss, trailing_stop_distance,
                     alpaca_order_id, client_order_id,
                     reasoning, confidence, trade_score
-                ) VALUES (?, ?, 'LONG', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'LONG', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
                     category,
-                    float(signal["entry_price"]),
+                    submitted_entry_price,
                     float(signal["entry_price"]),
                     float(order_payload["quantity"]),
                     allocated_capital,
                     float(signal["take_profit"]),
                     trailing_take_profit_distance,
+                    trailing_take_profit_activation_pct,
                     float(signal["stop_loss"]),
                     trailing_stop_distance,
                     str(getattr(order, "id", "")),
@@ -237,6 +382,23 @@ class TradeManager:
                     trailing_take_profit_distance,
                 )
                 return False
+        trailing_take_profit_activation_pct = signal.get("trailing_take_profit_activation_pct")
+        if trailing_take_profit_activation_pct is not None:
+            if not isinstance(trailing_take_profit_activation_pct, (int, float)) or float(trailing_take_profit_activation_pct) <= 0:
+                self.logger.warning(
+                    "GPT returned OPEN for %s with invalid trailing_take_profit_activation_pct=%s; skipping trade",
+                    signal.get("symbol"),
+                    trailing_take_profit_activation_pct,
+                )
+                return False
+        if (trailing_take_profit_distance is None) != (trailing_take_profit_activation_pct is None):
+            self.logger.warning(
+                "GPT returned OPEN for %s with mismatched trailing fields (distance=%s, activation_pct=%s); skipping trade",
+                signal.get("symbol"),
+                trailing_take_profit_distance,
+                trailing_take_profit_activation_pct,
+            )
+            return False
         trailing_stop_distance = signal.get("trailing_stop_distance")
         if trailing_stop_distance is None:
             return True
@@ -270,7 +432,7 @@ class TradeManager:
             if not candles:
                 self.logger.warning("No market data found for %s, skipping batch analysis", symbol)
                 continue
-            payloads.append(self.gpt_client.build_symbol_payload(symbol, category, candles, []))
+            payloads.append(self.gpt_client.build_batch_symbol_entry(symbol, candles))
         return payloads
 
     def _rank_signals(self, signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -308,6 +470,9 @@ class TradeManager:
                     "Skipping %s because available capital is insufficient for the proposed entry",
                     symbol,
                 )
+                return False
+            if category == "CRYPTO" and "too far above target" in str(exc).lower():
+                self.logger.info("Skipping %s because the live crypto ask moved too far above the GPT target", symbol)
                 return False
             raise
         self._save_new_trade(category, symbol, signal, order_payload, allocated_capital)
@@ -364,8 +529,9 @@ class TradeManager:
         )
         trailing_take_profit_price = self._compute_trailing_take_profit_price(
             high_water_mark,
-            self._as_float(trade.get("take_profit")),
+            entry_price,
             self._as_float(trade.get("trailing_take_profit_distance")),
+            self._as_float(trade.get("trailing_take_profit_activation_pct")),
         )
         pnl = (current_price - entry_price) * filled_quantity
         open_timestamp = self._order_timestamp(order, "filled_at", "updated_at", "submitted_at") or utc_now()
@@ -433,6 +599,10 @@ class TradeManager:
                     (self.TERMINAL_PENDING_STATUSES[status], isoformat_utc(close_timestamp), trade["id"]),
                 )
             self.logger.info("Pending trade %s cancelled with status %s", trade["id"], status)
+            return
+
+        if trade["category"] == "CRYPTO" and status in self.LIVE_PENDING_ENTRY_STATUSES:
+            self._refresh_live_crypto_pending_trade(trade, order)
 
     def review_stale_pending_trades(self, min_age_days: int = 7) -> None:
         stale_trades = self.get_stale_pending_trades(min_age_days=min_age_days)
@@ -475,21 +645,12 @@ class TradeManager:
                 if "not found" not in str(exc).lower():
                     raise
 
-        close_price = self._as_float(trade.get("target_entry_price")) or self._as_float(trade.get("entry_price")) or 0.0
-        with db_cursor(self.config.db_trades) as cursor:
-            cursor.execute(
-                """
-                UPDATE trades
-                SET status = 'CANCELLED', close_reason = ?, close_timestamp = ?, reasoning = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    "STALE_PENDING_CANCELED",
-                    isoformat_utc(utc_now()),
-                    reasoning or trade.get("reasoning"),
-                    trade["id"],
-                ),
-            )
+        self._cancel_pending_trade_record(
+            trade,
+            "STALE_PENDING_CANCELED",
+            reasoning=reasoning or trade.get("reasoning"),
+            close_timestamp=utc_now(),
+        )
         self.logger.info("Cancelled stale pending trade %s after GPT cancel review", trade["id"])
 
     def _mark_trade_closed(
@@ -602,7 +763,7 @@ class TradeManager:
 
     def _refresh_single_open_trade_protection(self, trade: dict[str, Any]) -> None:
         symbol = str(trade["symbol"])
-        candles = self.data_manager.get_symbol_history(symbol, limit=260)
+        candles = self.data_manager.get_symbol_history(symbol, limit=40)
         if not candles:
             self.logger.warning("No market data found for open trade %s (%s); skipping GPT protection review", trade["id"], symbol)
             return
@@ -625,32 +786,62 @@ class TradeManager:
             )
             return
 
-        current_distance = self._as_float(trade.get("trailing_take_profit_distance"))
-        if current_distance == proposed_distance:
+        proposed_activation_pct = self._as_float(review.get("trailing_take_profit_activation_pct"))
+        raw_activation_pct = review.get("trailing_take_profit_activation_pct")
+        if raw_activation_pct is not None and proposed_activation_pct is None:
+            self.logger.warning(
+                "GPT returned invalid trailing_take_profit_activation_pct=%s for open trade %s; keeping previous value",
+                raw_activation_pct,
+                trade["id"],
+            )
+            return
+        if proposed_activation_pct is not None and proposed_activation_pct <= 0:
+            self.logger.warning(
+                "GPT returned non-positive trailing_take_profit_activation_pct=%s for open trade %s; keeping previous value",
+                proposed_activation_pct,
+                trade["id"],
+            )
+            return
+        if (proposed_distance is None) != (proposed_activation_pct is None):
+            self.logger.warning(
+                "GPT returned mismatched trailing fields (distance=%s, activation_pct=%s) for open trade %s; keeping previous values",
+                proposed_distance,
+                proposed_activation_pct,
+                trade["id"],
+            )
             return
 
-        current_high_water_mark = self._as_float(trade.get("high_water_mark")) or float(trade["entry_price"])
-        take_profit = self._as_float(trade.get("take_profit"))
+        current_distance = self._as_float(trade.get("trailing_take_profit_distance"))
+        current_activation_pct = self._as_float(trade.get("trailing_take_profit_activation_pct"))
+        if current_distance == proposed_distance and current_activation_pct == proposed_activation_pct:
+            return
+
+        entry_price = float(trade["entry_price"])
+        current_high_water_mark = self._as_float(trade.get("high_water_mark")) or entry_price
         trailing_take_profit_price = self._compute_trailing_take_profit_price(
             current_high_water_mark,
-            take_profit,
+            entry_price,
             proposed_distance,
+            proposed_activation_pct,
         )
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
                 """
                 UPDATE trades
-                SET trailing_take_profit_distance = ?, trailing_take_profit_price = ?, updated_at = CURRENT_TIMESTAMP
+                SET trailing_take_profit_distance = ?, trailing_take_profit_activation_pct = ?,
+                    trailing_take_profit_price = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (proposed_distance, trailing_take_profit_price, trade["id"]),
+                (proposed_distance, proposed_activation_pct, trailing_take_profit_price, trade["id"]),
             )
         self.logger.info(
-            "Updated trailing take profit for trade %s (%s) from %s to %s",
+            "Updated trailing take profit for trade %s (%s): distance %s -> %s, activation_pct %s -> %s",
             trade["id"],
             symbol,
             current_distance,
             proposed_distance,
+            current_activation_pct,
+            proposed_activation_pct,
         )
 
     def sync_open_trade(self, trade: dict[str, Any]) -> None:
@@ -674,11 +865,13 @@ class TradeManager:
         stop_loss = self._as_float(trade.get("stop_loss"))
         take_profit = self._as_float(trade.get("take_profit"))
         trailing_take_profit_distance = self._as_float(trade.get("trailing_take_profit_distance"))
+        trailing_take_profit_activation_pct = self._as_float(trade.get("trailing_take_profit_activation_pct"))
         high_water_mark = max(self._as_float(trade.get("high_water_mark")) or entry_price, current_price)
         trailing_take_profit_price = self._compute_trailing_take_profit_price(
             high_water_mark,
-            take_profit,
+            entry_price,
             trailing_take_profit_distance,
+            trailing_take_profit_activation_pct,
         )
         trailing_stop_price = self._compute_trailing_stop_price(
             high_water_mark,
@@ -703,7 +896,7 @@ class TradeManager:
             self._request_market_close(trade, close_reason, current_price)
             return
 
-        if take_profit is not None and trailing_take_profit_distance is None and current_price >= take_profit:
+        if take_profit is not None and trailing_take_profit_price is None and current_price >= take_profit:
             self._request_market_close(trade, "TAKE_PROFIT", current_price)
             return
         close_reason = self._downside_close_reason(current_price, stop_loss, trailing_stop_price)
@@ -779,15 +972,10 @@ class TradeManager:
 
     def weekly_summary(self) -> dict[str, Any]:
         rows = fetch_all(self.config.db_trades, "SELECT * FROM trades")
-        cutoff = utc_now() - timedelta(days=7)
-        rows = [
-            row
-            for row in rows
-            if row["status"] in {"PENDING", "OPEN"}
-            or (parse_datetime(row.get("close_timestamp")) and parse_datetime(row.get("close_timestamp")) >= cutoff)
-        ]
+        # Include all OPEN and PENDING trades plus all CLOSED trades (cumulative PnL).
+        # CANCELLED trades are excluded entirely.
+        rows = [row for row in rows if row["status"] in {"OPEN", "PENDING", "CLOSED"}]
         closed = [row for row in rows if row["status"] == "CLOSED"]
-        cancelled = [row for row in rows if row["status"] == "CANCELLED"]
         winners = [row for row in closed if (row.get("pnl") or 0) > 0]
         pnls = [row.get("pnl") or 0 for row in closed]
         best_trade = max(closed, key=lambda row: row.get("pnl") or float("-inf"), default=None)
@@ -800,10 +988,56 @@ class TradeManager:
             "open_trades": [row for row in rows if row["status"] == "OPEN"],
             "pending_trades": [row for row in rows if row["status"] == "PENDING"],
             "closed_trades": closed,
-            "cancelled_trades": cancelled,
             "pnl_total": round(sum(pnls), 2),
             "pnl_by_category": {key: round(value, 2) for key, value in pnl_by_category.items()},
             "win_rate": round(len(winners) / len(closed), 4) if closed else 0.0,
+            "best_trade": best_trade,
+            "worst_trade": worst_trade,
+            "most_traded_symbols": most_traded,
+        }
+
+    def period_summary(self, period_start: datetime, period_end: datetime) -> dict[str, Any]:
+        """Summarise trading activity for a fixed time range.
+
+        Trades closed within [period_start, period_end) contribute to PnL and
+        win-rate metrics.  Every non-cancelled trade that was NOT closed during
+        the period (still OPEN, PENDING, or closed outside the window) is
+        returned as a carry-over with status "OPEN" so it flows into the next
+        reporting period.
+        """
+        rows = fetch_all(self.config.db_trades, "SELECT * FROM trades")
+        rows = [row for row in rows if row["status"] != "CANCELLED"]
+
+        closed_in_period: list[dict[str, Any]] = []
+        carry_over: list[dict[str, Any]] = []
+
+        for row in rows:
+            close_ts = parse_datetime(row.get("close_timestamp"))
+            if row["status"] == "CLOSED" and close_ts is not None and period_start <= close_ts < period_end:
+                closed_in_period.append(row)
+            else:
+                # Not closed within the period — carry over as open.
+                carry = dict(row)
+                carry["status"] = "OPEN"
+                carry_over.append(carry)
+
+        winners = [row for row in closed_in_period if (row.get("pnl") or 0) > 0]
+        pnls = [row.get("pnl") or 0 for row in closed_in_period]
+        best_trade = max(closed_in_period, key=lambda row: row.get("pnl") or float("-inf"), default=None)
+        worst_trade = min(closed_in_period, key=lambda row: row.get("pnl") or float("inf"), default=None)
+        all_in_scope = closed_in_period + carry_over
+        most_traded = Counter(row["symbol"] for row in all_in_scope).most_common(5)
+        pnl_by_category: dict[str, float] = {}
+        for row in closed_in_period:
+            pnl_by_category[row["category"]] = pnl_by_category.get(row["category"], 0.0) + float(row.get("pnl") or 0.0)
+        return {
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "closed_trades": closed_in_period,
+            "carry_over_trades": carry_over,
+            "pnl_total": round(sum(pnls), 2),
+            "pnl_by_category": {key: round(value, 2) for key, value in pnl_by_category.items()},
+            "win_rate": round(len(winners) / len(closed_in_period), 4) if closed_in_period else 0.0,
             "best_trade": best_trade,
             "worst_trade": worst_trade,
             "most_traded_symbols": most_traded,
