@@ -1,12 +1,7 @@
-"""Universe selection and persistence (multi-provider).
+"""Universe selection and persistence.
 
-The Alpaca path keeps the original three-stage flow (prefilter → parallel
-GPT dossiers → final consolidation), while the Binance path uses a
-lighter pipeline: rank by 24h quote volume, take a top-N candidate set,
-and ask GPT for a final selection in a single call. The lighter flow
-matches what makes sense for crypto pairs where 24h volume is the most
-honest liquidity proxy and a stock-style multi-stage pipeline would mostly
-churn tokens.
+The selection path uses a three-stage flow (prefilter → parallel GPT
+dossiers → final consolidation) for both stocks and crypto.
 """
 
 from __future__ import annotations
@@ -21,8 +16,7 @@ from typing import Any, Mapping
 from clients.gpt_client import GPTClient
 from core.utils import (
     ALL_PROVIDERS,
-    PROVIDER_ALPACA,
-    PROVIDER_BINANCE,
+    PROVIDER_ETORO,
     AppConfig,
     ProviderUniverse,
     read_universe_file,
@@ -51,38 +45,20 @@ class UniverseManager:
     STOCK_MIN_AVG_DOLLAR_VOLUME_20D = 2_000_000.0
     CRYPTO_MIN_AVG_DOLLAR_VOLUME_20D = 1_000_000.0
     MAX_DOSSIER_WORKERS = 6
-    BINANCE_PREFILTER_MULTIPLIER = 20
 
     def __init__(
         self,
         config: AppConfig,
         logger: logging.Logger,
-        broker_clients: Mapping[str, Any] | Any | None = None,
+        broker_clients: Mapping[str, Any] | None = None,
         gpt_client: GPTClient | None = None,
-        *,
-        alpaca_client: Any | None = None,
     ) -> None:
         self.config = config
         self.logger = logger.getChild("universe")
-        if isinstance(broker_clients, Mapping):
-            self._brokers: dict[str, Any] = dict(broker_clients)
-        elif broker_clients is not None:
-            self._brokers = {PROVIDER_ALPACA: broker_clients}
-        else:
-            self._brokers = {}
-        if alpaca_client is not None:
-            self._brokers[PROVIDER_ALPACA] = alpaca_client
+        self._brokers: dict[str, Any] = dict(broker_clients) if isinstance(broker_clients, Mapping) else {}
         if gpt_client is None:
             raise TypeError("UniverseManager requires a gpt_client")
         self.gpt_client = gpt_client
-
-    @property
-    def alpaca_client(self) -> Any | None:
-        return self._brokers.get(PROVIDER_ALPACA)
-
-    @property
-    def binance_client(self) -> Any | None:
-        return self._brokers.get(PROVIDER_BINANCE)
 
     def broker(self, provider: str) -> Any | None:
         return self._brokers.get(provider)
@@ -185,7 +161,7 @@ class UniverseManager:
             return None
         return round(((latest / base) - 1.0) * 100.0, 2)
 
-    # -- common Alpaca-style enrichment helpers ---------------------------
+    # -- common market-metric enrichment helpers ---------------------------
 
     def _compute_market_metrics(self, bars: list[dict[str, Any]], category: str) -> dict[str, Any]:
         ordered_bars = sorted(bars, key=lambda row: str(row.get("timestamp", "")))
@@ -567,45 +543,9 @@ class UniverseManager:
                 break
         return completed_selection[:required_count]
 
-    # -- Alpaca path ------------------------------------------------------
-
-    def _get_alpaca_stock_candidate_payload(self) -> list[dict[str, Any]]:
-        broker = self.alpaca_client
-        if broker is None:
-            return []
-        assets = broker.list_assets("US_EQUITY")
-        payload = [
-            self._asset_snapshot(asset)
-            for asset in assets
-            if getattr(asset, "tradable", False)
-            and getattr(asset, "status", "").lower() == "active"
-            and not self._looks_like_etf(asset)
-            and not self._looks_like_non_common_stock(asset)
-            and not self._looks_like_shell_company(asset)
-        ]
-        payload = self._dedupe_payload_by_symbol(payload)
-        payload.sort(key=lambda asset: str(asset["symbol"]))
-        return payload
-
-    def _get_alpaca_crypto_candidate_payload(self) -> list[dict[str, Any]]:
-        broker = self.alpaca_client
-        if broker is None:
-            return []
-        assets = broker.list_assets("CRYPTO")
-        quote_suffix = f"/{self.config.account_currency}"
-        payload = [
-            self._asset_snapshot(asset)
-            for asset in assets
-            if getattr(asset, "tradable", False)
-            and getattr(asset, "status", "").lower() == "active"
-            and str(getattr(asset, "symbol", "")).upper().endswith(quote_suffix)
-        ]
-        payload = self._dedupe_payload_by_symbol(payload)
-        payload.sort(key=lambda asset: str(asset["symbol"]))
-        return payload
-
-    def _select_alpaca_category_universe(
+    def _select_category_universe(
         self,
+        provider: str,
         category: str,
         payload: list[dict[str, Any]],
         required_count: int,
@@ -628,14 +568,14 @@ class UniverseManager:
 
         dossier_candidates = self._build_dossier_candidates(category, prefiltered_payload, required_count)
         dossiers = self._generate_parallel_symbol_dossiers(
-            provider=PROVIDER_ALPACA,
+            provider=provider,
             category=category,
             candidates=dossier_candidates,
             required_count=required_count,
             preferred_symbols=preferred_symbols,
         )
         if not dossiers:
-            return self._top_up_selection(PROVIDER_ALPACA, category, [], prefiltered_payload, required_count)
+            return self._top_up_selection(provider, category, [], prefiltered_payload, required_count)
 
         dossier_symbols = [self._normalize_symbol(dossier.get("symbol")) for dossier in dossiers]
         successful_dossier_payload = self._filter_payload_by_symbols(dossier_candidates, dossier_symbols)
@@ -646,10 +586,10 @@ class UniverseManager:
                 dossiers=dossiers,
                 required_count=min(required_count, len(dossiers)),
                 current_universe=preferred_symbols,
-                provider=PROVIDER_ALPACA,
+                provider=provider,
             )
             selected_symbols = self._sanitize_selection(
-                PROVIDER_ALPACA,
+                provider,
                 category,
                 final_result.get("symbols", []),
                 {self._normalize_symbol(dossier.get("symbol")) for dossier in dossiers},
@@ -658,56 +598,12 @@ class UniverseManager:
             self.logger.exception("GPT dossier-based final universe selection failed for %s; using deterministic fallback", category)
             selected_symbols = []
 
-        completed_selection = self._top_up_selection(PROVIDER_ALPACA, category, selected_symbols, successful_dossier_payload, required_count)
+        completed_selection = self._top_up_selection(provider, category, selected_symbols, successful_dossier_payload, required_count)
         if len(completed_selection) >= required_count:
             return completed_selection
-        return self._top_up_selection(PROVIDER_ALPACA, category, completed_selection, prefiltered_payload, required_count)
+        return self._top_up_selection(provider, category, completed_selection, prefiltered_payload, required_count)
 
-    def _select_alpaca_universe(self, current_universe: ProviderUniverse) -> dict[str, list[str]]:
-        broker = self.alpaca_client
-        if broker is None:
-            return {}
-        try:
-            base_stock_payload = self._get_alpaca_stock_candidate_payload()
-            base_crypto_payload = self._get_alpaca_crypto_candidate_payload()
-            full_stock_payload = self._enrich_payload_with_market_metrics(
-                PROVIDER_ALPACA,
-                "STOCK",
-                base_stock_payload,
-                universe_for_provider(current_universe, PROVIDER_ALPACA).get("STOCK", []),
-            )
-            full_crypto_payload = self._enrich_payload_with_market_metrics(
-                PROVIDER_ALPACA,
-                "CRYPTO",
-                base_crypto_payload,
-                universe_for_provider(current_universe, PROVIDER_ALPACA).get("CRYPTO", []),
-            )
-            self._write_alpaca_candidate_lists(full_stock_payload, full_crypto_payload)
-
-            stocks = self._select_alpaca_category_universe(
-                category="STOCK",
-                payload=full_stock_payload,
-                required_count=self.config.weekly_universe_stocks,
-                batch_size=self.STOCK_BATCH_SIZE,
-                preferred_symbols=universe_for_provider(current_universe, PROVIDER_ALPACA).get("STOCK", []),
-            )
-            crypto = self._select_alpaca_category_universe(
-                category="CRYPTO",
-                payload=full_crypto_payload,
-                required_count=self.config.weekly_universe_crypto,
-                batch_size=self.CRYPTO_BATCH_SIZE,
-                preferred_symbols=universe_for_provider(current_universe, PROVIDER_ALPACA).get("CRYPTO", []),
-            )
-        except Exception:
-            self.logger.exception("Trading universe selection failed for Alpaca; keeping the previous valid universe")
-            return {
-                "STOCK": list(universe_for_provider(current_universe, PROVIDER_ALPACA).get("STOCK", [])),
-                "CRYPTO": list(universe_for_provider(current_universe, PROVIDER_ALPACA).get("CRYPTO", [])),
-            }
-
-        return {"STOCK": stocks, "CRYPTO": crypto}
-
-    def _write_alpaca_candidate_lists(
+    def _write_candidate_lists(
         self,
         stock_payload: list[dict[str, Any]],
         crypto_payload: list[dict[str, Any]],
@@ -717,145 +613,70 @@ class UniverseManager:
             {"STOCK": stock_payload, "CRYPTO": crypto_payload},
         )
 
-    # -- Binance path (lighter pipeline) ----------------------------------
+    # -- eToro path -------------------------------------------------------
 
-    def _select_binance_universe(self, current_universe: ProviderUniverse) -> dict[str, list[str]]:
-        broker = self.binance_client
+    def _get_etoro_stock_candidate_payload(self) -> list[dict[str, Any]]:
+        broker = self.broker(PROVIDER_ETORO)
+        if broker is None:
+            return []
+        assets = broker.list_assets("STOCK")
+        payload = [
+            self._asset_snapshot(asset)
+            for asset in assets
+            if getattr(asset, "tradable", False)
+            and not self._looks_like_etf(asset)
+            and not self._looks_like_non_common_stock(asset)
+            and not self._looks_like_shell_company(asset)
+        ]
+        payload = self._dedupe_payload_by_symbol(payload)
+        payload.sort(key=lambda asset: str(asset["symbol"]))
+        return payload
+
+    def _get_etoro_crypto_candidate_payload(self) -> list[dict[str, Any]]:
+        broker = self.broker(PROVIDER_ETORO)
+        if broker is None:
+            return []
+        assets = broker.list_assets("CRYPTO")
+        payload = [
+            self._asset_snapshot(asset)
+            for asset in assets
+            if getattr(asset, "tradable", False)
+        ]
+        payload = self._dedupe_payload_by_symbol(payload)
+        payload.sort(key=lambda asset: str(asset["symbol"]))
+        return payload
+
+    def _select_etoro_universe(self, current_universe: ProviderUniverse) -> dict[str, list[str]]:
+        broker = self.broker(PROVIDER_ETORO)
         if broker is None:
             return {}
-        required = max(0, int(self.config.weekly_universe_binance))
-        if required <= 0:
-            return {"CRYPTO": []}
-        preferred = list(universe_for_provider(current_universe, PROVIDER_BINANCE).get("CRYPTO", []))
+        preferred = universe_for_provider(current_universe, PROVIDER_ETORO)
         try:
-            ranked = self._rank_binance_candidates(broker, preferred)
-        except Exception:
-            self.logger.exception("Binance universe ranking failed; keeping the previous valid universe")
-            return {"CRYPTO": preferred}
-        if not ranked:
-            return {"CRYPTO": preferred}
-
-        candidate_payload = ranked[: max(required * self.BINANCE_PREFILTER_MULTIPLIER, required * 3)]
-        try:
-            final_result = self.gpt_client.request_universe_final_selection(
-                category="CRYPTO",
-                shortlisted_candidates=candidate_payload,
-                required_count=min(required, len(candidate_payload)),
-                provider=PROVIDER_BINANCE,
+            base_stock_payload = self._get_etoro_stock_candidate_payload()
+            base_crypto_payload = self._get_etoro_crypto_candidate_payload()
+            full_stock_payload = self._enrich_payload_with_market_metrics(
+                PROVIDER_ETORO, "STOCK", base_stock_payload, preferred.get("STOCK", [])
             )
-            selected_symbols = self._sanitize_selection(
-                PROVIDER_BINANCE,
-                "CRYPTO",
-                final_result.get("symbols", []),
-                {str(asset["symbol"]).upper() for asset in candidate_payload},
+            full_crypto_payload = self._enrich_payload_with_market_metrics(
+                PROVIDER_ETORO, "CRYPTO", base_crypto_payload, preferred.get("CRYPTO", [])
+            )
+            self._write_candidate_lists(full_stock_payload, full_crypto_payload)
+
+            stocks = self._select_category_universe(
+                PROVIDER_ETORO, "STOCK", full_stock_payload,
+                self.config.weekly_universe_stocks, self.STOCK_BATCH_SIZE, preferred.get("STOCK", []),
+            )
+            crypto = self._select_category_universe(
+                PROVIDER_ETORO, "CRYPTO", full_crypto_payload,
+                self.config.weekly_universe_crypto, self.CRYPTO_BATCH_SIZE, preferred.get("CRYPTO", []),
             )
         except Exception:
-            self.logger.exception(
-                "GPT Binance universe final selection failed; falling back to deterministic ranking"
-            )
-            selected_symbols = []
-
-        completed = self._top_up_selection(
-            PROVIDER_BINANCE,
-            "CRYPTO",
-            selected_symbols,
-            candidate_payload,
-            required,
-        )
-        if len(completed) < required:
-            completed = self._top_up_selection(
-                PROVIDER_BINANCE,
-                "CRYPTO",
-                completed,
-                ranked,
-                required,
-            )
-        self._write_binance_candidate_log(ranked[: required * 6])
-        return {"CRYPTO": completed}
-
-    def _rank_binance_candidates(self, broker: Any, preferred_symbols: list[str]) -> list[dict[str, Any]]:
-        ticker_rows = broker.get_24h_ticker() or []
-        quote = (self.config.binance_quote_currency or "USDT").upper()
-        catalogue = {str(asset.symbol).upper(): asset for asset in broker.list_assets("CRYPTO")}
-        preferred_set = {str(s).upper() for s in preferred_symbols}
-
-        # Index 24h stats by Binance-native symbol (no slash) for fast lookup.
-        stats_by_native: dict[str, dict[str, Any]] = {}
-        for row in ticker_rows:
-            native_symbol = str(row.get("symbol", "")).upper()
-            if not native_symbol:
-                continue
-            stats_by_native[native_symbol] = row
-
-        ranked: list[dict[str, Any]] = []
-        for display_symbol, asset in catalogue.items():
-            if not asset.tradable:
-                continue
-            native = display_symbol.replace("/", "")
-            stats = stats_by_native.get(native)
-            if stats is None:
-                continue
-            quote_volume = self._safe_float(stats.get("quoteVolume")) or 0.0
-            last_price = self._safe_float(stats.get("lastPrice"))
-            price_change_pct = self._safe_float(stats.get("priceChangePercent"))
-            count_trades = self._safe_float(stats.get("count")) or 0.0
-            high_24h = self._safe_float(stats.get("highPrice"))
-            low_24h = self._safe_float(stats.get("lowPrice"))
-            distance_from_high = None
-            if high_24h and last_price and high_24h > 0:
-                distance_from_high = round(((last_price / high_24h) - 1.0) * 100.0, 2)
-            volatility_proxy = None
-            if low_24h and high_24h and low_24h > 0:
-                volatility_proxy = round((high_24h / low_24h - 1.0) * 100.0, 2)
-
-            preference_bonus = 8.0 if display_symbol in preferred_set else 0.0
-            liquidity_score = max(0.0, math.log10(max(quote_volume, 1.0)) * 12.0)
-            volatility_budget = 30.0 + (self.config.risk_tolerance * 6.0)
-            volatility_penalty = (
-                max((volatility_proxy or 0.0) - volatility_budget, 0.0) * 0.4
-            )
-            momentum_component = (price_change_pct or 0.0) * 0.4
-            score = round(
-                liquidity_score + momentum_component + preference_bonus - volatility_penalty,
-                4,
-            )
-
-            ranked.append(
-                {
-                    "symbol": display_symbol,
-                    "native_symbol": native,
-                    "name": asset.base_asset,
-                    "quote_currency": asset.quote_asset,
-                    "tradable": asset.tradable,
-                    "fractionable": True,
-                    "last_price": last_price,
-                    "price_change_pct_24h": price_change_pct,
-                    "quote_volume_24h": quote_volume,
-                    "trade_count_24h": count_trades,
-                    "distance_from_24h_high_pct": distance_from_high,
-                    "volatility_24h_pct": volatility_proxy,
-                    "in_current_universe": display_symbol in preferred_set,
-                    "prefilter_score": score,
-                }
-            )
-        ranked.sort(
-            key=lambda asset: (
-                asset["prefilter_score"],
-                asset["quote_volume_24h"],
-                asset["symbol"],
-            ),
-            reverse=True,
-        )
-        return ranked
-
-    def _write_binance_candidate_log(self, ranked: list[dict[str, Any]]) -> None:
-        log_path = str(self.config.universe_log_file).replace(
-            ".log", ".binance.log"
-        ) or self.config.universe_log_file
-        try:
-            write_json_file(log_path, {"BINANCE": ranked})
-        except Exception:
-            self.logger.warning("Failed to persist Binance candidate log", exc_info=True)
+            self.logger.exception("Trading universe selection failed for eToro; keeping the previous valid universe")
+            return {
+                "STOCK": list(preferred.get("STOCK", [])),
+                "CRYPTO": list(preferred.get("CRYPTO", [])),
+            }
+        return {"STOCK": stocks, "CRYPTO": crypto}
 
     # -- public entry points ---------------------------------------------
 
@@ -863,15 +684,10 @@ class UniverseManager:
         current_universe = self.get_current_universe()
         result: ProviderUniverse = {provider: {} for provider in ALL_PROVIDERS}
 
-        if self.alpaca_client is not None:
-            result[PROVIDER_ALPACA] = self._select_alpaca_universe(current_universe)
+        if self.broker(PROVIDER_ETORO) is not None:
+            result[PROVIDER_ETORO] = self._select_etoro_universe(current_universe)
         else:
-            result[PROVIDER_ALPACA] = {"STOCK": [], "CRYPTO": []}
-
-        if self.binance_client is not None:
-            result[PROVIDER_BINANCE] = self._select_binance_universe(current_universe)
-        else:
-            result[PROVIDER_BINANCE] = {"CRYPTO": []}
+            result[PROVIDER_ETORO] = {"STOCK": [], "CRYPTO": []}
 
         write_universe_file(result)
         self.logger.info("Selected trading universe: %s", result)

@@ -16,8 +16,7 @@ from typing import Any, Mapping
 from clients.gpt_client import GPTClient
 from core.db import db_cursor, fetch_all, fetch_one
 from core.utils import (
-    PROVIDER_ALPACA,
-    PROVIDER_BINANCE,
+    PROVIDER_ETORO,
     AppConfig,
     isoformat_utc,
     parse_datetime,
@@ -29,52 +28,23 @@ from services.data_manager import DataManager
 class TradeManager:
     """Coordinate broker orders, DB state, and GPT entry decisions."""
 
-    TERMINAL_PENDING_STATUSES = {
-        "canceled": "CANCELED",
-        "cancelled": "CANCELED",
-        "expired": "EXPIRED",
-        "rejected": "REJECTED",
-    }
-    TERMINAL_EXIT_STATUSES = {"canceled", "cancelled", "expired", "rejected"}
-    FILLED_ENTRY_STATUSES = {"filled", "partially_filled"}
-    LIVE_PENDING_ENTRY_STATUSES = {"new", "accepted", "pending_new", "accepted_for_bidding", "held"}
-
     def __init__(
         self,
         config: AppConfig,
         logger: logging.Logger,
-        broker_clients: Mapping[str, Any] | Any | None = None,
+        broker_clients: Mapping[str, Any] | None = None,
         data_manager: DataManager | None = None,
         gpt_client: GPTClient | None = None,
-        *,
-        alpaca_client: Any | None = None,
     ) -> None:
         self.config = config
         self.logger = logger.getChild("trade_manager")
-        # Accept either the new ``broker_clients`` mapping or the legacy
-        # single-broker ``alpaca_client`` keyword (still used by tests).
-        if isinstance(broker_clients, Mapping):
-            self._brokers: dict[str, Any] = dict(broker_clients)
-        elif broker_clients is not None:
-            self._brokers = {PROVIDER_ALPACA: broker_clients}
-        else:
-            self._brokers = {}
-        if alpaca_client is not None:
-            self._brokers[PROVIDER_ALPACA] = alpaca_client
+        self._brokers: dict[str, Any] = dict(broker_clients) if isinstance(broker_clients, Mapping) else {}
         if data_manager is None:
             raise TypeError("TradeManager requires a data_manager")
         if gpt_client is None:
             raise TypeError("TradeManager requires a gpt_client")
         self.data_manager = data_manager
         self.gpt_client = gpt_client
-
-    @property
-    def alpaca_client(self) -> Any | None:
-        return self._brokers.get(PROVIDER_ALPACA)
-
-    @property
-    def binance_client(self) -> Any | None:
-        return self._brokers.get(PROVIDER_BINANCE)
 
     @property
     def brokers(self) -> dict[str, Any]:
@@ -84,7 +54,7 @@ class TradeManager:
         return self._brokers.get(provider)
 
     def _trade_provider(self, trade: dict[str, Any]) -> str:
-        return str(trade.get("provider") or PROVIDER_ALPACA).lower()
+        return str(trade.get("provider") or PROVIDER_ETORO).lower()
 
     def _trade_broker(self, trade: dict[str, Any]) -> Any | None:
         return self.broker(self._trade_provider(trade))
@@ -99,22 +69,6 @@ class TradeManager:
             return None
 
     @staticmethod
-    def _order_status(order: Any) -> str:
-        status = getattr(order, "status", "")
-        return str(getattr(status, "value", status)).lower()
-
-    def _order_timestamp(self, order: Any, *field_names: str) -> datetime | None:
-        for field_name in field_names:
-            value = getattr(order, field_name, None)
-            if value is None:
-                continue
-            if isinstance(value, datetime):
-                return value
-            if isinstance(value, str):
-                return parse_datetime(value)
-        return None
-
-    @staticmethod
     def _minutes_since(timestamp: datetime | None) -> float | None:
         if timestamp is None:
             return None
@@ -126,9 +80,9 @@ class TradeManager:
         category: str,
         position: Any | None = None,
         fallback: float | None = None,
-        provider: str = PROVIDER_ALPACA,
+        provider: str = PROVIDER_ETORO,
     ) -> float:
-        broker = self.broker(provider) or self.alpaca_client
+        broker = self.broker(provider)
         try:
             if broker is None:
                 raise RuntimeError(f"No broker registered for provider {provider}")
@@ -297,26 +251,25 @@ class TradeManager:
             )
         return int(row["count"]) if row else 0
 
-    def compute_allocated_capital(self, provider: str = PROVIDER_ALPACA) -> float:
+    def compute_allocated_capital(self, provider: str = PROVIDER_ETORO) -> float:
         broker = self.broker(provider)
         if broker is None:
             return 0.0
         cash = broker.get_available_cash()
-        if provider == PROVIDER_BINANCE:
-            slots = max(int(self.config.max_open_trades_binance), 1)
-            active = self.count_active_trades("CRYPTO", provider=PROVIDER_BINANCE)
-        else:
-            slots = self.config.max_open_trades_stock + self.config.max_open_trades_crypto
-            # For Alpaca we use the legacy aggregate (across STOCK + CRYPTO)
-            # because the cash pool itself is shared between the two
-            # categories on Alpaca's side.
-            active = sum(
-                1
-                for t in self.get_open_or_pending_trades()
-                if self._trade_provider(t) == PROVIDER_ALPACA
-            )
+        slots = self.config.max_open_trades_stock + self.config.max_open_trades_crypto
+        # The cash pool is shared between STOCK and CRYPTO, so we use the
+        # aggregate count of this provider's active trades across categories.
+        active = sum(
+            1
+            for t in self.get_open_or_pending_trades()
+            if self._trade_provider(t) == provider
+        )
         available_slots = max(slots - active, 1)
-        return round(cash / available_slots, 2)
+        allocated = round(cash / available_slots, 2)
+        minimum = float(getattr(self.config, "etoro_min_trade_amount", 0.0) or 0.0)
+        if minimum > 0 and 0 < allocated < minimum and cash >= minimum:
+            return minimum
+        return allocated
 
     def _cancel_pending_trade_record(
         self,
@@ -341,147 +294,20 @@ class TradeManager:
                 ),
             )
 
-    def _update_pending_trade_submission(self, trade: dict[str, Any], order_payload: dict[str, Any]) -> None:
-        order = order_payload["order"]
-        submitted_entry_price = (
-            self._as_float(order_payload.get("submitted_entry_price"))
-            or self._as_float(getattr(order, "limit_price", None))
-            or self._as_float(trade.get("entry_price"))
-            or self._as_float(trade.get("target_entry_price"))
-            or 0.0
-        )
-        quantity = self._as_float(order_payload.get("quantity")) or float(trade["quantity"])
-        with db_cursor(self.config.db_trades) as cursor:
-            cursor.execute(
-                """
-                UPDATE trades
-                SET entry_price = ?, quantity = ?, alpaca_order_id = ?, client_order_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    submitted_entry_price,
-                    quantity,
-                    str(getattr(order, "id", "")),
-                    order_payload["client_order_id"],
-                    trade["id"],
-                ),
-            )
-
-    def _max_acceptable_crypto_entry_price(self, target_entry_price: float) -> float:
-        return target_entry_price * (1 + (self.config.crypto_entry_max_chase_bps / 10_000.0))
-
-    def _max_acceptable_crypto_entry_price_for(self, trade: dict[str, Any], target_entry_price: float) -> float:
-        provider = self._trade_provider(trade)
-        if provider == PROVIDER_BINANCE:
-            chase_bps = int(self.config.binance_entry_max_chase_bps)
-        else:
-            chase_bps = int(self.config.crypto_entry_max_chase_bps)
-        return target_entry_price * (1 + (chase_bps / 10_000.0))
-
-    def _pending_reprice_minutes(self, trade: dict[str, Any]) -> int:
-        if self._trade_provider(trade) == PROVIDER_BINANCE:
-            return int(self.config.binance_pending_reprice_minutes)
-        return int(self.config.crypto_pending_reprice_minutes)
-
-    def _pending_cancel_minutes(self, trade: dict[str, Any]) -> int:
-        if self._trade_provider(trade) == PROVIDER_BINANCE:
-            return int(self.config.binance_pending_cancel_minutes)
-        return int(self.config.crypto_pending_cancel_minutes)
-
-    def _cancel_broker_order(self, trade: dict[str, Any], order_id: str) -> None:
-        broker = self._trade_broker(trade)
-        if broker is None:
-            return
-        provider = self._trade_provider(trade)
-        try:
-            if provider == PROVIDER_BINANCE:
-                broker.cancel_order_for_symbol(str(trade["symbol"]), str(order_id))
-            else:
-                broker.cancel_order(str(order_id))
-        except Exception as exc:
-            if "not found" not in str(exc).lower():
-                raise
-
-    def _refresh_live_crypto_pending_trade(self, trade: dict[str, Any], order: Any) -> None:
-        target_entry_price = self._as_float(trade.get("target_entry_price")) or self._as_float(trade.get("entry_price"))
-        if target_entry_price is None or target_entry_price <= 0:
-            return
-        broker = self._trade_broker(trade)
-        if broker is None:
-            return
-
-        trade_age_minutes = self._minutes_since(parse_datetime(trade.get("created_at"))) or 0.0
-        order_age_anchor = self._order_timestamp(order, "updated_at", "submitted_at", "created_at") or parse_datetime(trade.get("created_at"))
-        order_age_minutes = self._minutes_since(order_age_anchor) or 0.0
-
-        try:
-            quote = broker.get_latest_quote(str(trade["symbol"]), str(trade["category"]))
-        except Exception:
-            self.logger.warning("Could not fetch latest quote for pending crypto trade %s", trade["id"], exc_info=True)
-            return
-
-        live_ask = self._as_float(quote.get("ask_price")) or self._as_float(quote.get("bid_price"))
-        if live_ask is None or live_ask <= 0:
-            return
-
-        order_id = trade.get("alpaca_order_id")
-
-        if live_ask > self._max_acceptable_crypto_entry_price_for(trade, target_entry_price):
-            if order_id:
-                self._cancel_broker_order(trade, str(order_id))
-            self._cancel_pending_trade_record(trade, "ENTRY_PRICE_MOVED")
-            self.logger.info(
-                "Cancelled pending crypto trade %s because live ask %s moved above the allowed target drift from %s",
-                trade["id"],
-                live_ask,
-                target_entry_price,
-            )
-            return
-
-        if trade_age_minutes >= self._pending_cancel_minutes(trade):
-            if order_id:
-                self._cancel_broker_order(trade, str(order_id))
-            self._cancel_pending_trade_record(trade, "CRYPTO_ENTRY_TIMEOUT")
-            self.logger.info("Cancelled pending crypto trade %s after %s minutes without a fill", trade["id"], round(trade_age_minutes, 2))
-            return
-
-        if order_age_minutes < self._pending_reprice_minutes(trade):
-            return
-
-        if order_id:
-            self._cancel_broker_order(trade, str(order_id))
-
-        try:
-            replacement_order = broker.place_limit_entry_order(
-                symbol=str(trade["symbol"]),
-                category=str(trade["category"]),
-                entry_price=target_entry_price,
-                allocated_capital=float(trade["allocated_capital"]),
-            )
-        except Exception as exc:
-            if "too far above target" in str(exc).lower():
-                self._cancel_pending_trade_record(trade, "ENTRY_PRICE_MOVED")
-                self.logger.info("Cancelled pending crypto trade %s because the refreshed live price moved away", trade["id"])
-                return
-            raise
-
-        self._update_pending_trade_submission(trade, replacement_order)
-        self.logger.info("Resubmitted pending crypto trade %s with a refreshed marketable IOC limit", trade["id"])
-
     def _save_new_trade(
         self,
         category: str,
         symbol: str,
         signal: dict[str, Any],
-        order_payload: dict[str, Any],
+        instrument_id: int,
         allocated_capital: float,
-        provider: str = PROVIDER_ALPACA,
+        provider: str = PROVIDER_ETORO,
     ) -> None:
-        order = order_payload["order"]
         trailing_take_profit_distance = self._as_float(signal.get("trailing_take_profit_distance"))
         trailing_take_profit_activation_pct = self._as_float(signal.get("trailing_take_profit_activation_pct"))
         trailing_stop_distance = self._as_float(signal.get("trailing_stop_distance"))
-        submitted_entry_price = self._as_float(order_payload.get("submitted_entry_price")) or float(signal["entry_price"])
+        target_entry_price = float(signal["entry_price"])
+        provisional_quantity = (allocated_capital / target_entry_price) if target_entry_price > 0 else 0.0
         account_currency = self.config.provider_account_currency(provider)
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
@@ -490,25 +316,23 @@ class TradeManager:
                     symbol, category, direction, status, entry_price, target_entry_price, quantity, allocated_capital,
                     take_profit, trailing_take_profit_distance, trailing_take_profit_activation_pct,
                     stop_loss, trailing_stop_distance,
-                    alpaca_order_id, client_order_id,
-                    reasoning, confidence, trade_score,
+                    instrument_id, reasoning, confidence, trade_score,
                     provider, account_currency
-                ) VALUES (?, ?, 'LONG', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'LONG', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
                     category,
-                    submitted_entry_price,
-                    float(signal["entry_price"]),
-                    float(order_payload["quantity"]),
+                    target_entry_price,
+                    target_entry_price,
+                    provisional_quantity,
                     allocated_capital,
                     float(signal["take_profit"]),
                     trailing_take_profit_distance,
                     trailing_take_profit_activation_pct,
                     float(signal["stop_loss"]),
                     trailing_stop_distance,
-                    str(getattr(order, "id", "")),
-                    order_payload["client_order_id"],
+                    int(instrument_id),
                     signal.get("reasoning"),
                     signal.get("confidence"),
                     self._as_float(signal.get("trade_score")),
@@ -516,7 +340,7 @@ class TradeManager:
                     account_currency,
                 ),
             )
-        self.logger.info("Stored new pending trade for %s on %s", symbol, provider)
+        self.logger.info("Stored new pending (emulated-limit) trade for %s on %s", symbol, provider)
 
     def _signal_has_required_levels(self, signal: dict[str, Any]) -> bool:
         for field in ("entry_price", "take_profit", "stop_loss"):
@@ -588,10 +412,8 @@ class TradeManager:
             return False
         return True
 
-    def _available_trade_slots(self, category: str, provider: str = PROVIDER_ALPACA) -> int:
-        if provider == PROVIDER_BINANCE:
-            max_trades = int(self.config.max_open_trades_binance)
-        elif category == "STOCK":
+    def _available_trade_slots(self, category: str, provider: str = PROVIDER_ETORO) -> int:
+        if category == "STOCK":
             max_trades = int(self.config.max_open_trades_stock)
         else:
             max_trades = int(self.config.max_open_trades_crypto)
@@ -601,7 +423,7 @@ class TradeManager:
         self,
         category: str,
         symbols: list[str],
-        provider: str = PROVIDER_ALPACA,
+        provider: str = PROVIDER_ETORO,
     ) -> list[dict[str, Any]]:
         broker = self.broker(provider)
         payloads: list[dict[str, Any]] = []
@@ -640,7 +462,7 @@ class TradeManager:
         category: str,
         symbol: str,
         signal: dict[str, Any],
-        provider: str = PROVIDER_ALPACA,
+        provider: str = PROVIDER_ETORO,
     ) -> bool:
         if self.get_symbol_trades(symbol, provider=provider):
             self.logger.debug("Skipping %s because an active trade already exists for the symbol", symbol)
@@ -668,32 +490,17 @@ class TradeManager:
             return False
 
         allocated_capital = self.compute_allocated_capital(provider=provider)
-        try:
-            order_payload = broker.place_limit_entry_order(
-                symbol=symbol,
-                category=category,
-                entry_price=float(signal["entry_price"]),
-                allocated_capital=allocated_capital,
-            )
-        except Exception as exc:
-            if broker.is_insufficient_balance_error(exc):
-                self.logger.warning(
-                    "Skipping %s because available capital is insufficient for the proposed entry",
-                    symbol,
-                )
-                return False
-            if category == "CRYPTO" and "too far above target" in str(exc).lower():
-                self.logger.info(
-                    "Skipping %s because the live %s ask moved too far above the GPT target",
-                    symbol,
-                    provider,
-                )
-                return False
-            raise
-        self._save_new_trade(category, symbol, signal, order_payload, allocated_capital, provider=provider)
+        if allocated_capital <= 0:
+            self.logger.warning("Skipping %s because allocated capital is zero", symbol)
+            return False
+        instrument_id = broker.instrument_id_for_symbol(symbol)
+        if instrument_id is None:
+            self.logger.warning("Skipping %s because it is not a tradable %s instrument", symbol, provider)
+            return False
+        self._save_new_trade(category, symbol, signal, instrument_id, allocated_capital, provider=provider)
         return True
 
-    def maybe_open_trade(self, category: str, symbol: str, provider: str = PROVIDER_ALPACA) -> None:
+    def maybe_open_trade(self, category: str, symbol: str, provider: str = PROVIDER_ETORO) -> None:
         broker = self.broker(provider)
         if broker is None:
             return
@@ -730,124 +537,112 @@ class TradeManager:
             return
         self._open_trade_from_signal(category, symbol, signal, provider=provider)
 
-    def _activate_trade_from_entry_fill(self, trade: dict[str, Any], order: Any) -> None:
+    def _entry_fill_ceiling(self, target_entry_price: float) -> float:
+        return target_entry_price * (1 + (int(self.config.crypto_entry_max_chase_bps) / 10_000.0))
+
+    def sync_pending_trade(self, trade: dict[str, Any]) -> None:
+        """Emulated limit entry: fill at market once price touches the target.
+
+        No broker order rests while PENDING — each monitor tick polls the rate
+        and, when the ask is at/below the target (within the chase tolerance),
+        fires a market open and activates the trade. Unfilled trades are
+        cancelled (a pure DB state change) once they age past the window.
+        """
+
         broker = self._trade_broker(trade)
-        position = broker.get_open_position(trade["symbol"]) if broker is not None else None
-        filled_quantity = (
-            self._as_float(getattr(order, "filled_qty", None))
-            or self._as_float(getattr(position, "qty", None))
-            or float(trade["quantity"])
-        )
-        entry_price = (
-            self._as_float(getattr(order, "filled_avg_price", None))
-            or self._as_float(getattr(position, "avg_entry_price", None))
-            or float(trade["entry_price"])
-        )
+        if broker is None:
+            return
+
+        existing = broker.get_open_position(trade["symbol"])
+        if existing is not None:
+            self._activate_trade_from_position(trade, existing, None)
+            return
+
+        target = self._as_float(trade.get("target_entry_price")) or self._as_float(trade.get("entry_price"))
+        if target is None or target <= 0:
+            return
+
+        age_minutes = self._minutes_since(parse_datetime(trade.get("created_at"))) or 0.0
+        if age_minutes >= int(self.config.crypto_pending_cancel_minutes):
+            self._cancel_pending_trade_record(trade, "ENTRY_TIMEOUT")
+            self.logger.info(
+                "Cancelled pending trade %s after %s min without touching target", trade["id"], round(age_minutes, 1)
+            )
+            return
+
+        try:
+            quote = broker.get_latest_quote(str(trade["symbol"]), str(trade["category"]))
+        except Exception:
+            self.logger.warning("Could not fetch quote for pending trade %s", trade["id"], exc_info=True)
+            return
+        ask = self._as_float(quote.get("ask_price")) or self._as_float(quote.get("bid_price"))
+        if ask is None or ask <= 0:
+            return
+        if ask > self._entry_fill_ceiling(target):
+            return  # wait for price to come down to the limit
+
+        instrument_id = int(trade.get("instrument_id") or 0) or broker.instrument_id_for_symbol(trade["symbol"])
+        if not instrument_id:
+            self._cancel_pending_trade_record(trade, "INSTRUMENT_UNRESOLVED")
+            return
+        try:
+            result = broker.open_market_position(
+                instrument_id=int(instrument_id),
+                symbol=str(trade["symbol"]),
+                amount_usd=float(trade["allocated_capital"]),
+                stop_loss_rate=float(trade["stop_loss"]),
+                take_profit_rate=float(trade["take_profit"]),
+                leverage=int(getattr(self.config, "etoro_default_leverage", 1) or 1),
+            )
+        except Exception:
+            self.logger.exception("Market open failed for pending trade %s; cancelling", trade["id"])
+            self._cancel_pending_trade_record(trade, "ENTRY_FAILED")
+            return
+
+        position = broker.get_open_position(trade["symbol"])
+        self._activate_trade_from_position(trade, position, result)
+
+    def _activate_trade_from_position(
+        self, trade: dict[str, Any], position: Any, open_result: dict[str, Any] | None
+    ) -> None:
+        target = self._as_float(trade.get("target_entry_price")) or self._as_float(trade.get("entry_price")) or 0.0
+        pos = position if isinstance(position, dict) else {}
+        entry_price = self._as_float(pos.get("open_rate")) or target or float(trade["entry_price"])
+        quantity = self._as_float(pos.get("units")) or float(trade["quantity"])
+        position_id = str(pos.get("position_id") or (open_result or {}).get("position_id") or "") or None
+        reference_id = str((open_result or {}).get("reference_id") or (open_result or {}).get("request_id") or "") or None
+
         current_price = self._resolve_current_price(
-            trade["symbol"],
-            trade["category"],
-            position=position,
-            fallback=entry_price,
+            trade["symbol"], trade["category"], position=None, fallback=entry_price,
             provider=self._trade_provider(trade),
         )
-        high_water_mark = max(
-            self._as_float(trade.get("high_water_mark")) or entry_price,
-            entry_price,
-            current_price,
-        )
+        high_water_mark = max(self._as_float(trade.get("high_water_mark")) or entry_price, entry_price, current_price)
         trailing_stop_price = self._compute_trailing_stop_price(
-            high_water_mark,
-            self._as_float(trade.get("trailing_stop_distance")),
+            high_water_mark, self._as_float(trade.get("trailing_stop_distance"))
         )
         trailing_take_profit_price = self._compute_trailing_take_profit_price(
-            high_water_mark,
-            entry_price,
+            high_water_mark, entry_price,
             self._as_float(trade.get("trailing_take_profit_distance")),
             self._as_float(trade.get("trailing_take_profit_activation_pct")),
             self.config.trailing_tp_min_profit_buffer_pct,
         )
-        pnl = (current_price - entry_price) * filled_quantity
-        open_timestamp = self._order_timestamp(order, "filled_at", "updated_at", "submitted_at") or utc_now()
+        pnl = (current_price - entry_price) * quantity
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
                 """
                 UPDATE trades
                 SET status = 'OPEN', open_timestamp = ?, entry_price = ?, quantity = ?, current_price = ?, pnl = ?,
-                    high_water_mark = ?, trailing_take_profit_price = ?, trailing_stop_price = ?, updated_at = CURRENT_TIMESTAMP
+                    high_water_mark = ?, trailing_take_profit_price = ?, trailing_stop_price = ?,
+                    position_id = ?, order_reference_id = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (
-                    isoformat_utc(open_timestamp),
-                    entry_price,
-                    filled_quantity,
-                    current_price,
-                    pnl,
-                    high_water_mark,
-                    trailing_take_profit_price,
-                    trailing_stop_price,
-                    trade["id"],
+                    isoformat_utc(utc_now()), entry_price, quantity, current_price, pnl,
+                    high_water_mark, trailing_take_profit_price, trailing_stop_price,
+                    position_id, reference_id, trade["id"],
                 ),
             )
-        self.logger.info("Trade %s moved from PENDING to OPEN", trade["id"])
-
-    def _fetch_trade_order(self, trade: dict[str, Any], order_id: str) -> Any | None:
-        broker = self._trade_broker(trade)
-        if broker is None:
-            return None
-        try:
-            if self._trade_provider(trade) == PROVIDER_BINANCE:
-                return broker.get_order_for_symbol(str(trade["symbol"]), str(order_id))
-            return broker.get_order(str(order_id))
-        except Exception:
-            self.logger.warning(
-                "Could not fetch order %s for trade %s; falling back to position lookup",
-                order_id,
-                trade["id"],
-                exc_info=True,
-            )
-            return None
-
-    def sync_pending_trade(self, trade: dict[str, Any]) -> None:
-        broker = self._trade_broker(trade)
-        if broker is None:
-            return
-        order = None
-        if trade.get("alpaca_order_id"):
-            order = self._fetch_trade_order(trade, str(trade["alpaca_order_id"]))
-
-        position = broker.get_open_position(trade["symbol"])
-        if position is not None:
-            self._activate_trade_from_entry_fill(trade, order or position)
-            return
-
-        if order is None:
-            return
-
-        status = self._order_status(order)
-        if status in self.FILLED_ENTRY_STATUSES:
-            if status == "partially_filled":
-                try:
-                    self._cancel_broker_order(trade, str(trade["alpaca_order_id"]))
-                except Exception:
-                    self.logger.warning("Could not cancel partially-filled remainder for trade %s", trade["id"], exc_info=True)
-            self._activate_trade_from_entry_fill(trade, order)
-            return
-        if status in self.TERMINAL_PENDING_STATUSES:
-            close_timestamp = self._order_timestamp(order, "expired_at", "canceled_at", "updated_at") or utc_now()
-            with db_cursor(self.config.db_trades) as cursor:
-                cursor.execute(
-                    """
-                    UPDATE trades
-                    SET status = 'CANCELLED', close_reason = ?, close_timestamp = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (self.TERMINAL_PENDING_STATUSES[status], isoformat_utc(close_timestamp), trade["id"]),
-                )
-            self.logger.info("Pending trade %s cancelled with status %s", trade["id"], status)
-            return
-
-        if trade["category"] == "CRYPTO" and status in self.LIVE_PENDING_ENTRY_STATUSES:
-            self._refresh_live_crypto_pending_trade(trade, order)
+        self.logger.info("Trade %s opened on eToro (position %s)", trade["id"], position_id)
 
     def review_stale_pending_trades(self, min_age_days: int = 7) -> None:
         stale_trades = self.get_stale_pending_trades(min_age_days=min_age_days)
@@ -884,10 +679,8 @@ class TradeManager:
         if action != "CANCEL":
             return
 
-        order_id = trade.get("alpaca_order_id")
-        if order_id:
-            self._cancel_broker_order(trade, str(order_id))
-
+        # Emulated-limit pending trades hold no resting broker order, so a
+        # cancel is a pure record state change.
         self._cancel_pending_trade_record(
             trade,
             "STALE_PENDING_CANCELED",
@@ -920,33 +713,28 @@ class TradeManager:
         if trade.get("exit_order_id"):
             return
         broker = self._trade_broker(trade)
-        if broker is None:
+        position_id = trade.get("position_id")
+        if broker is None or not position_id:
             self._mark_trade_closed(trade, close_reason, trigger_price)
             return
         try:
-            order = broker.close_position_market(trade["symbol"])
+            order = broker.close_position_market(str(position_id))
         except Exception as exc:
             message = str(exc).lower()
-            if "position does not exist" in message or "not found" in message or "no open" in message:
+            if "position" in message and ("not" in message or "exist" in message):
                 self._mark_trade_closed(trade, close_reason, trigger_price)
                 return
             raise
+        order_id = str((order or {}).get("order_id") or "") or None
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
                 """
                 UPDATE trades
-                SET exit_order_id = ?, exit_client_order_id = ?, exit_requested_at = ?, pending_close_reason = ?,
+                SET exit_order_id = ?, exit_requested_at = ?, pending_close_reason = ?,
                     current_price = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (
-                    str(getattr(order, "id", "")),
-                    str(getattr(order, "client_order_id", "")),
-                    isoformat_utc(utc_now()),
-                    close_reason,
-                    trigger_price,
-                    trade["id"],
-                ),
+                (order_id, isoformat_utc(utc_now()), close_reason, trigger_price, trade["id"]),
             )
         refreshed_trade = self.get_trade(trade["id"]) or trade
         self._sync_exit_order(refreshed_trade)
@@ -957,46 +745,20 @@ class TradeManager:
         self._mark_trade_closed(trade, reason, close_price)
 
     def _sync_exit_order(self, trade: dict[str, Any]) -> None:
-        exit_order_id = trade.get("exit_order_id")
-        if not exit_order_id:
+        if not trade.get("exit_order_id"):
             return
         broker = self._trade_broker(trade)
         if broker is None:
             return
-        order = self._fetch_trade_order(trade, str(exit_order_id))
-        if order is None:
-            # Without order context we can't decide; leave the trade as-is.
-            return
-        status = self._order_status(order)
-        if status == "filled":
-            close_price = self._as_float(getattr(order, "filled_avg_price", None)) or float(trade.get("current_price") or trade["entry_price"])
-            close_timestamp = self._order_timestamp(order, "filled_at", "updated_at") or utc_now()
+        position = broker.get_open_position(trade["symbol"])
+        if position is None:
+            close_price = self._as_float(trade.get("current_price")) or float(trade["entry_price"])
             self._mark_trade_closed(
-                trade,
-                str(trade.get("pending_close_reason") or "MARKET_EXIT"),
-                close_price,
-                close_timestamp,
+                trade, str(trade.get("pending_close_reason") or "MARKET_EXIT"), close_price
             )
             return
-        if status in self.TERMINAL_EXIT_STATUSES:
-            position = broker.get_open_position(trade["symbol"])
-            if position is None:
-                self._close_trade_without_position(trade)
-                return
-            with db_cursor(self.config.db_trades) as cursor:
-                cursor.execute(
-                    """
-                    UPDATE trades
-                    SET exit_order_id = NULL, exit_client_order_id = NULL, exit_requested_at = NULL,
-                        pending_close_reason = NULL, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (trade["id"],),
-                )
-            self.logger.warning("Exit order for trade %s ended with %s; trade remains OPEN", trade["id"], status)
-            return
-        if broker.get_open_position(trade["symbol"]) is None:
-            self._close_trade_without_position(trade)
+        # Position still present: the market close is in flight; retry next tick.
+        self.logger.debug("Exit for trade %s still pending (position open)", trade["id"])
 
     def refresh_open_trade_protections(self) -> None:
         open_trades = [
@@ -1135,11 +897,11 @@ class TradeManager:
             self._close_trade_without_position(trade)
             return
 
-        quantity = self._as_float(getattr(position, "qty", None)) or float(trade["quantity"])
+        quantity = self._as_float(position.get("units")) or float(trade["quantity"])
         current_price = self._resolve_current_price(
             trade["symbol"],
             trade["category"],
-            position=position,
+            position=None,
             fallback=float(trade.get("current_price") or trade["entry_price"]),
             provider=self._trade_provider(trade),
         )
@@ -1197,10 +959,6 @@ class TradeManager:
                     self.sync_open_trade(trade)
             except Exception:
                 self.logger.exception("Failed to sync trade %s", trade["id"])
-
-    # Legacy alias retained for any external caller still using the
-    # Alpaca-flavoured method name.
-    sync_alpaca_state = sync_broker_state
 
     def _evaluate_provider_category(
         self,
@@ -1269,9 +1027,9 @@ class TradeManager:
 
         for provider, categories in universe.items():
             if not isinstance(categories, dict):
-                # Legacy flat dict — assume Alpaca.
+                # Legacy flat dict — assume eToro.
                 if isinstance(categories, list):
-                    self._evaluate_provider_category(PROVIDER_ALPACA, str(provider).upper(), list(categories))
+                    self._evaluate_provider_category(PROVIDER_ETORO, str(provider).upper(), list(categories))
                 continue
             if self.broker(provider) is None:
                 continue
@@ -1292,7 +1050,7 @@ class TradeManager:
             if not isinstance(categories, dict):
                 if isinstance(categories, list):
                     for sym in categories:
-                        monitored[sym] = {"category": str(provider).upper(), "provider": PROVIDER_ALPACA}
+                        monitored[sym] = {"category": str(provider).upper(), "provider": PROVIDER_ETORO}
                 continue
             for category, symbols in categories.items():
                 cat = str(category).upper()
@@ -1301,7 +1059,7 @@ class TradeManager:
         for trade in self.get_open_or_pending_trades():
             monitored[trade["symbol"]] = {
                 "category": str(trade["category"]),
-                "provider": str(trade.get("provider") or PROVIDER_ALPACA),
+                "provider": str(trade.get("provider") or PROVIDER_ETORO),
             }
         return monitored
 

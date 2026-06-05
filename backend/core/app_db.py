@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS account_equity_snapshots (
     recorded_at TEXT NOT NULL,
     equity      REAL NOT NULL,
     currency    TEXT NOT NULL DEFAULT 'USD',
-    provider    TEXT NOT NULL DEFAULT 'alpaca'
+    provider    TEXT NOT NULL DEFAULT 'etoro'
 );
 CREATE INDEX IF NOT EXISTS idx_equity_snapshots_recorded ON account_equity_snapshots(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_equity_snapshots_provider ON account_equity_snapshots(provider, recorded_at);
@@ -173,7 +173,7 @@ def _ensure_equity_snapshot_columns(connection: sqlite3.Connection) -> None:
         cursor.close()
     if "provider" not in existing:
         connection.execute(
-            "ALTER TABLE account_equity_snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'alpaca'"
+            "ALTER TABLE account_equity_snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'etoro'"
         ).close()
 
 
@@ -226,7 +226,7 @@ def seed_admin_user_if_missing(
     return app_fetch_one(db_path, "SELECT * FROM users WHERE username = ?", (username,))
 
 
-ALPACA_PROMPT_KEYS: tuple[str, ...] = (
+PROMPT_KEYS: tuple[str, ...] = (
     "new_signal",
     "batch_signals",
     "pending_review",
@@ -236,25 +236,6 @@ ALPACA_PROMPT_KEYS: tuple[str, ...] = (
     "universe_final",
     "universe_final_from_dossiers",
 )
-
-BINANCE_PROMPT_KEYS: tuple[str, ...] = (
-    "binance_new_signal",
-    "binance_batch_signals",
-    "binance_pending_review",
-    "binance_protection_review",
-    "binance_universe_dossier",
-    "binance_universe_shortlist",
-    "binance_universe_final",
-    "binance_universe_final_from_dossiers",
-)
-
-PROMPT_KEYS: tuple[str, ...] = ALPACA_PROMPT_KEYS + BINANCE_PROMPT_KEYS
-
-
-def prompt_key_provider(key: str) -> str:
-    """Return the provider that owns a prompt key (``alpaca`` or ``binance``)."""
-
-    return "binance" if key.startswith("binance_") else "alpaca"
 
 
 def seed_initial_prompt_versions(db_path: str, defaults: dict[str, str]) -> None:

@@ -8,8 +8,7 @@ date by the script-managed lifecycle every minute.
 Multi-provider aware: each trade carries its own ``provider`` and
 ``account_currency``. Monetary fields are converted to the user's
 display currency at API edge using the trade's own native currency,
-so the dashboard sums Alpaca (USD) and Binance (USDT) trades into the
-same display number.
+so the dashboard reports every trade in the same display number.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from typing import Any, Mapping
 from core import fx
 from core.db import fetch_all
 from core.utils import (
-    PROVIDER_ALPACA,
+    PROVIDER_ETORO,
     AppConfig,
     parse_datetime,
     utc_now,
@@ -103,25 +102,11 @@ class MetricsService:
         self,
         config: AppConfig,
         logger: logging.Logger,
-        broker_clients: Mapping[str, Any] | Any | None = None,
-        *,
-        alpaca_client: Any | None = None,
+        broker_clients: Mapping[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.logger = logger.getChild("metrics")
-        if broker_clients is None:
-            self._brokers: dict[str, Any] = {}
-        elif isinstance(broker_clients, Mapping):
-            self._brokers = dict(broker_clients)
-        else:
-            # Backwards-compat for the single-broker constructor.
-            self._brokers = {PROVIDER_ALPACA: broker_clients}
-        if alpaca_client is not None:
-            self._brokers[PROVIDER_ALPACA] = alpaca_client
-
-    @property
-    def alpaca_client(self) -> Any | None:
-        return self._brokers.get(PROVIDER_ALPACA)
+        self._brokers: dict[str, Any] = dict(broker_clients) if isinstance(broker_clients, Mapping) else {}
 
     @property
     def brokers(self) -> dict[str, Any]:
@@ -157,7 +142,7 @@ class MetricsService:
         currency = str(trade.get("account_currency") or "").strip().upper()
         if currency:
             return currency
-        provider = str(trade.get("provider") or PROVIDER_ALPACA)
+        provider = str(trade.get("provider") or PROVIDER_ETORO)
         return self.config.provider_account_currency(provider)
 
     # -- raw trade access --------------------------------------------------
@@ -233,7 +218,7 @@ class MetricsService:
                 if converted is not None:
                     out[field] = converted
         # Surface the originating provider so the UI can group / badge.
-        out.setdefault("provider", str(row.get("provider") or PROVIDER_ALPACA))
+        out.setdefault("provider", str(row.get("provider") or PROVIDER_ETORO))
         out.setdefault("account_currency", native)
         return out
 
@@ -494,7 +479,7 @@ class MetricsService:
         agg: dict[tuple[str, str], dict[str, Any]] = {}
         for r in closed_in_period:
             sym = str(r.get("symbol", "")).upper()
-            provider = str(r.get("provider") or PROVIDER_ALPACA)
+            provider = str(r.get("provider") or PROVIDER_ETORO)
             key = (sym, provider)
             entry = agg.setdefault(
                 key,
@@ -539,7 +524,7 @@ class MetricsService:
             value_native = qty * (current if current > 0 else entry)
             value_display = float(self._fx_convert(value_native, source_currency=native) or 0.0)
             cat = str(r.get("category", "")).upper()
-            provider = str(r.get("provider") or PROVIDER_ALPACA)
+            provider = str(r.get("provider") or PROVIDER_ETORO)
             by_category[cat] = by_category.get(cat, 0.0) + value_display
             by_provider[provider] = by_provider.get(provider, 0.0) + value_display
             by_symbol.append(

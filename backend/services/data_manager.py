@@ -1,8 +1,8 @@
 """Market data download, persistence, and cleanup.
 
 Multi-provider aware: receives a registry of broker clients keyed by provider
-name (``alpaca``, ``binance``) and dispatches OHLCV fetches to whichever
-broker owns the symbol.
+name (``etoro``) and dispatches OHLCV fetches to whichever broker owns the
+symbol.
 """
 
 from __future__ import annotations
@@ -22,24 +22,11 @@ class DataManager:
         self,
         config: AppConfig,
         logger: logging.Logger,
-        broker_clients: Mapping[str, Any] | Any | None = None,
-        *,
-        alpaca_client: Any | None = None,
+        broker_clients: Mapping[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.logger = logger.getChild("data_manager")
-        if isinstance(broker_clients, Mapping):
-            self._brokers: dict[str, Any] = dict(broker_clients)
-        elif broker_clients is not None:
-            self._brokers = {"alpaca": broker_clients}
-        else:
-            self._brokers = {}
-        if alpaca_client is not None:
-            self._brokers["alpaca"] = alpaca_client
-
-    @property
-    def alpaca_client(self) -> Any | None:
-        return self._brokers.get("alpaca")
+        self._brokers: dict[str, Any] = dict(broker_clients) if isinstance(broker_clients, Mapping) else {}
 
     def broker(self, provider: str) -> Any | None:
         return self._brokers.get(provider)
@@ -79,7 +66,7 @@ class DataManager:
         return row["timestamp"] if row else None
 
     @retry()
-    def update_symbol(self, symbol: str, category: str, provider: str = "alpaca") -> int:
+    def update_symbol(self, symbol: str, category: str, provider: str = "etoro") -> int:
         normalized_symbol = str(symbol).upper().strip()
         broker = self.broker(provider)
         if broker is None:
@@ -138,7 +125,7 @@ class DataManager:
         """Bulk update OHLCV for a set of monitored symbols.
 
         ``symbol_categories`` may map ``symbol -> category`` (legacy single-broker
-        shape, defaults to Alpaca) or ``symbol -> {category, provider}`` /
+        shape, defaults to eToro) or ``symbol -> {category, provider}`` /
         ``symbol -> (category, provider)`` for the multi-provider case.
         """
 
@@ -157,6 +144,6 @@ class DataManager:
             return str(value[0]).upper(), str(value[1]).lower()
         if isinstance(value, dict):
             category = str(value.get("category") or "CRYPTO").upper()
-            provider = str(value.get("provider") or "alpaca").lower()
+            provider = str(value.get("provider") or "etoro").lower()
             return category, provider
-        return str(value).upper(), "alpaca"
+        return str(value).upper(), "etoro"

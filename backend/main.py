@@ -7,8 +7,7 @@ import threading
 from typing import Any
 
 from api.api_server import create_api_server
-from clients.alpaca_client import AlpacaClient
-from clients.binance_client import BinanceClient
+from clients.etoro_client import EToroClient
 from clients.gpt_client import GPTClient, get_default_prompts
 from core.app_db import (
     initialize_app_database,
@@ -19,8 +18,7 @@ from core.app_db import (
 from core.db import initialize_databases
 from core.logger import setup_logging
 from core.utils import (
-    PROVIDER_ALPACA,
-    PROVIDER_BINANCE,
+    PROVIDER_ETORO,
     apply_settings_overlay,
     load_config,
 )
@@ -58,9 +56,7 @@ def main() -> None:
             config.admin_username,
         )
 
-    # Seed the initial prompt versions from the hard-coded constants. This
-    # now seeds both the Alpaca prompts and the Binance variants — the
-    # admin can keep the Binance ones unchanged or rewrite them.
+    # Seed the initial prompt versions from the hard-coded constants.
     seed_initial_prompt_versions(config.db_app, get_default_prompts())
 
     # Apply any operator-supplied settings overlay before instantiating the
@@ -89,16 +85,11 @@ def main() -> None:
     # ``GET /api/providers`` and hides surfaces accordingly.
     # ------------------------------------------------------------------
     brokers: dict[str, Any] = {}
-    if config.alpaca_enabled:
-        brokers[PROVIDER_ALPACA] = AlpacaClient(config, logger)
-        logger.info("Alpaca client enabled")
+    if config.etoro_enabled:
+        brokers[PROVIDER_ETORO] = EToroClient(config, logger)
+        logger.info("eToro client enabled (%s account)", "demo" if config.demo else "real")
     else:
-        logger.info("Alpaca credentials missing; module disabled")
-    if config.binance_enabled:
-        brokers[PROVIDER_BINANCE] = BinanceClient(config, logger)
-        logger.info("Binance client enabled (base_url=%s)", config.binance_base_url)
-    else:
-        logger.info("Binance credentials missing; module disabled")
+        logger.info("eToro credentials missing; module disabled")
 
     if not brokers:
         logger.warning(
