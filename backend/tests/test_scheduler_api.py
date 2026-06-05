@@ -287,6 +287,43 @@ class TradingApiServerTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
 
+    def test_restart_required_set_on_change_and_cleared_after_restart(self) -> None:
+        """Changing a restart-only setting flags a restart, and a real restart
+        (a fresh app re-snapshotting the overlay) clears the flag — the bug was
+        that the banner stayed on forever because it only checked whether the
+        overlay contained any restart-required key."""
+        from api.api_server import create_app
+        from fastapi.testclient import TestClient
+
+        self._login_admin()
+
+        # Change a restart-only setting (log_level) to a value different from
+        # what this process booted with (the class app booted with no overlay).
+        patched = self._client.patch("/api/settings", json={"log_level": "DEBUG"})
+        self.assertEqual(patched.status_code, 200, patched.text)
+        self.assertTrue(patched.json()["restart_required"])
+
+        # The flag persists across GETs until a restart actually happens.
+        got = self._client.get("/api/settings")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertTrue(got.json()["restart_required"])
+
+        # Simulate `docker down && docker up`: a fresh app instance against the
+        # same DB re-snapshots the now-updated overlay as its boot baseline.
+        restarted_app = create_app(self._scheduler, logging.getLogger("test"))
+        with TestClient(restarted_app) as restarted:
+            login = restarted.post(
+                "/api/auth/login",
+                json={
+                    "username": self._config.admin_username,
+                    "password": self._config.admin_password,
+                },
+            )
+            self.assertEqual(login.status_code, 200, login.text)
+            got_after = restarted.get("/api/settings")
+            self.assertEqual(got_after.status_code, 200, got_after.text)
+            self.assertFalse(got_after.json()["restart_required"])
+
     def test_health_endpoint_is_public(self) -> None:
         response = self._client.get("/")
         self.assertEqual(response.status_code, 200)
@@ -320,6 +357,216 @@ class TradingApiServerTests(unittest.TestCase):
         self.assertEqual(body["line_count"], 2)
         self.assertEqual(body["log_file"], str(self._log_file))
         self.assertEqual(body["logs"], "line 2\nline 3\n")
+
+    def test_live_stream_requires_auth(self) -> None:
+        # No login cookie — must be rejected with 401.
+        response = self._client.get("/api/live/stream")
+        self.assertEqual(response.status_code, 401)
+
+    def test_candles_endpoint_requires_auth(self) -> None:
+        # No auth cookie — must be rejected with 401.
+        response = self._client.get("/api/candles?symbol=BTC")
+        self.assertEqual(response.status_code, 401)
+
+    def test_candles_with_stubbed_broker_returns_ohlc_shape(self) -> None:
+        """Authenticated request with a stubbed eToro broker returns mapped candle shape."""
+        from unittest.mock import Mock
+
+        fake_bars = [
+            {
+                "symbol": "BTC",
+                "timestamp": "2024-01-01T00:00:00+00:00",
+                "open": 40000.0,
+                "high": 41000.0,
+                "low": 39000.0,
+                "close": 40500.0,
+                "volume": 100.0,
+            },
+            {
+                "symbol": "BTC",
+                "timestamp": "2024-01-02T00:00:00+00:00",
+                "open": 40500.0,
+                "high": 42000.0,
+                "low": 40000.0,
+                "close": 41500.0,
+                "volume": 200.0,
+            },
+        ]
+        broker_stub = Mock()
+        broker_stub.instrument_id_for_symbol.return_value = 12345
+        broker_stub.get_candles_by_instrument.return_value = fake_bars
+
+        # Temporarily wire the stub broker into the scheduler's trade_manager.
+        original_brokers = self._scheduler.trade_manager.brokers
+        self._scheduler.trade_manager.brokers = {"etoro": broker_stub}
+        try:
+            self._login_admin()
+            response = self._client.get("/api/candles?symbol=BTC&count=2")
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual(body["symbol"], "BTC")
+            self.assertEqual(body["category"], "CRYPTO")
+            self.assertEqual(body["granularity"], "OneDay")
+            candles = body["candles"]
+            self.assertEqual(len(candles), 2)
+            # Verify the mapped compact shape for the first candle.
+            c = candles[0]
+            self.assertIn("t", c)
+            self.assertAlmostEqual(c["o"], 40000.0)
+            self.assertAlmostEqual(c["h"], 41000.0)
+            self.assertAlmostEqual(c["l"], 39000.0)
+            self.assertAlmostEqual(c["c"], 40500.0)
+            self.assertAlmostEqual(c["v"], 100.0)
+            # broker was called with the right args
+            broker_stub.instrument_id_for_symbol.assert_called_once_with("BTC")
+            broker_stub.get_candles_by_instrument.assert_called_once_with(
+                12345, "BTC", count=2, interval="OneDay"
+            )
+        finally:
+            self._scheduler.trade_manager.brokers = original_brokers
+            self._client.cookies.clear()
+
+    def test_candles_returns_503_when_no_broker_configured(self) -> None:
+        """When no eToro broker is registered, the endpoint returns 503."""
+        original_brokers = self._scheduler.trade_manager.brokers
+        self._scheduler.trade_manager.brokers = {}
+        try:
+            self._login_admin()
+            response = self._client.get("/api/candles?symbol=BTC")
+            self.assertEqual(response.status_code, 503)
+            detail = response.json()["detail"]
+            self.assertEqual(detail["error"]["code"], "no_broker_configured")
+        finally:
+            self._scheduler.trade_manager.brokers = original_brokers
+            self._client.cookies.clear()
+
+
+@unittest.skipUnless(_FASTAPI_AVAILABLE, "fastapi not installed in this test env")
+class CandleToDictTests(unittest.TestCase):
+    """Unit tests for the module-level _candle_to_dict helper.
+
+    These are pure-Python tests: no broker, no network, no DB.
+    They run wherever FastAPI is importable (i.e. in Docker).
+    """
+
+    def _fn(self):
+        from api.api_server import _candle_to_dict
+        return _candle_to_dict
+
+    def test_maps_all_standard_bar_fields(self) -> None:
+        fn = self._fn()
+        bar = {
+            "symbol": "ETH",
+            "timestamp": "2024-03-15T00:00:00+00:00",
+            "open": 3000.0,
+            "high": 3100.0,
+            "low": 2900.0,
+            "close": 3050.0,
+            "volume": 500.0,
+        }
+        result = fn(bar)
+        self.assertIn("t", result)
+        self.assertIn("2024-03-15", result["t"])
+        self.assertAlmostEqual(result["o"], 3000.0)
+        self.assertAlmostEqual(result["h"], 3100.0)
+        self.assertAlmostEqual(result["l"], 2900.0)
+        self.assertAlmostEqual(result["c"], 3050.0)
+        self.assertAlmostEqual(result["v"], 500.0)
+
+    def test_volume_none_when_missing(self) -> None:
+        fn = self._fn()
+        bar = {
+            "symbol": "BTC",
+            "timestamp": "2024-01-01T00:00:00+00:00",
+            "open": 40000.0,
+            "high": 41000.0,
+            "low": 39000.0,
+            "close": 40500.0,
+            "volume": None,
+        }
+        result = fn(bar)
+        self.assertIsNone(result["v"])
+
+    def test_zero_volume_treated_as_zero_not_none(self) -> None:
+        fn = self._fn()
+        bar = {
+            "symbol": "BTC",
+            "timestamp": "2024-01-01T00:00:00+00:00",
+            "open": 40000.0,
+            "high": 41000.0,
+            "low": 39000.0,
+            "close": 40500.0,
+            "volume": 0.0,
+        }
+        result = fn(bar)
+        self.assertIsNotNone(result["v"])
+        self.assertAlmostEqual(result["v"], 0.0)
+
+    def test_timestamp_normalised_to_utc_iso(self) -> None:
+        fn = self._fn()
+        bar = {
+            "symbol": "BTC",
+            "timestamp": "2024-06-01T12:00:00+00:00",
+            "open": 1.0,
+            "high": 2.0,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 10.0,
+        }
+        result = fn(bar)
+        # Must be a non-empty string containing the date
+        self.assertIsInstance(result["t"], str)
+        self.assertIn("2024-06-01", result["t"])
+
+    def test_output_has_exactly_six_keys(self) -> None:
+        fn = self._fn()
+        bar = {
+            "symbol": "X",
+            "timestamp": "2024-01-01T00:00:00+00:00",
+            "open": 1.0,
+            "high": 2.0,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 5.0,
+        }
+        result = fn(bar)
+        self.assertEqual(set(result.keys()), {"t", "o", "h", "l", "c", "v"})
+
+
+@unittest.skipUnless(_FASTAPI_AVAILABLE, "fastapi not installed in this test env")
+class FormatEventTests(unittest.TestCase):
+    """Unit tests for the module-level _format_event SSE helper.
+
+    Requires FastAPI to be importable (needed to import api_server).
+    Run in Docker where all deps are available.
+    """
+
+    def test_simple_single_line_event(self) -> None:
+        from api.api_server import _format_event
+
+        result = _format_event("snapshot", json.dumps({"a": 1}))
+        self.assertIsInstance(result, bytes)
+        text = result.decode("utf-8")
+        self.assertIn("event: snapshot", text)
+        self.assertIn('data: {"a": 1}', text)
+        # SSE event terminated by a blank line.
+        self.assertTrue(text.endswith("\n\n"))
+
+    def test_empty_data_uses_empty_data_line(self) -> None:
+        from api.api_server import _format_event
+
+        result = _format_event("heartbeat", "")
+        text = result.decode("utf-8")
+        self.assertIn("event: heartbeat", text)
+        self.assertIn("data: ", text)
+
+    def test_multiline_data_each_line_prefixed(self) -> None:
+        from api.api_server import _format_event
+
+        result = _format_event("append", "line1\nline2")
+        text = result.decode("utf-8")
+        self.assertIn("data: line1", text)
+        self.assertIn("data: line2", text)
 
 
 if __name__ == "__main__":
