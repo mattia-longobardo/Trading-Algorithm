@@ -200,6 +200,11 @@ class EToroOrderTests(unittest.TestCase):
         self.assertEqual(body["action"], "open")
         self.assertEqual(body["transaction"], "buy")
         self.assertEqual(body["instrumentId"], 101)
+        # eToro rejects orders that supply BOTH symbol and instrumentId
+        # ("Exactly one of Symbol or InstrumentID must be provided"); send only
+        # the canonical instrumentId.
+        self.assertNotIn("symbol", body)
+        self.assertEqual(body["settlementType"], "real")
         self.assertEqual(body["orderType"], "mkt")
         self.assertEqual(body["amount"], 250.0)
         self.assertEqual(body["orderCurrency"], "usd")
@@ -210,16 +215,33 @@ class EToroOrderTests(unittest.TestCase):
         self.assertEqual(result["order_id"], "o1")
         self.assertEqual(result["reference_id"], "ref-1")
 
-    def test_close_position_market_builds_body(self):
-        client, session = make_client("real")
-        session.request.return_value = make_response(200, {"orderId": "c1"})
-        result = client.close_position_market("p1")
+    def test_close_position_market_uses_market_close_endpoint(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {"orderForClose": {"orderID": 42}})
+        result = client.close_position_market("p1", instrument_id=100000)
         args, kwargs = session.request.call_args
-        self.assertTrue(args[1].endswith("/api/v2/trading/execution/orders"))
+        self.assertEqual(args[0], "POST")
+        self.assertTrue(args[1].endswith("/api/v1/trading/execution/demo/market-close-orders/positions/p1"))
         body = kwargs["json"]
-        self.assertEqual(body["action"], "close")
-        self.assertEqual(body["positionIds"], ["p1"])
-        self.assertEqual(result["order_id"], "c1")
+        self.assertEqual(body["InstrumentID"], 100000)
+        self.assertNotIn("UnitsToDeduct", body)
+        self.assertEqual(result["raw"]["orderForClose"]["orderID"], 42)
+        self.assertEqual(result["order_id"], "42")
+
+    def test_close_position_market_partial_sends_units(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {"orderForClose": {"orderID": 43}})
+        client.close_position_market("p2", instrument_id=100000, units=0.5)
+        body = session.request.call_args.kwargs["json"]
+        self.assertEqual(body["UnitsToDeduct"], 0.5)
+
+    def test_cancel_order_deletes(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {"token": "t1"})
+        client.cancel_order("999")
+        args, _ = session.request.call_args
+        self.assertEqual(args[0], "DELETE")
+        self.assertTrue(args[1].endswith("/api/v2/trading/execution/demo/orders/999"))
 
     def test_open_uses_request_id_as_idempotency_key(self):
         client, session = make_client()
@@ -230,6 +252,69 @@ class EToroOrderTests(unittest.TestCase):
         )
         sent_request_id = session.request.call_args.kwargs["headers"]["x-request-id"]
         self.assertEqual(result["request_id"], sent_request_id)
+
+    def test_get_order_status_filled(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {
+            "orderId": 555, "status": {"id": 3, "name": "Filled", "errorCode": 0, "errorMessage": None},
+            "positionExecutions": [{"positionId": 9001, "state": "open"}],
+        })
+        st = client.get_order_status("555")
+        self.assertTrue(st["executed"])
+        self.assertFalse(st["rejected"])
+        self.assertFalse(st["waiting"])
+        self.assertFalse(st["canceled"])
+        self.assertEqual(st["position_id"], "9001")
+        params = session.request.call_args.kwargs["params"]
+        self.assertEqual(params["orderId"], "555")
+        self.assertTrue(session.request.call_args.args[1].endswith("/api/v2/trading/info/demo/orders:lookup"))
+
+    def test_get_order_status_rejected(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {
+            "orderId": 7, "status": {"id": 4, "name": "Rejected", "errorCode": 759,
+                                     "errorMessage": "manual Trading is disallowed for this instrument type(10:CRYPTO)"},
+            "positionExecutions": [],
+        })
+        st = client.get_order_status("7")
+        self.assertTrue(st["rejected"])
+        self.assertFalse(st["executed"])
+        self.assertEqual(st["error_code"], 759)
+        self.assertIn("disallowed", st["error_message"])
+        self.assertIsNone(st["position_id"])
+
+    def test_get_order_status_waiting(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {
+            "orderId": 8, "status": {"id": 11, "name": "WaitingForMarket", "errorCode": 0, "errorMessage": None},
+            "positionExecutions": [],
+        })
+        st = client.get_order_status("8")
+        self.assertTrue(st["waiting"])
+        self.assertFalse(st["executed"])
+        self.assertFalse(st["rejected"])
+
+    def test_get_order_status_not_found(self):
+        client, session = make_client("demo")
+        session.request.side_effect = EToroAPIError(404, "no operation")
+        self.assertIsNone(client.get_order_status("404ref"))
+
+    def test_get_order_status_unknown_name_waits(self):
+        client, session = make_client("demo")
+        session.request.return_value = make_response(200, {
+            "orderId": 9, "status": {"id": 3, "name": "SomethingNew", "errorCode": 0, "errorMessage": None},
+            "positionExecutions": [],
+        })
+        st = client.get_order_status("9")
+        self.assertTrue(st["waiting"])
+        self.assertFalse(st["executed"])
+        self.assertFalse(st["rejected"])
+
+    def test_get_order_status_reraises_non_404(self):
+        client, session = make_client("demo")
+        session.request.side_effect = EToroAPIError(500, "boom")
+        with self.assertRaises(EToroAPIError):
+            client.get_order_status("x")
 
 
 class EToroResolutionTests(unittest.TestCase):
@@ -440,6 +525,151 @@ class EToroListAssetsTests(unittest.TestCase):
         self.assertEqual(assets[0].symbol, "BTC")
         params = session.request.call_args_list[1].kwargs["params"]
         self.assertEqual(params["instrumentTypeIds"], "10")
+
+
+class EToroDiscoverTests(unittest.TestCase):
+    def test_list_exchanges_maps_id_to_description(self):
+        client, session = make_client()
+        session.request.return_value = make_response(200, {"exchangeInfo": [
+            {"exchangeID": 4, "exchangeDescription": "NASDAQ"},
+            {"exchangeID": 5, "exchangeDescription": "NYSE"},
+            {"exchangeID": None, "exchangeDescription": "ignored"},
+        ]})
+        out = client.list_exchanges()
+        self.assertEqual(out[4], "NASDAQ")
+        self.assertEqual(out[5], "NYSE")
+        self.assertNotIn(None, out)
+
+    def test_list_exchanges_is_cached(self):
+        client, session = make_client()
+        session.request.return_value = make_response(200, {"exchangeInfo": [
+            {"exchangeID": 4, "exchangeDescription": "NASDAQ"},
+        ]})
+        client.list_exchanges()
+        client.list_exchanges()
+        self.assertEqual(session.request.call_count, 1)
+
+    def _discover_page(self, items, page=1, total=None):
+        return make_response(200, {
+            "page": page, "pageSize": 200,
+            "totalItems": total if total is not None else len(items),
+            "items": items,
+        })
+
+    def _stock_row(self, **over):
+        row = {
+            "instrumentId": 101, "symbol": "AAPL", "displayName": "Apple Inc",
+            "isin": "US0378331005", "assetClass": "Stocks", "exchangeName": "Nasdaq",
+            "countryCode": "US", "marketCapInUSD": 4.5e12, "currentRate": 200.0,
+            "popularityUniques": 5000, "isBuyEnabled": True, "isDelisted": False,
+            "daysSinceFirstTrade": 5000, "averageDailyVolumeLast3Months-TTM": 1_000_000.0,
+            "tipranksAllConsensus": "StrongBuy", "tipranksAllUpside": 20.0,
+            "tipranksAllTotalAnalysts": 30,
+            "oneYearAnnualRevenueGrowthRate": 12.0, "netProfitMargin": 25.0,
+            "dailyPriceChange": 1.0, "weeklyPriceChange": 2.0, "monthlyPriceChange": 3.0,
+            "threeMonthPriceChange": 4.0, "sixMonthPriceChange": 5.0,
+        }
+        row.update(over)
+        return row
+
+    def test_discover_instruments_normalizes_and_filters_internal(self):
+        client, session = make_client()
+        session.request.side_effect = [self._discover_page([
+            self._stock_row(),
+            {"instrumentId": 999, "symbol": "HID", "isInternalInstrument": True},
+        ])]
+        rows = client.discover_instruments("STOCK")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["symbol"], "AAPL")
+        self.assertEqual(row["instrument_id"], 101)
+        self.assertEqual(row["name"], "Apple Inc")
+        self.assertEqual(row["isin"], "US0378331005")
+        self.assertEqual(row["country_code"], "US")
+        self.assertEqual(row["market_cap"], 4.5e12)
+        self.assertEqual(row["dollar_volume"], 1_000_000.0 * 200.0)
+        self.assertEqual(row["analyst_consensus"], "StrongBuy")
+        self.assertEqual(row["analyst_count"], 30)
+        self.assertTrue(row["tradable"])
+        self.assertEqual(row["price_change_3m"], 4.0)
+        params = session.request.call_args_list[0].kwargs["params"]
+        self.assertEqual(params["assetClass"], "Stocks")
+        self.assertEqual(params["sort"], "-marketCap")
+        self.assertIn("marketCapMin", params)
+        self.assertIn("marketCapInUSD", params["fields"])
+
+    def test_discover_instruments_crypto_uses_crypto_params(self):
+        client, session = make_client()
+        session.request.side_effect = [self._discover_page([
+            {"instrumentId": 1, "symbol": "BTC", "displayName": "Bitcoin",
+             "assetClass": "Crypto", "isBuyEnabled": True, "currentRate": 60000.0,
+             "marketCapInUSD": 1.2e12, "popularityUniques": 10},
+        ])]
+        rows = client.discover_instruments("CRYPTO")
+        self.assertEqual(rows[0]["symbol"], "BTC")
+        self.assertEqual(rows[0]["asset_class"], "Crypto")
+        params = session.request.call_args_list[0].kwargs["params"]
+        self.assertEqual(params["assetClass"], "Crypto")
+        self.assertEqual(params["sort"], "-popularityUniques")
+        self.assertNotIn("marketCapMin", params)
+
+    def test_discover_instruments_tradable_false_when_delisted(self):
+        client, session = make_client()
+        session.request.side_effect = [self._discover_page([
+            self._stock_row(symbol="X", instrumentId=7, isBuyEnabled=True, isDelisted=True),
+        ])]
+        rows = client.discover_instruments("STOCK")
+        self.assertFalse(rows[0]["tradable"])
+        self.assertTrue(rows[0]["delisted"])
+
+    def test_discover_instruments_tradable_false_when_not_buy_enabled(self):
+        client, session = make_client()
+        session.request.side_effect = [self._discover_page([
+            self._stock_row(symbol="X", instrumentId=8, isBuyEnabled=False, isDelisted=False),
+        ])]
+        rows = client.discover_instruments("STOCK")
+        self.assertFalse(rows[0]["tradable"])
+
+    def test_discover_instruments_skips_hidden_from_client(self):
+        client, session = make_client()
+        session.request.side_effect = [self._discover_page([
+            {"instrumentId": 9, "symbol": "HDN", "isHiddenFromClient": True},
+        ])]
+        rows = client.discover_instruments("STOCK")
+        self.assertEqual(rows, [])
+
+    def test_discover_instruments_stops_on_short_page(self):
+        client, session = make_client()
+        session.request.side_effect = [self._discover_page([self._stock_row()], total=1)]
+        rows = client.discover_instruments("STOCK")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(session.request.call_count, 1)
+
+    def test_discover_instruments_paginates_multiple_pages(self):
+        client, session = make_client()
+        full_page = [self._stock_row(symbol=f"S{i}", instrumentId=i) for i in range(client.DISCOVER_PAGE_SIZE)]
+        second_page = [self._stock_row(symbol="LAST", instrumentId=99001)]
+        session.request.side_effect = [
+            self._discover_page(full_page, page=1, total=client.DISCOVER_PAGE_SIZE + 1),
+            self._discover_page(second_page, page=2, total=client.DISCOVER_PAGE_SIZE + 1),
+        ]
+        rows = client.discover_instruments("STOCK")
+        self.assertEqual(len(rows), client.DISCOVER_PAGE_SIZE + 1)
+        self.assertIn("LAST", [r["symbol"] for r in rows])
+        self.assertEqual(session.request.call_count, 2)
+        self.assertEqual(session.request.call_args_list[0].kwargs["params"]["page"], 1)
+        self.assertEqual(session.request.call_args_list[1].kwargs["params"]["page"], 2)
+
+    def test_discover_instruments_respects_cap(self):
+        client, session = make_client()
+        client._DISCOVER_CAPS = {"STOCK": 2}
+        full_page = [self._stock_row(symbol=f"S{i}", instrumentId=i) for i in range(client.DISCOVER_PAGE_SIZE)]
+        session.request.side_effect = [self._discover_page(full_page, page=1, total=9999)]
+        rows = client.discover_instruments("STOCK")
+        # cap halts further pagination; the full first page is processed before
+        # the while condition re-evaluates, so only one page is fetched
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(session.request.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from core.utils import (
     utc_now,
 )
 from services.data_manager import DataManager
+from services.portfolio_risk import PortfolioRiskService
 
 
 class TradeManager:
@@ -44,6 +45,12 @@ class TradeManager:
         if gpt_client is None:
             raise TypeError("TradeManager requires a gpt_client")
         self.data_manager = data_manager
+        history_provider = (
+            self.data_manager.get_symbol_history
+            if self.data_manager is not None
+            else (lambda symbol, limit=None: [])
+        )
+        self.risk = PortfolioRiskService(config, self.logger, history_provider)
         self.gpt_client = gpt_client
 
     @property
@@ -271,6 +278,111 @@ class TradeManager:
             return minimum
         return allocated
 
+    def _open_position_values(self, provider: str) -> list[dict[str, Any]]:
+        """Current OPEN positions for *provider* as {symbol, category, value(USD)}."""
+        positions: list[dict[str, Any]] = []
+        for trade in self.get_open_or_pending_trades():
+            if self._trade_provider(trade) != provider:
+                continue
+            if str(trade.get("status") or "").upper() != "OPEN":
+                continue
+            quantity = self._as_float(trade.get("quantity")) or 0.0
+            current_price = self._as_float(trade.get("current_price")) or 0.0
+            value = quantity * current_price
+            if value <= 0:
+                value = self._as_float(trade.get("allocated_capital")) or 0.0
+            if value <= 0:
+                continue
+            positions.append({
+                "symbol": str(trade.get("symbol")).upper(),
+                "category": str(trade.get("category") or "STOCK"),
+                "value": value,
+            })
+        return positions
+
+    def _risk_based_allocation(self, category: str, symbol: str, provider: str = PROVIDER_ETORO) -> float:
+        """Risk-based size for a new position, with an over-budget entry gate.
+
+        Falls back to equal-slot allocation when equity/risk data is unavailable.
+        Returns 0.0 to signal "skip" when the trade cannot fit under the hard
+        risk threshold even at the minimum trade amount.
+        """
+        broker = self.broker(provider)
+        if broker is None:
+            return 0.0
+        try:
+            equity = float(broker.get_account_equity())
+        except Exception:
+            equity = 0.0
+        if equity <= 0:
+            return self.compute_allocated_capital(provider=provider)
+        try:
+            cash = float(broker.get_available_cash())
+        except Exception:
+            return self.compute_allocated_capital(provider=provider)
+        positions = self._open_position_values(provider)
+        candidate = {"symbol": str(symbol).upper(), "category": category}
+        size = self.risk.suggest_size(candidate, positions, equity, cash)
+        if size <= 0:
+            return 0.0
+        minimum = float(getattr(self.config, "etoro_min_trade_amount", 0.0) or 0.0) or 1.0
+        projection = self.risk.project(candidate, size, positions, equity)
+        tries = 0
+        while projection.over_hard and size > minimum and tries < 8:
+            size = round(max(minimum, size * 0.5), 2)
+            projection = self.risk.project(candidate, size, positions, equity)
+            tries += 1
+        if projection.over_hard:
+            self.logger.info(
+                "Risk gate: skipping %s/%s — projected portfolio risk %.1f over hard threshold %.1f",
+                provider, symbol, projection.score, self.config.risk_hard_threshold,
+            )
+            return 0.0
+        return size
+
+    def portfolio_risk_snapshot(self, provider: str = PROVIDER_ETORO) -> dict[str, Any]:
+        """Full risk assessment for the dashboard API (always returns a dict)."""
+        broker = self.broker(provider)
+        equity = 0.0
+        if broker is not None:
+            try:
+                equity = float(broker.get_account_equity())
+            except Exception:
+                equity = 0.0
+        try:
+            positions = self._open_position_values(provider) if broker is not None else []
+        except Exception:
+            positions = []
+        assessment = self.risk.assess(positions, equity)
+        snapshot = assessment.to_dict()
+        snapshot["equity"] = round(equity, 2)
+        snapshot["positions"] = len(positions)
+        return snapshot
+
+    def _risk_context(self, provider: str = PROVIDER_ETORO) -> dict[str, Any] | None:
+        """Compact portfolio-risk block for GPT prompts, or None if unavailable."""
+        broker = self.broker(provider)
+        if broker is None:
+            return None
+        try:
+            equity = float(broker.get_account_equity())
+        except Exception:
+            return None
+        if equity <= 0:
+            return None
+        assessment = self.risk.assess(self._open_position_values(provider), equity)
+        return {
+            "score": assessment.score,
+            "portfolio_vol": assessment.portfolio_vol,
+            "budget_vol": assessment.budget_vol,
+            "avg_correlation": assessment.avg_correlation,
+            "n_eff": assessment.n_eff,
+            "exposure": assessment.exposure,
+            "remaining_budget": round(max(0.0, self.config.risk_hard_threshold - assessment.score), 2),
+            "alert_threshold": self.config.risk_alert_threshold,
+            "hard_threshold": self.config.risk_hard_threshold,
+        }
+
     def _cancel_pending_trade_record(
         self,
         trade: dict[str, Any],
@@ -489,7 +601,7 @@ class TradeManager:
         if not self._signal_has_required_levels(signal):
             return False
 
-        allocated_capital = self.compute_allocated_capital(provider=provider)
+        allocated_capital = self._risk_based_allocation(category, symbol, provider=provider)
         if allocated_capital <= 0:
             self.logger.warning("Skipping %s because allocated capital is zero", symbol)
             return False
@@ -531,7 +643,10 @@ class TradeManager:
             self.logger.warning("No market data found for %s, skipping new trade decision", symbol)
             return
 
-        signal = self.gpt_client.request_new_signal(symbol, category, candles, [], provider=provider)
+        signal = self.gpt_client.request_new_signal(
+            symbol, category, candles, [], provider=provider,
+            portfolio_risk=self._risk_context(provider=provider),
+        )
         if signal["action"] != "OPEN":
             self.logger.debug("GPT skipped %s", symbol)
             return
@@ -551,6 +666,10 @@ class TradeManager:
 
         broker = self._trade_broker(trade)
         if broker is None:
+            return
+
+        if trade.get("order_id"):
+            self._resolve_submitted_order(trade)
             return
 
         existing = broker.get_open_position(trade["symbol"])
@@ -599,8 +718,64 @@ class TradeManager:
             self._cancel_pending_trade_record(trade, "ENTRY_FAILED")
             return
 
-        position = broker.get_open_position(trade["symbol"])
-        self._activate_trade_from_position(trade, position, result)
+        self._mark_order_submitted(trade, result)
+
+    def _mark_order_submitted(self, trade: dict[str, Any], open_result: dict[str, Any] | None) -> None:
+        order_id = str((open_result or {}).get("order_id") or "") or None
+        if not order_id:
+            # No order id to track → fall back to the legacy immediate activation.
+            self._activate_trade_from_position(trade, None, open_result)
+            return
+        with db_cursor(self.config.db_trades) as cursor:
+            cursor.execute(
+                "UPDATE trades SET order_id = ?, order_submitted_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (order_id, isoformat_utc(utc_now()), trade["id"]),
+            )
+        self.logger.info("Trade %s order submitted (order %s); awaiting fill", trade["id"], order_id)
+
+    def _resolve_submitted_order(self, trade: dict[str, Any]) -> None:
+        broker = self._trade_broker(trade)
+        if broker is None:
+            return
+        order_id = str(trade.get("order_id") or "")
+        if not order_id:
+            return
+        try:
+            status = broker.get_order_status(order_id)
+        except Exception:
+            self.logger.warning("Order status lookup failed for trade %s", trade["id"], exc_info=True)
+            return
+        submitted_age = self._minutes_since(parse_datetime(trade.get("order_submitted_at"))) or 0.0
+        timed_out = submitted_age >= int(self.config.order_await_timeout_minutes)
+
+        if status is None:
+            if timed_out:
+                self._abandon_unfilled_order(broker, trade, order_id, "ORDER_AWAIT_TIMEOUT")
+            return
+        if status.get("executed"):
+            position = broker.get_open_position(trade["symbol"])
+            self._activate_trade_from_position(trade, position, {"position_id": status.get("position_id")})
+            return
+        if status.get("rejected") or status.get("canceled"):
+            self.logger.warning(
+                "Entry order for trade %s/%s was %s: %s",
+                trade["id"], trade["symbol"],
+                "rejected" if status.get("rejected") else "canceled",
+                status.get("error_message"),
+            )
+            self._cancel_pending_trade_record(trade, "ENTRY_REJECTED")
+            return
+        # waiting / not yet executed
+        if timed_out:
+            self._abandon_unfilled_order(broker, trade, order_id, "ORDER_AWAIT_TIMEOUT")
+
+    def _abandon_unfilled_order(self, broker: Any, trade: dict[str, Any], order_id: str, reason: str) -> None:
+        if broker is not None:
+            try:
+                broker.cancel_order(order_id)
+            except Exception:
+                self.logger.warning("cancel_order failed for trade %s order %s", trade["id"], order_id, exc_info=True)
+        self._cancel_pending_trade_record(trade, reason)
 
     def _activate_trade_from_position(
         self, trade: dict[str, Any], position: Any, open_result: dict[str, Any] | None
@@ -633,13 +808,15 @@ class TradeManager:
                 UPDATE trades
                 SET status = 'OPEN', open_timestamp = ?, entry_price = ?, quantity = ?, current_price = ?, pnl = ?,
                     high_water_mark = ?, trailing_take_profit_price = ?, trailing_stop_price = ?,
-                    position_id = ?, order_reference_id = ?, updated_at = CURRENT_TIMESTAMP
+                    position_id = ?, order_reference_id = ?, position_confirmed = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (
                     isoformat_utc(utc_now()), entry_price, quantity, current_price, pnl,
                     high_water_mark, trailing_take_profit_price, trailing_stop_price,
-                    position_id, reference_id, trade["id"],
+                    position_id, reference_id,
+                    1 if isinstance(position, dict) and position else int(trade.get("position_confirmed") or 0),
+                    trade["id"],
                 ),
             )
         self.logger.info("Trade %s opened on eToro (position %s)", trade["id"], position_id)
@@ -718,7 +895,7 @@ class TradeManager:
             self._mark_trade_closed(trade, close_reason, trigger_price)
             return
         try:
-            order = broker.close_position_market(str(position_id))
+            order = broker.close_position_market(str(position_id), instrument_id=int(trade.get("instrument_id") or 0))
         except Exception as exc:
             message = str(exc).lower()
             if "position" in message and ("not" in message or "exist" in message):
@@ -894,8 +1071,19 @@ class TradeManager:
             return
         position = broker.get_open_position(trade["symbol"])
         if position is None:
-            self._close_trade_without_position(trade)
+            # Only treat a vanished position as an external close once we have
+            # actually observed it live; a never-confirmed trade (just filled,
+            # portfolio still catching up, or a transient read) is left to retry.
+            if trade.get("position_confirmed"):
+                self._close_trade_without_position(trade)
             return
+        if not trade.get("position_confirmed"):
+            with db_cursor(self.config.db_trades) as cursor:
+                cursor.execute(
+                    "UPDATE trades SET position_confirmed = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (trade["id"],),
+                )
+            trade["position_confirmed"] = 1
 
         quantity = self._as_float(position.get("units")) or float(trade["quantity"])
         current_price = self._resolve_current_price(
@@ -986,6 +1174,7 @@ class TradeManager:
                 existing_trades=[],
                 max_new_trades=available_slots,
                 provider=provider,
+                portfolio_risk=self._risk_context(provider=provider),
             )
             by_symbol = {payload["symbol"]: payload for payload in symbol_payloads}
             candidate_signals = [

@@ -73,6 +73,7 @@ class EToroClient:
         self.logger = logger.getChild("etoro")
         self.session = session or requests.Session()
         self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter(max_calls=60, period=60.0)
+        self._exchange_cache: dict[int, str] | None = None
 
     # --- low-level HTTP -----------------------------------------------------
 
@@ -310,6 +311,39 @@ class EToroClient:
         "CRYPTO": ("crypto",),
     }
 
+    DISCOVER_PAGE_SIZE = 200
+    DISCOVER_MAX_ITEMS = 2500
+    # discover mixes all asset classes; the working server-side type filter is
+    # `assetClass` (NOT `instrumentTypeID`, which does not filter).
+    _ASSET_CLASS_PARAM = {"US_EQUITY": "Stocks", "STOCK": "Stocks", "CRYPTO": "Crypto"}
+    _DISCOVER_CAPS = {"STOCK": 2500, "CRYPTO": 1000}
+    # The default discover projection is minimal; requesting an explicit field
+    # list returns the full fundamentals object (incl. marketCap, liquidity,
+    # analyst consensus, growth/margin) with NO bar fetch.
+    _DISCOVER_FIELDS = (
+        "symbol,isin,displayName,assetClass,exchangeName,countryCode,"
+        "marketCapInUSD,currentRate,popularityUniques,isBuyEnabled,isDelisted,"
+        "daysSinceFirstTrade,averageDailyVolumeLast3Months-TTM,"
+        "tipranksAllConsensus,tipranksAllUpside,tipranksAllTotalAnalysts,"
+        "oneYearAnnualRevenueGrowthRate,netProfitMargin,"
+        "dailyPriceChange,weeklyPriceChange,monthlyPriceChange,"
+        "threeMonthPriceChange,sixMonthPriceChange"
+    )
+
+    def list_exchanges(self) -> dict[int, str]:
+        """Return ``{exchangeID: exchangeDescription}`` (cached for the run)."""
+        if self._exchange_cache is not None:
+            return self._exchange_cache
+        payload = self._request("GET", "/api/v1/market-data/exchanges")
+        out: dict[int, str] = {}
+        for row in payload.get("exchangeInfo") or []:
+            exchange_id = row.get("exchangeID")
+            if exchange_id is None:
+                continue
+            out[int(exchange_id)] = str(row.get("exchangeDescription") or "")
+        self._exchange_cache = out
+        return out
+
     def _instrument_type_ids(self, hints: tuple[str, ...]) -> list[int]:
         payload = self._request("GET", "/api/v1/market-data/instrument-types")
         out: list[int] = []
@@ -345,6 +379,115 @@ class EToroClient:
             except Exception:
                 self.logger.debug("Failed to cache instrument mapping for %s", symbol)
         return assets
+
+    @staticmethod
+    def _discover_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_discover_row(self, row: dict[str, Any], category: str) -> dict[str, Any]:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        instrument_id = int(row["instrumentId"])
+        name = str(row.get("displayName") or "")
+        delisted = bool(row.get("isDelisted"))
+        tradable = bool(row.get("isBuyEnabled", True)) and not delisted
+        current_rate = self._discover_float(row.get("currentRate"))
+        avg_daily_volume = self._discover_float(row.get("averageDailyVolumeLast3Months-TTM"))
+        dollar_volume = (
+            avg_daily_volume * current_rate
+            if avg_daily_volume is not None and current_rate is not None
+            else None
+        )
+        consensus = row.get("tipranksAllConsensus")
+        asset = {
+            "symbol": symbol,
+            "name": name,
+            "isin": str(row.get("isin") or "").strip(),
+            "status": "active",
+            "tradable": tradable,
+            "delisted": delisted,
+            "fractionable": False,
+            "instrument_id": instrument_id,
+            "asset_class": str(row.get("assetClass") or ""),
+            "instrument_type": str(row.get("assetClass") or ""),
+            "exchange_name": str(row.get("exchangeName") or ""),
+            "country_code": str(row.get("countryCode") or "").upper(),
+            "market_cap": self._discover_float(row.get("marketCapInUSD")),
+            "current_rate": current_rate,
+            "avg_daily_volume": avg_daily_volume,
+            "dollar_volume": dollar_volume,
+            "days_since_first_trade": self._discover_float(row.get("daysSinceFirstTrade")),
+            "popularity": int(self._discover_float(row.get("popularityUniques")) or 0),
+            "analyst_consensus": str(consensus) if consensus else None,
+            "analyst_upside": self._discover_float(row.get("tipranksAllUpside")),
+            "analyst_count": int(self._discover_float(row.get("tipranksAllTotalAnalysts")) or 0),
+            "revenue_growth": self._discover_float(row.get("oneYearAnnualRevenueGrowthRate")),
+            "net_margin": self._discover_float(row.get("netProfitMargin")),
+            "price_change_1d": self._discover_float(row.get("dailyPriceChange")),
+            "price_change_1w": self._discover_float(row.get("weeklyPriceChange")),
+            "price_change_1m": self._discover_float(row.get("monthlyPriceChange")),
+            "price_change_3m": self._discover_float(row.get("threeMonthPriceChange")),
+            "price_change_6m": self._discover_float(row.get("sixMonthPriceChange")),
+        }
+        try:
+            upsert_instrument_mapping(self.config.db_market_data, symbol, instrument_id, category, name, tradable)
+        except Exception:
+            self.logger.debug("Failed to cache instrument mapping for %s", symbol)
+        return asset
+
+    def discover_instruments(self, asset_class: str) -> list[dict[str, Any]]:
+        """Cheap metadata discovery for the universe prefilter.
+
+        Uses ``/api/v1/instruments/discover`` with the ``assetClass`` server-side
+        filter and an explicit ``fields`` projection to return rich fundamentals
+        (market cap, liquidity, analyst consensus, growth/margin, momentum)
+        WITHOUT fetching any price bars. Stocks are filtered to
+        ``universe_stock_min_market_cap`` server-side and sorted by market cap.
+
+        Note: each accepted row is upserted into the local ``instrument_map``
+        cache individually; O(rows) SQLite writes per run, bounded by the
+        per-category cap.
+        """
+        ac = str(asset_class).upper()
+        asset_class_param = self._ASSET_CLASS_PARAM.get(ac, ac.title())
+        category = "CRYPTO" if asset_class_param == "Crypto" else "STOCK"
+        params_base: dict[str, Any] = {
+            "assetClass": asset_class_param,
+            "pageSize": self.DISCOVER_PAGE_SIZE,
+            "fields": self._DISCOVER_FIELDS,
+        }
+        if category == "STOCK":
+            params_base["sort"] = "-marketCap"
+            min_cap = self.config.universe_stock_min_market_cap
+            if min_cap and min_cap > 0:
+                params_base["marketCapMin"] = int(min_cap)
+        else:
+            params_base["sort"] = "-popularityUniques"
+        cap = self._DISCOVER_CAPS.get(category, self.DISCOVER_MAX_ITEMS)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        page = 1
+        while len(out) < cap:
+            payload = self._request(
+                "GET", "/api/v1/instruments/discover", params={**params_base, "page": page}
+            )
+            items = payload.get("items") or []
+            if not items:
+                break
+            for row in items:
+                if row.get("isInternalInstrument") or row.get("isHiddenFromClient"):
+                    continue
+                symbol = str(row.get("symbol") or "").upper().strip()
+                if not symbol or symbol in seen or row.get("instrumentId") is None:
+                    continue
+                seen.add(symbol)
+                out.append(self._normalize_discover_row(row, category))
+            if len(items) < self.DISCOVER_PAGE_SIZE:
+                break
+            page += 1
+        return out
 
     # --- account & portfolio ------------------------------------------------
 
@@ -458,11 +601,15 @@ class EToroClient:
         leverage: int = 1,
     ) -> dict[str, Any]:
         request_id = str(uuid4())
+        # eToro requires EXACTLY ONE of symbol / instrumentId on open orders
+        # (sending both → HTTP 400 "Exactly one of Symbol or InstrumentID must
+        # be provided. Both were supplied."). We send the canonical instrumentId
+        # only; `symbol` is kept in the signature for logging/clarity.
         body = {
             "action": "open",
             "transaction": "buy",
-            "symbol": str(symbol).upper().strip(),
             "instrumentId": int(instrument_id),
+            "settlementType": "real",
             "orderType": "mkt",
             "leverage": int(leverage),
             "amount": float(amount_usd),
@@ -480,23 +627,77 @@ class EToroClient:
             "raw": payload,
         }
 
-    def close_position_market(self, position_id: str, units: float | None = None) -> dict[str, Any]:
-        body: dict[str, Any] = {"action": "close", "positionIds": [str(position_id)]}
+    def close_position_market(self, position_id: str, instrument_id: int, units: float | None = None) -> dict[str, Any]:
+        """Close (or partially close) a position via the dedicated market-close endpoint.
+
+        eToro's v2 orders endpoint does not accept ``action=close``; the correct
+        path is the v1 market-close-orders endpoint, which needs the instrument id
+        and (optionally) the units to deduct for a partial close.
+        """
+        path = f"/api/v1/trading/execution/{self._mode_segment()}market-close-orders/positions/{position_id}"
+        body: dict[str, Any] = {"InstrumentID": int(instrument_id)}
         if units is not None:
-            body["units"] = float(units)
-        payload = self._request("POST", self._orders_path(), json_body=body)
+            body["UnitsToDeduct"] = float(units)
+        payload = self._request_with_id("POST", path, str(uuid4()), json_body=body)
+        order = payload.get("orderForClose") or {}
         return {
-            "order_id": str(payload.get("orderId")) if payload.get("orderId") is not None else None,
+            "order_id": str(order.get("orderID")) if order.get("orderID") is not None else None,
             "raw": payload,
         }
 
-    def get_order_info(self, order_id: str) -> dict[str, Any]:
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel an order before it executes (idempotent if already closed)."""
+        path = f"/api/v2/trading/execution/{self._mode_segment()}orders/{order_id}"
+        return self._request_with_id("DELETE", path, str(uuid4()))
+
+    @staticmethod
+    def _classify_order_status(name: str) -> tuple[bool, bool, bool, bool]:
+        """Return (executed, waiting, rejected, canceled) from the status name.
+
+        eToro status *ids* are inconsistent across asset types (id 3 was observed
+        meaning "Filled" for crypto yet "Rejected" elsewhere), so classify ONLY by
+        the human-readable name. An unrecognized name is treated as still-waiting
+        (keep polling) rather than guessed terminal.
+        """
+        text = name.lower()
+        if "fill" in text or "execut" in text:
+            return True, False, False, False
+        if "reject" in text:
+            return False, False, True, False
+        if "cancel" in text:
+            return False, False, False, True
+        return False, True, False, False  # waiting / unknown -> keep polling
+
+    def get_order_status(self, order_id: str) -> dict[str, Any] | None:
+        """Resolve an order's async outcome via the orders:lookup endpoint.
+
+        Returns ``None`` when the order is not (yet) found (HTTP 404).
+        """
         path = f"/api/v2/trading/info/{self._mode_segment()}orders:lookup"
-        payload = self._request("GET", path, params={"orderId": str(order_id)})
-        position_id = payload.get("positionId")
+        try:
+            payload = self._request("GET", path, params={"orderId": str(order_id)})
+        except EToroAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        status = payload.get("status") or {}
+        name = str(status.get("name") or "")
+        status_id = status.get("id")
+        executed, waiting, rejected, canceled = self._classify_order_status(name)
+        position_id = None
+        for execution in payload.get("positionExecutions") or []:
+            if str(execution.get("state") or "").lower() == "open" and execution.get("positionId") is not None:
+                position_id = str(execution["positionId"])
+                break
         return {
-            "position_id": str(position_id) if position_id is not None else None,
-            "filled_price": (float(payload["openRate"]) if payload.get("openRate") is not None else None),
-            "units": (float(payload["units"]) if payload.get("units") is not None else None),
-            "raw": payload,
+            "order_id": str(order_id),
+            "status_name": name,
+            "status_id": status_id,
+            "executed": executed,
+            "waiting": waiting,
+            "rejected": rejected,
+            "canceled": canceled,
+            "error_code": status.get("errorCode"),
+            "error_message": status.get("errorMessage"),
+            "position_id": position_id,
         }

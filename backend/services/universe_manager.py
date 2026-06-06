@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from statistics import fmean, pstdev
@@ -46,6 +47,8 @@ class UniverseManager:
     CRYPTO_MIN_AVG_DOLLAR_VOLUME_20D = 1_000_000.0
     MAX_DOSSIER_WORKERS = 6
 
+    _DATED_FUTURE_RE = re.compile(r"\.[A-Z]{3}\d{2}$")
+
     def __init__(
         self,
         config: AppConfig,
@@ -78,6 +81,17 @@ class UniverseManager:
     def _normalize_symbol(symbol: Any) -> str:
         return str(symbol or "").upper().strip()
 
+    @classmethod
+    def _is_dated_future(cls, symbol: Any) -> bool:
+        text = str(symbol or "").upper().strip()
+        return bool(cls._DATED_FUTURE_RE.search(text))
+
+    @staticmethod
+    def _asset_name(asset: object) -> str:
+        if isinstance(asset, dict):
+            return str(asset.get("name") or "").lower()
+        return str(getattr(asset, "name", "") or "").lower()
+
     @staticmethod
     def _dedupe_payload_by_symbol(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[str] = set()
@@ -92,7 +106,7 @@ class UniverseManager:
 
     @staticmethod
     def _looks_like_etf(asset: object) -> bool:
-        name = str(getattr(asset, "name", "")).lower()
+        name = UniverseManager._asset_name(asset)
         return any(
             token in name
             for token in (
@@ -103,7 +117,7 @@ class UniverseManager:
 
     @staticmethod
     def _looks_like_non_common_stock(asset: object) -> bool:
-        name = str(getattr(asset, "name", "")).lower()
+        name = UniverseManager._asset_name(asset)
         return any(
             token in name
             for token in (
@@ -114,7 +128,7 @@ class UniverseManager:
 
     @staticmethod
     def _looks_like_shell_company(asset: object) -> bool:
-        name = str(getattr(asset, "name", "")).lower()
+        name = UniverseManager._asset_name(asset)
         return any(
             token in name
             for token in (
@@ -273,6 +287,176 @@ class UniverseManager:
             liquidity_score + trend_score + proximity_score + history_score + continuity_bonus + fractionable_bonus - volatility_penalty,
             4,
         )
+
+    _CONSENSUS_SCORE = {"STRONGBUY": 2.0, "BUY": 1.0, "HOLD": 0.0, "SELL": -1.0, "STRONGSELL": -2.0}
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _cheap_prefilter_score(self, asset: dict[str, Any]) -> float:
+        """Quality/size-first score from discover metadata (no bars).
+
+        Dominated by liquidity + company size, then analyst consensus and
+        fundamental quality, with momentum only as a light bounded tiebreaker
+        and a penalty for one-day price spikes (pump signature).
+        """
+        market_cap = max(self._safe_float(asset.get("market_cap")) or 0.0, 0.0)
+        dollar_volume = max(self._safe_float(asset.get("dollar_volume")) or 0.0, 0.0)
+        liquidity = math.log10(dollar_volume + 1.0) * 6.0
+        size = math.log10(market_cap + 1.0) * 3.0
+
+        consensus_key = str(asset.get("analyst_consensus") or "").upper().replace(" ", "")
+        consensus = self._CONSENSUS_SCORE.get(consensus_key, 0.0)
+        upside = self._clamp(self._safe_float(asset.get("analyst_upside")) or 0.0, -20.0, 40.0)
+        confidence = min(self._safe_float(asset.get("analyst_count")) or 0.0, 15.0) / 15.0
+        analyst = (consensus * 6.0 + upside * 0.25) * confidence
+
+        revenue_growth = self._clamp(self._safe_float(asset.get("revenue_growth")) or 0.0, -25.0, 50.0)
+        net_margin = self._clamp(self._safe_float(asset.get("net_margin")) or 0.0, -20.0, 40.0)
+        quality = revenue_growth * 0.15 + net_margin * 0.20
+
+        m1m = self._clamp(self._safe_float(asset.get("price_change_1m")) or 0.0, -25.0, 25.0)
+        m3m = self._clamp(self._safe_float(asset.get("price_change_3m")) or 0.0, -40.0, 40.0)
+        m6m = self._clamp(self._safe_float(asset.get("price_change_6m")) or 0.0, -60.0, 60.0)
+        momentum = m1m * 0.10 + m3m * 0.10 + m6m * 0.05
+        daily = abs(self._safe_float(asset.get("price_change_1d")) or 0.0)
+        pump_penalty = max(daily - 12.0, 0.0) * 0.30
+
+        return round(liquidity + size + analyst + quality + momentum - pump_penalty, 4)
+
+    # Fundamental fields that are identical across an instrument's listing
+    # variants (same ISIN) but may be null on the .RTH/secondary variant.
+    _ISIN_MERGE_FIELDS = (
+        "analyst_consensus", "analyst_upside", "analyst_count",
+        "market_cap", "dollar_volume", "days_since_first_trade",
+        "revenue_growth", "net_margin",
+    )
+
+    def _dedupe_by_isin(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse listing variants of the same company (same ISIN) into one row.
+
+        Keeps the most popular variant's symbol but back-fills fundamental fields
+        from siblings (e.g. TipRanks data lives on the canonical symbol while
+        popularity lives on the ``.RTH`` variant). Rows without an ISIN pass through.
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        passthrough: list[dict[str, Any]] = []
+        for row in rows:
+            isin = str(row.get("isin") or "").strip().upper()
+            if not isin:
+                passthrough.append(row)
+                continue
+            if isin not in groups:
+                groups[isin] = []
+                order.append(isin)
+            groups[isin].append(row)
+        deduped: list[dict[str, Any]] = []
+        for isin in order:
+            variants = groups[isin]
+            merged = dict(max(variants, key=lambda r: self._safe_float(r.get("popularity")) or 0.0))
+            for field in self._ISIN_MERGE_FIELDS:
+                if not merged.get(field):
+                    for sibling in variants:
+                        if sibling.get(field):
+                            merged[field] = sibling.get(field)
+                            break
+            deduped.append(merged)
+        return deduped + passthrough
+
+    def _passes_cheap_filter(self, category: str, asset: dict[str, Any]) -> bool:
+        if not asset.get("tradable") or asset.get("delisted"):
+            return False
+        symbol = self._normalize_symbol(asset.get("symbol"))
+        if not symbol:
+            return False
+        if category == "STOCK":
+            if (
+                self._looks_like_etf(asset)
+                or self._looks_like_non_common_stock(asset)
+                or self._looks_like_shell_company(asset)
+            ):
+                return False
+            countries = {code.upper() for code in (self.config.universe_countries or ())}
+            if countries and str(asset.get("country_code") or "").upper() not in countries:
+                return False
+            market_cap = self._safe_float(asset.get("market_cap"))
+            if market_cap is None or market_cap < self.config.universe_stock_min_market_cap:
+                return False
+            dollar_volume = self._safe_float(asset.get("dollar_volume"))
+            if dollar_volume is None or dollar_volume < self.config.universe_stock_min_dollar_volume:
+                return False
+            return True
+        # CRYPTO
+        if self._is_dated_future(symbol):
+            return False
+        if "futur" in str(asset.get("instrument_type") or "").lower():
+            return False
+        market_cap = self._safe_float(asset.get("market_cap"))
+        if market_cap is not None and market_cap < self.config.universe_crypto_min_market_cap:
+            return False
+        return True
+
+    def _build_cheap_shortlist(
+        self,
+        broker: Any,
+        category: str,
+        preferred_symbols: list[str],
+    ) -> list[dict[str, Any]]:
+        candidates = broker.discover_instruments(category)
+        if not candidates:
+            return []
+        candidates = self._dedupe_payload_by_symbol(candidates)
+        candidates = self._dedupe_by_isin(candidates)
+        preferred_set = {self._normalize_symbol(symbol) for symbol in preferred_symbols}
+        pinned: list[dict[str, Any]] = []
+        pinned_symbols: set[str] = set()
+        pool: list[dict[str, Any]] = []
+        for asset in candidates:
+            symbol = self._normalize_symbol(asset.get("symbol"))
+            # Current-universe symbols are pinned for continuity and intentionally
+            # bypass the cheap filter. discover_instruments already applies the
+            # server-side isCurrentlyTradable/isDelisted filters, so a pinned symbol
+            # present here is by definition still tradable. pinned_symbols is a
+            # defensive guard (candidates are pre-deduped, so it should never fire).
+            if symbol in preferred_set and symbol not in pinned_symbols:
+                pinned_symbols.add(symbol)
+                pinned.append(asset)
+                continue
+            if not self._passes_cheap_filter(category, asset):
+                continue
+            scored = dict(asset)
+            scored["prefilter_score"] = self._cheap_prefilter_score(scored)
+            pool.append(scored)
+        pool.sort(
+            key=lambda asset: (
+                self._safe_float(asset.get("prefilter_score")) or float("-inf"),
+                str(asset.get("symbol", "")),
+            ),
+            reverse=True,
+        )
+        limit = (
+            self.config.universe_stock_shortlist
+            if category == "STOCK"
+            else self.config.universe_crypto_shortlist
+        )
+        if len(pinned) > limit:
+            self.logger.warning(
+                "Universe %s has %s pinned (current-universe) symbols exceeding the shortlist limit %s; "
+                "shortlist will carry all pinned symbols",
+                category,
+                len(pinned),
+                limit,
+            )
+        shortlist = (pinned + pool)[: max(limit, len(pinned))]
+        self.logger.info(
+            "Universe cheap prefilter for %s reduced %s discovered to %s shortlist before bars",
+            category,
+            len(candidates),
+            len(shortlist),
+        )
+        return shortlist
 
     def _passes_liquidity_prefilter(self, category: str, asset: dict[str, Any]) -> bool:
         bar_count = int(asset.get("bar_count") or 0)
@@ -641,6 +825,7 @@ class UniverseManager:
             self._asset_snapshot(asset)
             for asset in assets
             if getattr(asset, "tradable", False)
+            and not self._is_dated_future(getattr(asset, "symbol", ""))
         ]
         payload = self._dedupe_payload_by_symbol(payload)
         payload.sort(key=lambda asset: str(asset["symbol"]))
@@ -652,8 +837,27 @@ class UniverseManager:
             return {}
         preferred = universe_for_provider(current_universe, PROVIDER_ETORO)
         try:
-            base_stock_payload = self._get_etoro_stock_candidate_payload()
-            base_crypto_payload = self._get_etoro_crypto_candidate_payload()
+            base_stock_payload: list[dict[str, Any]] = []
+            base_crypto_payload: list[dict[str, Any]] = []
+            try:
+                base_stock_payload = self._build_cheap_shortlist(
+                    broker, "STOCK", preferred.get("STOCK", [])
+                )
+                base_crypto_payload = self._build_cheap_shortlist(
+                    broker, "CRYPTO", preferred.get("CRYPTO", [])
+                )
+            except Exception:
+                self.logger.warning(
+                    "eToro discover prefilter failed; falling back to legacy full scan",
+                    exc_info=True,
+                )
+            if not base_stock_payload:
+                self.logger.warning("eToro discover STOCK prefilter empty; using legacy full scan for STOCK")
+                base_stock_payload = self._get_etoro_stock_candidate_payload()
+            if not base_crypto_payload:
+                self.logger.warning("eToro discover CRYPTO prefilter empty; using legacy full scan for CRYPTO")
+                base_crypto_payload = self._get_etoro_crypto_candidate_payload()
+
             full_stock_payload = self._enrich_payload_with_market_metrics(
                 PROVIDER_ETORO, "STOCK", base_stock_payload, preferred.get("STOCK", [])
             )

@@ -57,6 +57,14 @@ SETTINGS_RESTART_REQUIRED_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# Default country whitelist (ISO codes, eToro `countryCode` = company domicile) used
+# to scope the stock universe to USA + major EU. Cleaner than eToro's inconsistent
+# exchange names. Override via the UNIVERSE_COUNTRIES env var.
+DEFAULT_UNIVERSE_COUNTRIES: tuple[str, ...] = (
+    "US", "GB", "DE", "FR", "NL", "IT", "ES", "CH",
+    "SE", "DK", "NO", "FI", "IE", "BE", "AT", "PT", "LU",
+)
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -72,11 +80,32 @@ class AppConfig:
     weekly_universe_stocks: int = 5
     weekly_universe_crypto: int = 5
     risk_tolerance: int = 5
+    universe_countries: tuple[str, ...] = DEFAULT_UNIVERSE_COUNTRIES
+    universe_stock_min_market_cap: float = 2_000_000_000.0
+    universe_stock_min_dollar_volume: float = 5_000_000.0
+    universe_crypto_min_market_cap: float = 100_000_000.0
+    universe_stock_shortlist: int = 300
+    universe_crypto_shortlist: int = 150
+    risk_weight_vol: float = 0.30
+    risk_weight_concentration: float = 0.30
+    risk_weight_correlation: float = 0.25
+    risk_weight_exposure: float = 0.15
+    risk_budget_vol_min: float = 0.10
+    risk_budget_vol_max: float = 0.45
+    risk_lookback_days: int = 120
+    risk_corr_shrinkage: float = 0.6
+    risk_alert_threshold: float = 70.0
+    risk_hard_threshold: float = 85.0
+    risk_sizing_corr_floor: float = 0.30
+    risk_max_position_pct: float = 0.25
+    risk_default_stock_vol: float = 0.30
+    risk_default_crypto_vol: float = 0.60
     currency: str = "EUR"
     crypto_entry_limit_collar_bps: int = 15
     crypto_entry_max_chase_bps: int = 40
     crypto_pending_reprice_minutes: int = 2
     crypto_pending_cancel_minutes: int = 12
+    order_await_timeout_minutes: int = 360
     # Minimum profit cushion (in percent of entry_price) that the trailing
     # take profit must guarantee. The bot rejects GPT signals whose
     # `activation_pct − distance/entry × 100` falls below this buffer and
@@ -171,11 +200,36 @@ def load_config() -> AppConfig:
         weekly_universe_stocks=int(os.getenv("WEEKLY_UNIVERSE_STOCKS", "5")),
         weekly_universe_crypto=int(os.getenv("WEEKLY_UNIVERSE_CRYPTO", "5")),
         risk_tolerance=max(1, min(10, int(os.getenv("RISK_TOLERANCE", "5")))),
+        universe_countries=tuple(
+            code.strip().upper()
+            for code in os.getenv("UNIVERSE_COUNTRIES", "").split(",")
+            if code.strip()
+        ) or DEFAULT_UNIVERSE_COUNTRIES,
+        universe_stock_min_market_cap=max(0.0, float(os.getenv("UNIVERSE_STOCK_MIN_MARKET_CAP", "2000000000"))),
+        universe_stock_min_dollar_volume=max(0.0, float(os.getenv("UNIVERSE_STOCK_MIN_DOLLAR_VOLUME", "5000000"))),
+        universe_crypto_min_market_cap=max(0.0, float(os.getenv("UNIVERSE_CRYPTO_MIN_MARKET_CAP", "100000000"))),
+        universe_stock_shortlist=max(10, int(os.getenv("UNIVERSE_STOCK_SHORTLIST", "300"))),
+        universe_crypto_shortlist=max(10, int(os.getenv("UNIVERSE_CRYPTO_SHORTLIST", "150"))),
+        risk_weight_vol=max(0.0, float(os.getenv("RISK_WEIGHT_VOL", "0.30"))),
+        risk_weight_concentration=max(0.0, float(os.getenv("RISK_WEIGHT_CONCENTRATION", "0.30"))),
+        risk_weight_correlation=max(0.0, float(os.getenv("RISK_WEIGHT_CORRELATION", "0.25"))),
+        risk_weight_exposure=max(0.0, float(os.getenv("RISK_WEIGHT_EXPOSURE", "0.15"))),
+        risk_budget_vol_min=max(0.01, float(os.getenv("RISK_BUDGET_VOL_MIN", "0.10"))),
+        risk_budget_vol_max=max(0.02, float(os.getenv("RISK_BUDGET_VOL_MAX", "0.45"))),
+        risk_lookback_days=max(20, int(os.getenv("RISK_LOOKBACK_DAYS", "120"))),
+        risk_corr_shrinkage=min(1.0, max(0.0, float(os.getenv("RISK_CORR_SHRINKAGE", "0.6")))),
+        risk_alert_threshold=min(100.0, max(0.0, float(os.getenv("RISK_ALERT_THRESHOLD", "70")))),
+        risk_hard_threshold=min(100.0, max(0.0, float(os.getenv("RISK_HARD_THRESHOLD", "85")))),
+        risk_sizing_corr_floor=min(1.0, max(0.0, float(os.getenv("RISK_SIZING_CORR_FLOOR", "0.30")))),
+        risk_max_position_pct=min(1.0, max(0.01, float(os.getenv("RISK_MAX_POSITION_PCT", "0.25")))),
+        risk_default_stock_vol=max(0.01, float(os.getenv("RISK_DEFAULT_STOCK_VOL", "0.30"))),
+        risk_default_crypto_vol=max(0.01, float(os.getenv("RISK_DEFAULT_CRYPTO_VOL", "0.60"))),
         currency=os.getenv("CURRENCY", "EUR").upper(),
         crypto_entry_limit_collar_bps=max(0, int(os.getenv("CRYPTO_ENTRY_LIMIT_COLLAR_BPS", "15"))),
         crypto_entry_max_chase_bps=max(0, int(os.getenv("CRYPTO_ENTRY_MAX_CHASE_BPS", "40"))),
         crypto_pending_reprice_minutes=max(1, int(os.getenv("CRYPTO_PENDING_REPRICE_MINUTES", "2"))),
         crypto_pending_cancel_minutes=max(1, int(os.getenv("CRYPTO_PENDING_CANCEL_MINUTES", "12"))),
+        order_await_timeout_minutes=max(1, int(os.getenv("ORDER_AWAIT_TIMEOUT_MINUTES", "360"))),
         trailing_tp_min_profit_buffer_pct=max(0.0, float(os.getenv("TRAILING_TP_MIN_PROFIT_BUFFER_PCT", "0.5"))),
         strategy_horizon_days_min=int(os.getenv("STRATEGY_HORIZON_DAYS_MIN", "90")),
         strategy_horizon_days_max=int(os.getenv("STRATEGY_HORIZON_DAYS_MAX", "120")),
