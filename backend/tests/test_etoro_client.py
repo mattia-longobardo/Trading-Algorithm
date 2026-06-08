@@ -5,7 +5,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 dotenv_stub = ModuleType("dotenv")
 dotenv_stub.load_dotenv = lambda: None
@@ -92,6 +92,23 @@ class EToroMarketDataTests(unittest.TestCase):
         self.assertEqual(quote["bid_price"], 10.4)
         self.assertEqual(quote["last_price"], 10.45)
 
+    def test_get_rates_by_instruments_sends_literal_commas(self):
+        """Regression: eToro's rates endpoint returns 500 for %2C-encoded commas.
+
+        Passing a comma-joined value via requests' ``params`` percent-encodes the
+        commas (``instrumentIds=1%2C2%2C3``), which eToro rejects with a 500. A
+        live probe confirmed literal commas (``instrumentIds=1,2,3``) return 200.
+        The query must therefore reach requests with literal commas (embedded in
+        the URL), not as an encodable ``params`` dict.
+        """
+        client, session = make_client()
+        session.request.return_value = make_response(200, {"rates": []})
+        client.get_rates_by_instruments([1, 2, 3])
+        args, kwargs = session.request.call_args
+        url = args[1] if len(args) > 1 else kwargs.get("url", "")
+        self.assertIn("instrumentIds=1,2,3", url)
+        self.assertNotIn("instrumentIds", str(kwargs.get("params") or ""))
+
     def test_get_candles_normalizes_bars(self):
         client, session = make_client()
         session.request.return_value = make_response(200, {
@@ -109,6 +126,34 @@ class EToroMarketDataTests(unittest.TestCase):
         self.assertEqual(bars[0]["close"], 1.5)
         self.assertTrue(bars[0]["timestamp"].startswith("2026-01-01"))
         self.assertLess(bars[0]["timestamp"], bars[1]["timestamp"])
+
+
+class EToroMarketOpenTests(unittest.TestCase):
+    def _rates(self, date_iso):
+        return make_response(200, {"rates": [
+            {"instrumentID": 101, "bid": 10.0, "ask": 10.1, "lastExecution": 10.0, "date": date_iso}
+        ]})
+
+    def test_market_open_when_quote_is_fresh(self):
+        from core.utils import utc_now, isoformat_utc
+        client, session = make_client()
+        session.request.return_value = self._rates(isoformat_utc(utc_now()))
+        self.assertTrue(client.is_market_open(101))
+
+    def test_market_closed_when_quote_is_stale(self):
+        client, session = make_client()
+        session.request.return_value = self._rates("2020-01-01T00:00:00Z")
+        self.assertFalse(client.is_market_open(101))
+
+    def test_fails_open_on_error(self):
+        client, session = make_client()
+        session.request.side_effect = EToroAPIError(500, "boom")
+        self.assertTrue(client.is_market_open(101))  # don't block trading on a transient error
+
+    def test_fails_open_when_no_rate_row(self):
+        client, session = make_client()
+        session.request.return_value = make_response(200, {"rates": []})
+        self.assertTrue(client.is_market_open(101))
 
 
 class EToroInstrumentTests(unittest.TestCase):
@@ -183,6 +228,39 @@ class EToroAccountTests(unittest.TestCase):
         equity = client.get_account_equity()
         # credit 1000 + 2 units * 55.0 bid = 1110
         self.assertEqual(equity, 1110.0)
+
+    def test_account_equity_ignores_null_instrument_id_rate_rows(self):
+        """Regression: a rates row with null instrumentID must not crash equity.
+
+        The eToro rates endpoint can return rows without an instrumentID. The
+        hardened ``get_rates_by_instruments`` skips them, but ``get_account_equity``
+        used to do ``int(None)`` and raise — which ``portfolio_risk_snapshot``
+        swallowed into equity=0, zeroing the entire risk score despite open
+        positions. Equity must be computed via the same hardened path.
+        """
+        client, session = make_client()
+        session.request.side_effect = [
+            self._portfolio_response(),
+            make_response(200, {"rates": [
+                {"instrumentID": None, "bid": None, "ask": None, "lastExecution": None},
+                {"instrumentID": 101, "bid": 55.0, "ask": 55.2, "lastExecution": 55.1},
+            ]}),
+        ]
+        equity = client.get_account_equity()
+        # poison row skipped; credit 1000 + 2 units * 55.0 bid = 1110
+        self.assertEqual(equity, 1110.0)
+
+    def test_account_equity_falls_back_to_open_rate_when_rates_fail(self):
+        """If the rates endpoint fails (e.g. eToro 500), equity must fall back to
+        openRate instead of raising — otherwise the failure propagates and the
+        risk score is zeroed. Mirrors the live snapshot's rate-failure tolerance.
+        """
+        client, session = make_client()
+        session.request.return_value = self._portfolio_response()
+        with patch.object(client, "get_rates_by_instruments", side_effect=EToroAPIError(500, "boom")):
+            equity = client.get_account_equity()
+        # rates failed → openRate 50.0: credit 1000 + 2 units * 50.0 = 1100
+        self.assertEqual(equity, 1100.0)
 
 
 class EToroOrderTests(unittest.TestCase):

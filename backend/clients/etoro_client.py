@@ -156,6 +156,36 @@ class EToroClient:
         last = float(row.get("lastExecution") or 0.0) or None
         return {"ask_price": ask, "bid_price": bid, "last_price": last}
 
+    def is_market_open(self, instrument_id: int, *, max_staleness_minutes: float = 15.0) -> bool:
+        """True if the instrument has a fresh live quote (i.e. its market is open).
+
+        eToro does not expose a reliable per-instrument market-open boolean, but a
+        closed exchange freezes the rate at the last close, so the quote ``date``
+        going stale is a robust, exchange-agnostic proxy (handles holidays/DST on
+        its own). Crypto rates tick 24/7 and are always fresh. Fails *open*
+        (returns True) on any error so a transient quote failure never blocks
+        trading — the gate only suppresses entries when the market is provably
+        closed.
+        """
+        try:
+            payload = self._request(
+                "GET",
+                f"/api/v1/market-data/instruments/rates?instrumentIds={int(instrument_id)}",
+            )
+            rows = payload.get("rates") or []
+            if not rows:
+                return True
+            quote_dt = parse_datetime(rows[0].get("date"))
+            if quote_dt is None:
+                return True
+            age_minutes = (utc_now() - quote_dt).total_seconds() / 60.0
+            return age_minutes <= max_staleness_minutes
+        except Exception:
+            self.logger.debug(
+                "is_market_open: quote check failed for %s; assuming open", instrument_id, exc_info=True
+            )
+            return True
+
     def get_candles_by_instrument(
         self,
         instrument_id: int,
@@ -514,11 +544,15 @@ class EToroClient:
         """
         if not instrument_ids:
             return {}
+        # eToro's gateway returns 500 for %2C-encoded commas, and requests
+        # percent-encodes a comma-joined ``params`` value. Embed the query in the
+        # path so the commas reach eToro literally (``instrumentIds=1,2,3``).
+        # A single id has no comma, which is why this only surfaced with >=2
+        # open positions. (``requote_uri`` keeps literal commas intact.)
         ids_param = ",".join(str(int(i)) for i in instrument_ids)
         payload = self._request(
             "GET",
-            "/api/v1/market-data/instruments/rates",
-            params={"instrumentIds": ids_param},
+            f"/api/v1/market-data/instruments/rates?instrumentIds={ids_param}",
         )
         result: dict[int, dict] = {}
         for row in payload.get("rates") or []:
@@ -559,21 +593,33 @@ class EToroClient:
     def get_account_equity(self) -> float:
         portfolio = self._portfolio()
         credit = float(portfolio.get("credit") or 0.0)
-        positions = [self._normalize_position(p) for p in (portfolio.get("positions") or [])]
-        if not positions:
+        positions = portfolio.get("positions") or []
+        # Use the hardened batched-rates helper (it skips rows with a null
+        # instrumentID and floats bid/ask/last). Mirrors ``live_snapshot._build``
+        # so equity here matches the live snapshot the rest of the app shows.
+        instrument_ids = [
+            int(p["instrumentID"]) for p in positions if p.get("instrumentID") is not None
+        ]
+        if not instrument_ids:
             return credit
-        instrument_ids = ",".join(str(p["instrument_id"]) for p in positions)
-        rates_payload = self._request(
-            "GET",
-            "/api/v1/market-data/instruments/rates",
-            params={"instrumentIds": instrument_ids},
-        )
-        by_id = {int(r.get("instrumentID")): r for r in (rates_payload.get("rates") or [])}
+        # Tolerate a rates-fetch failure (e.g. an eToro 500): fall back to
+        # openRate so equity stays a usable figure instead of raising and being
+        # collapsed to 0 by callers. Mirrors ``live_snapshot._build``.
+        try:
+            rate_map = self.get_rates_by_instruments(instrument_ids)
+        except Exception as exc:
+            self.logger.debug("get_account_equity: rates fetch failed, using openRate: %s", exc)
+            rate_map = {}
         market_value = 0.0
         for position in positions:
-            rate = by_id.get(position["instrument_id"], {})
-            price = float(rate.get("bid") or rate.get("lastExecution") or position["open_rate"])
-            market_value += position["units"] * price
+            iid = position.get("instrumentID")
+            if iid is None:
+                continue
+            units = float(position.get("units") or 0.0)
+            open_rate = float(position.get("openRate") or 0.0)
+            rate = rate_map.get(int(iid), {})
+            price = rate.get("bid") or rate.get("lastExecution") or open_rate
+            market_value += units * float(price or open_rate)
         return credit + market_value
 
     def get_open_position(self, symbol: str) -> dict[str, Any] | None:
