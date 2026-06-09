@@ -258,11 +258,47 @@ class TradeManager:
             )
         return int(row["count"]) if row else 0
 
+    def _pending_allocated_capital(self, provider: str) -> float:
+        """Capital committed to DB-PENDING orders the broker doesn't yet reflect.
+
+        Fresh orders live as PENDING rows before they reach eToro, so
+        ``get_available_cash()`` still counts their cash as free. Subtracting
+        this stops a single batch cycle from sizing every order against the same
+        full balance and exhausting liquidity before all slots are funded.
+        """
+        total = 0.0
+        for t in self.get_open_or_pending_trades():
+            if self._trade_provider(t) != provider:
+                continue
+            if str(t.get("status") or "").upper() != "PENDING":
+                continue
+            total += self._as_float(t.get("allocated_capital")) or 0.0
+        return total
+
+    def _uniform_cash_share(self, cash: float, provider: str) -> float:
+        """Even share of *cash* across this provider's still-open slots.
+
+        Used as a ceiling so risk-parity sizing can only shrink a position, never
+        let one trade soak up cash meant for the remaining slots. ``cash`` is the
+        already-pending-adjusted free cash, and the active count includes PENDING,
+        so cash-left and slots-left stay consistent.
+        """
+        slots = self.config.max_open_trades_stock + self.config.max_open_trades_crypto
+        active = sum(
+            1
+            for t in self.get_open_or_pending_trades()
+            if self._trade_provider(t) == provider
+        )
+        remaining_slots = max(slots - active, 1)
+        return cash / remaining_slots
+
     def compute_allocated_capital(self, provider: str = PROVIDER_ETORO) -> float:
         broker = self.broker(provider)
         if broker is None:
             return 0.0
-        cash = broker.get_available_cash()
+        # Subtract in-flight PENDING commitments the broker hasn't booked yet so
+        # the equal-slot share reflects truly free cash, not the full balance.
+        cash = max(0.0, broker.get_available_cash() - self._pending_allocated_capital(provider))
         slots = self.config.max_open_trades_stock + self.config.max_open_trades_crypto
         # The cash pool is shared between STOCK and CRYPTO, so we use the
         # aggregate count of this provider's active trades across categories.
@@ -320,12 +356,24 @@ class TradeManager:
             cash = float(broker.get_available_cash())
         except Exception:
             return self.compute_allocated_capital(provider=provider)
+        # Free cash net of in-flight PENDING orders the broker hasn't booked,
+        # so every order in a batch cycle sizes against the shrinking balance.
+        cash = max(0.0, cash - self._pending_allocated_capital(provider))
         positions = self._open_position_values(provider)
         candidate = {"symbol": str(symbol).upper(), "category": category}
         size = self.risk.suggest_size(candidate, positions, equity, cash)
         if size <= 0:
             return 0.0
+        # Spread liquidity uniformly: never exceed an even share of the remaining
+        # cash across the still-open slots. Risk-parity can only shrink from here.
+        uniform_share = self._uniform_cash_share(cash, provider)
         minimum = float(getattr(self.config, "etoro_min_trade_amount", 0.0) or 0.0) or 1.0
+        if uniform_share > 0:
+            size = round(min(size, uniform_share), 2)
+            if size < minimum:
+                size = minimum if cash >= minimum else 0.0
+                if size <= 0:
+                    return 0.0
         projection = self.risk.project(candidate, size, positions, equity)
         tries = 0
         while projection.over_hard and size > minimum and tries < 8:
@@ -607,6 +655,29 @@ class TradeManager:
             max_trades = int(self.config.max_open_trades_crypto)
         return max(max_trades - self.count_active_trades(category, provider=provider), 0)
 
+    def _has_liquidity_for_new_trade(self, provider: str = PROVIDER_ETORO) -> bool:
+        """True when *provider* has enough cash to open at least the smallest trade.
+
+        Pre-LLM gate so we never ask GPT for orders we could not fund. Permissive
+        by design: returns True when no minimum is configured or when the cash
+        lookup fails, so a transient broker blip never silently halts trading
+        (downstream sizing still guards against over-allocation).
+        """
+        broker = self.broker(provider)
+        if broker is None:
+            return False
+        minimum = float(getattr(self.config, "etoro_min_trade_amount", 0.0) or 0.0)
+        if minimum <= 0:
+            return True
+        try:
+            cash = float(broker.get_available_cash())
+        except Exception:
+            self.logger.warning(
+                "Cash lookup failed for %s; allowing GPT cycle", provider, exc_info=True
+            )
+            return True
+        return cash >= minimum
+
     def _build_batch_payloads(
         self,
         category: str,
@@ -717,6 +788,13 @@ class TradeManager:
                 symbol,
                 provider,
                 category,
+            )
+            return
+
+        if not self._has_liquidity_for_new_trade(provider):
+            self.logger.info(
+                "Skipping %s because available cash is below the minimum trade amount",
+                symbol,
             )
             return
 
@@ -1241,6 +1319,15 @@ class TradeManager:
             if available_slots <= 0:
                 self.logger.debug(
                     "Skipping %s/%s batch evaluation because no slots are available",
+                    provider,
+                    category,
+                )
+                return
+
+            if not self._has_liquidity_for_new_trade(provider):
+                self.logger.info(
+                    "Skipping %s/%s batch evaluation because available cash is below "
+                    "the minimum trade amount",
                     provider,
                     category,
                 )
