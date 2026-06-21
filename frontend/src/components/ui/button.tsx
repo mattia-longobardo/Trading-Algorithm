@@ -11,7 +11,7 @@ const buttonStyles = cva(
     variants: {
       variant: {
         default:
-          "bg-(--color-accent) text-slate-950 hover:bg-emerald-400 active:bg-emerald-500",
+          "bg-(--color-accent) text-(--color-accent-contrast) hover:opacity-90 active:opacity-85",
         secondary:
           "bg-(--color-panel) text-(--color-text) border border-(--color-line) hover:bg-(--color-hover) active:bg-(--color-hover)",
         ghost:
@@ -19,13 +19,13 @@ const buttonStyles = cva(
         outline:
           "bg-transparent text-(--color-text) border border-(--color-line) hover:bg-(--color-panel) active:bg-(--color-hover)",
         danger:
-          "bg-(--color-danger) text-white hover:bg-rose-600 active:bg-rose-700",
+          "bg-(--color-danger) text-white hover:opacity-90 active:opacity-85",
       },
       size: {
-        sm: "h-8 px-3 text-xs",
-        md: "h-9 px-4",
+        sm: "h-10 px-3 text-sm sm:h-8 sm:text-xs",
+        md: "h-10 px-4 sm:h-9",
         lg: "h-10 px-5",
-        icon: "h-9 w-9 p-0",
+        icon: "h-10 w-10 p-0 sm:h-9 sm:w-9",
       },
     },
     defaultVariants: {

@@ -174,6 +174,78 @@ def latest_snapshot(db_path: str, provider: str | None = None) -> dict[str, Any]
     )
 
 
+def account_return(
+    db_path: str,
+    *,
+    target_currency: str,
+    provider: str | None = None,
+    from_dt: datetime | None = None,
+    to_dt: datetime | None = None,
+) -> dict[str, float] | None:
+    """Real account performance from equity snapshots, in ``target_currency``.
+
+    Compares the *earliest* recorded equity (the base) with the latest, summed
+    per provider so a multi-broker account aggregates correctly. Returns
+    ``{base, latest, abs, pct}`` or ``None`` when there are no usable snapshots.
+
+    When ``from_dt``/``to_dt`` are given the base/latest are taken from the
+    first/last snapshot inside that window, so the figure tracks the period the
+    dashboard has selected (not the whole history).
+
+    This is the broker's ground-truth equity growth — distinct from the bot's
+    own trade PnL, which only covers positions the bot tracked.
+    """
+
+    if provider:
+        providers = [provider]
+    else:
+        rows = app_fetch_all(db_path, "SELECT DISTINCT provider FROM account_equity_snapshots")
+        providers = [r["provider"] for r in rows]
+
+    from_iso = isoformat_utc(from_dt) if from_dt is not None else None
+    to_iso = isoformat_utc(to_dt) if to_dt is not None else None
+
+    base = 0.0
+    latest = 0.0
+    have = False
+    for prov in providers:
+        base_sql = "SELECT equity, currency FROM account_equity_snapshots WHERE provider = ?"
+        base_params: list[Any] = [prov]
+        last_sql = "SELECT equity, currency FROM account_equity_snapshots WHERE provider = ?"
+        last_params: list[Any] = [prov]
+        if from_iso is not None:
+            base_sql += " AND recorded_at >= ?"
+            base_params.append(from_iso)
+            last_sql += " AND recorded_at >= ?"
+            last_params.append(from_iso)
+        if to_iso is not None:
+            base_sql += " AND recorded_at <= ?"
+            base_params.append(to_iso)
+            last_sql += " AND recorded_at <= ?"
+            last_params.append(to_iso)
+        first = app_fetch_one(db_path, base_sql + " ORDER BY recorded_at ASC LIMIT 1", tuple(base_params))
+        last = app_fetch_one(db_path, last_sql + " ORDER BY recorded_at DESC LIMIT 1", tuple(last_params))
+        if not first or not last:
+            continue
+        converted_base = fx.convert(first["equity"], first["currency"], target_currency)
+        converted_latest = fx.convert(last["equity"], last["currency"], target_currency)
+        if converted_base is None or converted_latest is None:
+            continue
+        base += float(converted_base)
+        latest += float(converted_latest)
+        have = True
+
+    if not have or base == 0:
+        return None
+    abs_return = round(latest - base, 2)
+    return {
+        "base": round(base, 2),
+        "latest": round(latest, 2),
+        "abs": abs_return,
+        "pct": round((abs_return / base) * 100.0, 2),
+    }
+
+
 def prune_old_snapshots(db_path: str, keep_days: int = 365) -> int:
     """Delete snapshots older than ``keep_days``. Returns rows removed."""
 

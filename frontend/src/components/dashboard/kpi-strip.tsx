@@ -1,6 +1,6 @@
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
+import { formatCurrency, formatNumber, formatPercent, formatSignedPercent } from "@/lib/format";
 import type { Metrics } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -11,11 +11,14 @@ function Kpi({
   value,
   subtitle,
   accent,
+  subtitleProminent,
 }: {
   title: string;
   value: string;
   subtitle?: string;
   accent?: "positive" | "negative";
+  /** Render the subtitle (e.g. a percentage) large, bold and accent-colored. */
+  subtitleProminent?: boolean;
 }) {
   const tone =
     accent === "positive"
@@ -23,11 +26,16 @@ function Kpi({
       : accent === "negative"
       ? "text-(--color-danger)"
       : "text-(--color-text)";
+  const subtitleClass = subtitleProminent
+    ? `tnum mt-1 break-words text-lg font-semibold leading-tight tabular-nums ${tone}`
+    : "tnum mt-1 break-words text-xs leading-tight tabular-nums text-(--color-muted)";
   return (
     <Card className="p-3 sm:p-4">
-      <p className="text-xs uppercase tracking-wide text-(--color-muted)">{title}</p>
-      <p className={`tnum mt-1 text-xl font-semibold tabular-nums ${tone}`}>{value}</p>
-      {subtitle && <p className="tnum mt-1 text-xs tabular-nums text-(--color-muted)">{subtitle}</p>}
+      <p className="text-xs uppercase text-(--color-muted)">{title}</p>
+      <p className={`tnum mt-1 break-words text-xl font-semibold leading-tight tabular-nums ${tone}`}>
+        {value}
+      </p>
+      {subtitle && <p className={subtitleClass}>{subtitle}</p>}
     </Card>
   );
 }
@@ -43,8 +51,8 @@ export interface KpiStripProps {
 export function KpiStrip({ metrics: m, loading }: KpiStripProps) {
   if (loading) {
     return (
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-4 xl:grid-cols-6">
-        {Array.from({ length: 11 }).map((_, i) => (
+      <div className="grid grid-cols-1 gap-3 min-[430px]:grid-cols-2 md:grid-cols-4 md:gap-4 xl:grid-cols-6">
+        {Array.from({ length: 12 }).map((_, i) => (
           <Card key={i} className="p-4">
             <Skeleton className="h-3 w-16" />
             <Skeleton className="mt-2 h-6 w-24" />
@@ -55,12 +63,18 @@ export function KpiStrip({ metrics: m, loading }: KpiStripProps) {
   }
 
   return (
-    <div className="grid grid-cols-2 gap-4 md:grid-cols-4 xl:grid-cols-6">
+    <div className="grid grid-cols-1 gap-3 min-[430px]:grid-cols-2 md:grid-cols-4 md:gap-4 xl:grid-cols-6">
       <Kpi
-        title="PnL totale"
+        title="PnL realizzato"
         value={formatCurrency(m?.total_pnl_abs, m?.currency ?? "EUR")}
         accent={(m?.total_pnl_abs ?? 0) >= 0 ? "positive" : "negative"}
-        subtitle={formatPercent(m?.total_pnl_pct)}
+        subtitle={formatSignedPercent(m?.total_pnl_pct)}
+        subtitleProminent
+      />
+      <Kpi
+        title="PnL non realizzato"
+        value={formatCurrency(m?.unrealized_pnl_abs, m?.currency ?? "EUR")}
+        accent={(m?.unrealized_pnl_abs ?? 0) >= 0 ? "positive" : "negative"}
       />
       <Kpi title="Win rate" value={formatPercent((m?.win_rate ?? 0) * 100)} />
       <Kpi
@@ -76,6 +90,11 @@ export function KpiStrip({ metrics: m, loading }: KpiStripProps) {
       <Kpi
         title="Equity account"
         value={formatCurrency(m?.account_equity, m?.currency ?? "EUR")}
+        accent={(m?.account_return_abs ?? 0) >= 0 ? "positive" : "negative"}
+        subtitle={
+          m?.account_return_pct != null ? formatSignedPercent(m.account_return_pct) : undefined
+        }
+        subtitleProminent
       />
       <Kpi
         title="Avg win"

@@ -4,9 +4,16 @@ import { useState } from "react";
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { formatCurrency, formatDateTime, formatNumber } from "@/lib/format";
+import { formatCurrency, formatDateTime, formatNumber, formatSignedPercent } from "@/lib/format";
 import { type Trade } from "@/lib/types";
-import { pnlClass, statusVariant } from "./trade-row";
+import {
+  isTradeActionable,
+  isTradeEditable,
+  pnlClass,
+  statusVariant,
+  tradePnl,
+  tradePnlPct,
+} from "./trade-row";
 
 export interface TradeCardProps {
   trade: Trade;
@@ -19,9 +26,12 @@ export function TradeCard({ trade: t, onEdit, onClose }: TradeCardProps) {
 
   const ttpArmed = t.trailing_take_profit_price != null && t.high_water_mark != null;
   const tsArmed = t.trailing_stop_price != null;
-  const pnl = (t.realized_pnl ?? 0) + (t.unrealized_pnl ?? 0);
+  const pnl = tradePnl(t);
+  const pnlPct = tradePnlPct(t);
 
-  const isActionable = t.status === "PENDING" || t.status === "OPEN";
+  const isActionable = isTradeActionable(t);
+  const isEditable = isTradeEditable(t);
+  const closeLabel = t.status === "PENDING" ? "Annulla" : "Chiudi";
 
   return (
     <div className="rounded-lg border border-(--color-line) bg-(--color-panel)/40 p-3 text-sm">
@@ -30,15 +40,19 @@ export function TradeCard({ trade: t, onEdit, onClose }: TradeCardProps) {
         <div className="flex min-w-0 items-center gap-2">
           <Link
             href={`/symbol/${encodeURIComponent(t.symbol)}`}
-            className="font-medium hover:underline"
+            className="truncate font-medium hover:underline"
+            title={t.symbol}
           >
             {t.symbol}
           </Link>
           <Badge variant={statusVariant(t.status)}>{t.status}</Badge>
           <span className="text-xs text-(--color-muted)">{t.category}</span>
         </div>
-        <span className={`tnum shrink-0 font-medium ${pnlClass(pnl)}`}>
-          {formatCurrency(pnl, t.account_currency || "EUR")}
+        <span className={`tnum flex shrink-0 flex-col items-end font-medium ${pnlClass(pnl)}`}>
+          <span>{formatCurrency(pnl, t.account_currency || "EUR")}</span>
+          {pnlPct != null && (
+            <span className="text-xs">{formatSignedPercent(pnlPct)}</span>
+          )}
         </span>
       </div>
 
@@ -69,6 +83,10 @@ export function TradeCard({ trade: t, onEdit, onClose }: TradeCardProps) {
           <div>
             <dt className="text-(--color-muted)">Entry</dt>
             <dd className="tnum">{formatNumber(t.entry_price)}</dd>
+          </div>
+          <div>
+            <dt className="text-(--color-muted)">Uscita</dt>
+            <dd className="tnum">{formatNumber(t.close_price)}</dd>
           </div>
           <div>
             <dt className="text-(--color-muted)">Target Entry</dt>
@@ -143,16 +161,28 @@ export function TradeCard({ trade: t, onEdit, onClose }: TradeCardProps) {
         </dl>
       )}
 
-      {/* Footer actions — always show Modifica; show Chiudi/Annulla only for PENDING/OPEN */}
+      {/* Footer actions stay visible; inactive states are disabled. */}
       <div className="mt-3 flex justify-end gap-2">
-        <Button size="sm" variant="secondary" onClick={() => onEdit(t)}>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={!isEditable}
+          onClick={() => {
+            if (isEditable) onEdit(t);
+          }}
+        >
           Modifica
         </Button>
-        {isActionable && (
-          <Button size="sm" variant="danger" onClick={() => onClose(t)}>
-            {t.status === "PENDING" ? "Annulla" : "Chiudi"}
-          </Button>
-        )}
+        <Button
+          size="sm"
+          variant={isActionable ? "danger" : "secondary"}
+          disabled={!isActionable}
+          onClick={() => {
+            if (isActionable) onClose(t);
+          }}
+        >
+          {closeLabel}
+        </Button>
       </div>
     </div>
   );

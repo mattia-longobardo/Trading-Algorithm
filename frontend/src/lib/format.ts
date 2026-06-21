@@ -9,12 +9,19 @@ export function formatCurrency(value: number | null | undefined, currency = "EUR
     style: "currency",
     currency,
     maximumFractionDigits: 2,
-  }).format(value);
+  }).format(value).replace(/\u00a0/g, " ");
 }
 
 export function formatPercent(value: number | null | undefined, fractionDigits = 2): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   return `${value.toFixed(fractionDigits)}%`;
+}
+
+/** Like formatPercent but always shows an explicit + / − sign (gain/loss). */
+export function formatSignedPercent(value: number | null | undefined, fractionDigits = 2): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(fractionDigits)}%`;
 }
 
 export function formatDateTime(value: string | null | undefined): string {

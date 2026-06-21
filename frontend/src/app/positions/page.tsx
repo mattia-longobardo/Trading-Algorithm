@@ -16,7 +16,7 @@ export default function PositionsPage() {
     <section className="space-y-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-3xl font-semibold">Posizioni</h1>
+          <h1 className="text-2xl font-semibold sm:text-3xl">Posizioni</h1>
           <p className="text-sm text-(--color-muted)">Posizioni aperte in tempo reale.</p>
         </div>
         <LiveBadge status={status} />
@@ -25,7 +25,7 @@ export default function PositionsPage() {
       {/* Summary line */}
       <p className="tnum text-sm text-(--color-muted)">
         <span className="font-medium text-(--color-text)">Equity</span> {equityStr}
-        <span className="mx-2 text-(--color-line)">·</span>
+        <span className="mx-2 text-(--color-muted)">·</span>
         <span className="font-medium text-(--color-text)">Liquidità</span> {cashStr}
       </p>
 

@@ -3,7 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useMinuteRefresh } from "@/lib/use-minute-refresh";
-import { TimeframeSelector, type Timeframe } from "@/components/timeframe-selector";
+import { DateRangePicker, type DateRange } from "@/components/dashboard/date-range-picker";
 import { EquityBalanceChart } from "@/components/equity-balance-chart";
 import { KpiStrip } from "@/components/dashboard/kpi-strip";
 import { CategoryAllocationChart } from "@/components/dashboard/category-allocation-chart";
@@ -23,7 +23,7 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "@/lib/api";
-import { formatCurrency } from "@/lib/format";
+import { formatCurrency, formatNumber } from "@/lib/format";
 import type {
   AllocationCategory,
   AllocationSymbol,
@@ -46,19 +46,45 @@ const DASHBOARD_QUERY_KEYS = [
   "account-balance",
 ] as const;
 
+// Selected range → `from`/`to` query string (empty = whole history). The end
+// is pushed to the last millisecond of the day so the chosen day is inclusive.
+function rangeToParams(range: DateRange): string {
+  const params = new URLSearchParams();
+  if (range.from) {
+    const f = new Date(range.from);
+    f.setHours(0, 0, 0, 0);
+    params.set("from", f.toISOString());
+  }
+  if (range.to) {
+    const t = new Date(range.to);
+    t.setHours(23, 59, 59, 999);
+    params.set("to", t.toISOString());
+  }
+  return params.toString();
+}
+
+function defaultRange(): DateRange {
+  const to = new Date();
+  const from = new Date();
+  from.setDate(from.getDate() - 90); // last 3 months
+  return { from, to };
+}
+
 export default function DashboardPage() {
   const theme = useChartTheme();
-  const [timeframe, setTimeframe] = useState<Timeframe>("3M");
+  const [range, setRange] = useState<DateRange>(() => defaultRange());
+  const rangeQuery = rangeToParams(range);
   const lastAutoRefresh = useMinuteRefresh(DASHBOARD_QUERY_KEYS);
   const { status: liveStatus } = useLiveStream();
 
   const metrics = useQuery({
-    queryKey: ["metrics", timeframe],
-    queryFn: () => api.get<Metrics>(`/api/metrics?window=${timeframe}`),
+    queryKey: ["metrics", rangeQuery],
+    queryFn: () => api.get<Metrics>(`/api/metrics${rangeQuery ? `?${rangeQuery}` : ""}`),
   });
   const equity = useQuery({
-    queryKey: ["equity", timeframe],
-    queryFn: () => api.get<{ points: EquityPoint[] }>(`/api/equity-curve?window=${timeframe}`),
+    queryKey: ["equity", rangeQuery],
+    queryFn: () =>
+      api.get<{ points: EquityPoint[] }>(`/api/equity-curve${rangeQuery ? `?${rangeQuery}` : ""}`),
   });
   const fxRate = useQuery({
     queryKey: ["fx-rate"],
@@ -73,8 +99,9 @@ export default function DashboardPage() {
     staleTime: 5 * 60 * 1000,
   });
   const pnlBySymbol = useQuery({
-    queryKey: ["pnl-by-symbol", timeframe],
-    queryFn: () => api.get<{ items: PnlBySymbolRow[] }>(`/api/pnl-by-symbol?window=${timeframe}`),
+    queryKey: ["pnl-by-symbol", rangeQuery],
+    queryFn: () =>
+      api.get<{ items: PnlBySymbolRow[] }>(`/api/pnl-by-symbol${rangeQuery ? `?${rangeQuery}` : ""}`),
   });
   const allocation = useQuery({
     queryKey: ["allocation"],
@@ -85,9 +112,11 @@ export default function DashboardPage() {
       }>("/api/allocation"),
   });
   const distribution = useQuery({
-    queryKey: ["returns-distribution", timeframe],
+    queryKey: ["returns-distribution", rangeQuery],
     queryFn: () =>
-      api.get<{ bins: ReturnsBin[] }>(`/api/returns-distribution?window=${timeframe}&bins=12`),
+      api.get<{ bins: ReturnsBin[] }>(
+        `/api/returns-distribution?${rangeQuery ? `${rangeQuery}&` : ""}bins=12`
+      ),
   });
 
   const m = metrics.data;
@@ -96,8 +125,8 @@ export default function DashboardPage() {
   return (
     <section className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-semibold">Dashboard</h1>
+        <div className="min-w-0 flex-1">
+          <h1 className="text-2xl font-semibold sm:text-3xl">Dashboard</h1>
           <p className="text-sm text-(--color-muted)">
             Performance del bot — i KPI ricalcolano sull&apos;intervallo selezionato.
             I dati si aggiornano una volta al minuto, ~30 s dopo il tick di
@@ -114,16 +143,16 @@ export default function DashboardPage() {
             </p>
           )}
         </div>
-        <div className="flex items-center gap-3">
+        <div className="grid w-full grid-cols-[auto_minmax(0,1fr)] gap-2 sm:flex sm:w-auto sm:items-center sm:gap-3">
           <LiveBadge status={liveStatus} />
           {fxRate.data && fxRate.data.from !== fxRate.data.to && (
             <div
-              className={`rounded-lg border px-3 py-1.5 text-xs ${
+              className={`min-w-0 rounded-lg border px-3 py-2 text-xs leading-tight sm:py-1.5 ${
                 fxRate.data.available
                   ? fxRate.data.stale
-                    ? "border-amber-500/40 bg-amber-500/10 text-amber-200"
+                    ? "border-(--color-warning)/50 bg-(--color-warning)/10 text-(--color-warning)"
                     : "border-(--color-line) bg-(--color-panel)/70 text-(--color-muted)"
-                  : "border-rose-500/40 bg-rose-500/10 text-rose-300"
+                  : "border-(--color-danger)/50 bg-(--color-danger)/10 text-(--color-danger)"
               }`}
               title={
                 fxRate.data.available
@@ -136,8 +165,11 @@ export default function DashboardPage() {
               {fxRate.data.available && fxRate.data.rate != null ? (
                 <>
                   {fxRate.data.stale && "⚠ "}1 {fxRate.data.from} ={" "}
-                  <span className="tnum font-medium tabular-nums">
-                    {fxRate.data.rate.toFixed(4)}
+                  <span className="font-medium tabular-nums">
+                    {formatNumber(fxRate.data.rate, {
+                      minimumFractionDigits: 4,
+                      maximumFractionDigits: 4,
+                    })}
                   </span>{" "}
                   {fxRate.data.to}
                 </>
@@ -146,7 +178,11 @@ export default function DashboardPage() {
               )}
             </div>
           )}
-          <TimeframeSelector value={timeframe} onChange={setTimeframe} />
+          <DateRangePicker
+            value={range}
+            onChange={setRange}
+            className="col-span-2 w-full justify-center sm:col-span-1 sm:w-auto"
+          />
         </div>
       </header>
 
@@ -161,7 +197,7 @@ export default function DashboardPage() {
       <KpiStrip metrics={m} loading={metrics.isLoading} />
 
       {/* Account equity + equity curve */}
-      <EquityBalanceChart fallbackCurrency={currency} />
+      <EquityBalanceChart fallbackCurrency={currency} from={range.from} to={range.to} />
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">

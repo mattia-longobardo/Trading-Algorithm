@@ -32,7 +32,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const sidebarContent = (
     <>
       <div className="mb-6 flex items-center gap-2">
-        <div className="size-8 rounded-lg bg-(--color-accent) grid place-items-center text-slate-950 font-bold">
+        <div className="size-8 rounded-lg bg-(--color-accent) grid place-items-center text-(--color-accent-contrast) font-bold">
           T
         </div>
         <div>
@@ -52,14 +52,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               href={item.href}
               aria-current={active ? "page" : undefined}
               className={cn(
-                "relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-(--color-accent) focus-visible:ring-offset-2 focus-visible:ring-offset-(--color-bg)",
+                "relative flex min-w-0 items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-(--color-accent) focus-visible:ring-offset-2 focus-visible:ring-offset-(--color-bg)",
                 active
                   ? "bg-(--color-panel) text-(--color-text) before:absolute before:left-0 before:top-1/2 before:h-5 before:w-0.5 before:-translate-y-1/2 before:rounded-r before:bg-(--color-accent)"
                   : "text-(--color-muted) hover:bg-(--color-panel)/60 hover:text-(--color-text)"
               )}
             >
-              <Icon className={cn("size-4", active && "text-(--color-accent)")} />
-              <span>{item.label}</span>
+              <Icon className={cn("size-4 shrink-0", active && "text-(--color-accent)")} />
+              <span className="truncate">{item.label}</span>
             </Link>
           );
         })}
@@ -67,11 +67,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       <div className="mt-auto space-y-3 pt-6">
         <div className="rounded-lg border border-(--color-line) bg-(--color-elevated) p-3">
-          <div className="flex items-center justify-between gap-2">
-            <p className="truncate text-sm font-medium" title={user.display_name}>
-              {user.display_name}
+          <p className="text-sm font-medium break-words" title={user.display_name}>
+            {user.display_name}
+          </p>
+          <div className="mt-1 flex items-center justify-between gap-2">
+            <p className="min-w-0 truncate text-xs text-(--color-muted)" title={user.username}>
+              @{user.username}
             </p>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <button
                 type="button"
                 aria-label="Apri palette comandi"
@@ -85,9 +88,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <Badge variant={user.role === "admin" ? "admin" : "user"}>{user.role}</Badge>
             </div>
           </div>
-          <p className="mt-1 truncate text-xs text-(--color-muted)" title={user.username}>
-            @{user.username}
-          </p>
         </div>
         <Button variant="secondary" size="sm" className="w-full" onClick={logout}>
           <LogOut className="size-4" />
@@ -98,30 +98,36 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex h-dvh min-h-dvh overflow-hidden lg:h-auto lg:min-h-screen lg:overflow-visible">
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
       {/* Desktop sidebar: always visible from lg breakpoint up. */}
-      <aside className="hidden w-60 flex-col border-r border-(--color-line) bg-(--color-elevated) px-4 py-6 lg:flex">
+      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col self-start overflow-x-hidden overflow-y-auto border-r border-(--color-line) bg-(--color-elevated) px-4 py-6 lg:flex">
         {sidebarContent}
       </aside>
 
-      <main className="flex-1 overflow-x-hidden">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:min-h-screen lg:overflow-visible">
         {/* Mobile top bar: brand + theme toggle + logout. Hidden on lg+. */}
-        <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-(--color-line) bg-(--color-bg)/95 px-4 backdrop-blur lg:hidden">
-          <div className="flex items-center gap-2">
-            <div className="size-6 rounded bg-(--color-accent) grid place-items-center text-slate-950 text-xs font-bold">
+        <header className="z-30 flex h-14 shrink-0 items-center justify-between gap-3 border-b border-(--color-line) bg-(--color-bg)/95 px-4 backdrop-blur lg:hidden">
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="size-6 rounded bg-(--color-accent) grid place-items-center text-(--color-accent-contrast) text-xs font-bold">
               T
             </div>
-            <p className="text-sm font-semibold">Trading Console</p>
+            <p className="truncate text-sm font-semibold">Trading Console</p>
           </div>
           <div className="flex items-center gap-2">
-            <ThemeToggle className="size-8" />
-            <Button variant="secondary" size="sm" aria-label="Logout" onClick={logout}>
+            <ThemeToggle className="size-10" />
+            <Button
+              variant="secondary"
+              size="icon"
+              className="size-10"
+              aria-label="Logout"
+              onClick={logout}
+            >
               <LogOut className="size-4" />
             </Button>
           </div>
         </header>
-        <div className="mx-auto w-full max-w-7xl px-4 py-6 pb-bottom-nav sm:px-6 lg:px-8 lg:py-8 lg:pb-8">
+        <div className="mx-auto min-h-0 w-full max-w-7xl flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:flex-none lg:overflow-visible lg:px-8 lg:py-8">
           {children}
         </div>
         <BottomNav items={items} />
