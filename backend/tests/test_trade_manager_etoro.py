@@ -44,6 +44,7 @@ class EtoroLifecycleBase(unittest.TestCase):
         self.broker.get_available_cash.return_value = 1000.0
         self.broker.is_market_open.return_value = True
         self.data_manager = Mock()
+        self.data_manager.get_symbol_history.return_value = []
         self.gpt = Mock()
         self.manager = TradeManager(
             self.config, logging.getLogger("t"), {PROVIDER_ETORO: self.broker}, self.data_manager, self.gpt
@@ -102,6 +103,14 @@ class EtoroEntryTests(EtoroLifecycleBase):
         self.assertTrue(ok)
         self.broker.is_market_open.assert_not_called()
         self.assertEqual(len(self._rows("PENDING")), 1)
+
+    def test_signal_rejected_when_entry_not_above_stop(self):
+        sig = self._signal(entry_price=100.0, stop_loss=100.0, take_profit=130.0)
+        self.assertFalse(self.manager._signal_has_required_levels(sig))
+        sig2 = self._signal(entry_price=90.0, stop_loss=100.0, take_profit=130.0)
+        self.assertFalse(self.manager._signal_has_required_levels(sig2))
+        ok = self._signal(entry_price=100.0, stop_loss=90.0, take_profit=130.0)
+        self.assertTrue(self.manager._signal_has_required_levels(ok))
 
 
 class EtoroPendingTests(EtoroLifecycleBase):

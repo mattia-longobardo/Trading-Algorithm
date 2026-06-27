@@ -35,15 +35,19 @@ SETTINGS_OVERRIDABLE_KEYS: frozenset[str] = frozenset(
         "risk_tolerance",
         "strategy_horizon_days_min",
         "strategy_horizon_days_max",
-        "crypto_entry_limit_collar_bps",
         "crypto_entry_max_chase_bps",
-        "crypto_pending_reprice_minutes",
         "crypto_pending_cancel_minutes",
         "etoro_min_trade_amount",
         "etoro_default_leverage",
+        "risk_per_trade_pct",
         "trailing_tp_min_profit_buffer_pct",
+        "exit_min_reward_risk",
+        "exit_trailing_arm_r",
+        "exit_trailing_trail_r",
         "log_level",
         "log_profile",
+        "regime_gate_enabled",
+        "regime_sma_period",
     }
 )
 
@@ -109,14 +113,15 @@ class AppConfig:
     risk_hard_threshold: float = 85.0
     risk_sizing_corr_floor: float = 0.30
     risk_max_position_pct: float = 0.25
+    risk_per_trade_pct: float = 0.01
     risk_default_stock_vol: float = 0.30
     risk_default_crypto_vol: float = 0.60
+    regime_gate_enabled: bool = True
+    regime_sma_period: int = 200
     currency: str = "EUR"
-    crypto_entry_limit_collar_bps: int = 15
-    crypto_entry_max_chase_bps: int = 40
-    crypto_pending_reprice_minutes: int = 2
-    crypto_pending_cancel_minutes: int = 12
-    order_await_timeout_minutes: int = 360
+    crypto_entry_max_chase_bps: int = 80
+    crypto_pending_cancel_minutes: int = 20
+    order_await_timeout_minutes: int = 720
     # Minimum profit cushion (in percent of entry_price) that the trailing
     # take profit must guarantee. The bot rejects GPT signals whose
     # `activation_pct − distance/entry × 100` falls below this buffer and
@@ -124,6 +129,11 @@ class AppConfig:
     # belt. Default 0.5% covers ~2× crypto round-trip fees plus typical
     # slippage on liquid pairs.
     trailing_tp_min_profit_buffer_pct: float = 0.5
+    # Deterministic R-multiple exit shaping (R = entry - stop). See
+    # services/exit_levels.normalize_exit_levels.
+    exit_min_reward_risk: float = 1.5
+    exit_trailing_arm_r: float = 1.5
+    exit_trailing_trail_r: float = 1.0
     strategy_horizon_days_min: int = 90
     strategy_horizon_days_max: int = 120
     log_profile: str = "PRODUCTION"
@@ -244,15 +254,17 @@ def load_config() -> AppConfig:
         risk_hard_threshold=min(100.0, max(0.0, float(os.getenv("RISK_HARD_THRESHOLD", "85")))),
         risk_sizing_corr_floor=min(1.0, max(0.0, float(os.getenv("RISK_SIZING_CORR_FLOOR", "0.30")))),
         risk_max_position_pct=min(1.0, max(0.01, float(os.getenv("RISK_MAX_POSITION_PCT", "0.25")))),
+        risk_per_trade_pct=min(0.10, max(0.001, float(os.getenv("RISK_PER_TRADE_PCT", "0.01")))),
         risk_default_stock_vol=max(0.01, float(os.getenv("RISK_DEFAULT_STOCK_VOL", "0.30"))),
         risk_default_crypto_vol=max(0.01, float(os.getenv("RISK_DEFAULT_CRYPTO_VOL", "0.60"))),
         currency=os.getenv("CURRENCY", "EUR").upper(),
-        crypto_entry_limit_collar_bps=max(0, int(os.getenv("CRYPTO_ENTRY_LIMIT_COLLAR_BPS", "15"))),
-        crypto_entry_max_chase_bps=max(0, int(os.getenv("CRYPTO_ENTRY_MAX_CHASE_BPS", "40"))),
-        crypto_pending_reprice_minutes=max(1, int(os.getenv("CRYPTO_PENDING_REPRICE_MINUTES", "2"))),
-        crypto_pending_cancel_minutes=max(1, int(os.getenv("CRYPTO_PENDING_CANCEL_MINUTES", "12"))),
-        order_await_timeout_minutes=max(1, int(os.getenv("ORDER_AWAIT_TIMEOUT_MINUTES", "360"))),
+        crypto_entry_max_chase_bps=max(0, int(os.getenv("CRYPTO_ENTRY_MAX_CHASE_BPS", "80"))),
+        crypto_pending_cancel_minutes=max(1, int(os.getenv("CRYPTO_PENDING_CANCEL_MINUTES", "20"))),
+        order_await_timeout_minutes=max(1, int(os.getenv("ORDER_AWAIT_TIMEOUT_MINUTES", "720"))),
         trailing_tp_min_profit_buffer_pct=max(0.0, float(os.getenv("TRAILING_TP_MIN_PROFIT_BUFFER_PCT", "0.5"))),
+        exit_min_reward_risk=max(0.0, float(os.getenv("EXIT_MIN_REWARD_RISK", "1.5"))),
+        exit_trailing_arm_r=max(0.0, float(os.getenv("EXIT_TRAILING_ARM_R", "1.5"))),
+        exit_trailing_trail_r=max(0.01, float(os.getenv("EXIT_TRAILING_TRAIL_R", "1.0"))),
         strategy_horizon_days_min=int(os.getenv("STRATEGY_HORIZON_DAYS_MIN", "90")),
         strategy_horizon_days_max=int(os.getenv("STRATEGY_HORIZON_DAYS_MAX", "120")),
         log_profile=os.getenv("LOG_PROFILE", "PRODUCTION").upper(),
@@ -284,6 +296,9 @@ def load_config() -> AppConfig:
         etoro_account_type=os.getenv("ETORO_ACCOUNT_TYPE", "demo").strip().lower() or "demo",
         etoro_default_leverage=max(1, int(os.getenv("ETORO_DEFAULT_LEVERAGE", "1"))),
         etoro_min_trade_amount=max(0.0, float(os.getenv("ETORO_MIN_TRADE_AMOUNT", "50"))),
+        regime_gate_enabled=os.getenv("REGIME_GATE_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes", "on"},
+        regime_sma_period=max(20, int(os.getenv("REGIME_SMA_PERIOD", "200"))),
     )
     config.log_file = resolve_runtime_path(config.log_file)
     config.universe_log_file = resolve_runtime_path(config.universe_log_file)

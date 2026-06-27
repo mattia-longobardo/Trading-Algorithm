@@ -23,7 +23,12 @@ from core.utils import (
     utc_now,
 )
 from services.data_manager import DataManager
+from services.exit_levels import normalize_exit_levels
+from services.order_exec import is_marketable
 from services.portfolio_risk import PortfolioRiskService
+from services.regime import passes_regime_gate
+from services.trade_analytics import excursion_r, planned_metrics, realized_r
+from services import exit_eval
 
 
 class TradeManager:
@@ -104,9 +109,7 @@ class TradeManager:
 
     @staticmethod
     def _compute_trailing_stop_price(high_water_mark: float, trailing_stop_distance: float | None) -> float | None:
-        if trailing_stop_distance is None or trailing_stop_distance <= 0:
-            return None
-        return round(high_water_mark - trailing_stop_distance, 8)
+        return exit_eval.compute_trailing_stop_price(high_water_mark, trailing_stop_distance)
 
     @staticmethod
     def _compute_trailing_take_profit_price(
@@ -116,32 +119,7 @@ class TradeManager:
         trailing_take_profit_activation_pct: float | None,
         min_profit_buffer_pct: float = 0.0,
     ) -> float | None:
-        """Compute the trailing TP trigger, floored at entry + min profit buffer.
-
-        Without the floor, a trade with ``distance > (HWM − entry)`` would
-        trigger below the entry price and close at a loss labelled
-        ``TRAILING_TAKE_PROFIT``. The floor guarantees that whenever the
-        trailing arms it will close, at worst, at a small minimum profit —
-        which is what "take profit" is supposed to mean. The signal-side
-        validator (`_validate_trailing_take_profit_pair`) keeps the floor
-        from ever silently changing GPT's intent on healthy signals.
-        """
-
-        if (
-            entry_price is None
-            or entry_price <= 0
-            or trailing_take_profit_distance is None
-            or trailing_take_profit_distance <= 0
-            or trailing_take_profit_activation_pct is None
-            or trailing_take_profit_activation_pct <= 0
-        ):
-            return None
-        activation_threshold = entry_price * (1 + trailing_take_profit_activation_pct / 100.0)
-        if high_water_mark < activation_threshold:
-            return None
-        raw_trigger = high_water_mark - trailing_take_profit_distance
-        floor = entry_price * (1 + max(min_profit_buffer_pct, 0.0) / 100.0)
-        return round(max(raw_trigger, floor), 8)
+        return exit_eval.compute_trailing_take_profit_price(high_water_mark, entry_price, trailing_take_profit_distance, trailing_take_profit_activation_pct, min_profit_buffer_pct)
 
     @staticmethod
     def _trailing_take_profit_pair_is_valid(
@@ -178,28 +156,14 @@ class TradeManager:
         stop_loss: float | None,
         trailing_stop_price: float | None,
     ) -> str | None:
-        if trailing_stop_price is not None and stop_loss is not None:
-            if trailing_stop_price >= stop_loss and current_price <= trailing_stop_price:
-                return "TRAILING_STOP"
-            if current_price <= stop_loss:
-                return "STOP_LOSS"
-            if current_price <= trailing_stop_price:
-                return "TRAILING_STOP"
-            return None
-        if stop_loss is not None and current_price <= stop_loss:
-            return "STOP_LOSS"
-        if trailing_stop_price is not None and current_price <= trailing_stop_price:
-            return "TRAILING_STOP"
-        return None
+        return exit_eval.downside_close_reason(current_price, stop_loss, trailing_stop_price)
 
     @staticmethod
     def _trailing_take_profit_close_reason(
         current_price: float,
         trailing_take_profit_price: float | None,
     ) -> str | None:
-        if trailing_take_profit_price is not None and current_price <= trailing_take_profit_price:
-            return "TRAILING_TAKE_PROFIT"
-        return None
+        return exit_eval.trailing_take_profit_close_reason(current_price, trailing_take_profit_price)
 
     def get_trade(self, trade_id: int) -> dict[str, Any] | None:
         return fetch_one(self.config.db_trades, "SELECT * FROM trades WHERE id = ?", (trade_id,))
@@ -336,7 +300,14 @@ class TradeManager:
             })
         return positions
 
-    def _risk_based_allocation(self, category: str, symbol: str, provider: str = PROVIDER_ETORO) -> float:
+    def _risk_based_allocation(
+        self,
+        category: str,
+        symbol: str,
+        provider: str = PROVIDER_ETORO,
+        entry_price: float | None = None,
+        stop_loss: float | None = None,
+    ) -> float:
         """Risk-based size for a new position, with an over-budget entry gate.
 
         Falls back to equal-slot allocation when equity/risk data is unavailable.
@@ -360,8 +331,8 @@ class TradeManager:
         # so every order in a batch cycle sizes against the shrinking balance.
         cash = max(0.0, cash - self._pending_allocated_capital(provider))
         positions = self._open_position_values(provider)
-        candidate = {"symbol": str(symbol).upper(), "category": category}
-        size = self.risk.suggest_size(candidate, positions, equity, cash)
+        candidate = {"symbol": str(symbol).upper(), "category": category, "entry_price": entry_price}
+        size = self.risk.suggest_size(candidate, positions, equity, cash, stop_loss=stop_loss)
         if size <= 0:
             return 0.0
         # Spread liquidity uniformly: never exceed an even share of the remaining
@@ -539,12 +510,24 @@ class TradeManager:
         allocated_capital: float,
         provider: str = PROVIDER_ETORO,
     ) -> None:
-        trailing_take_profit_distance = self._as_float(signal.get("trailing_take_profit_distance"))
-        trailing_take_profit_activation_pct = self._as_float(signal.get("trailing_take_profit_activation_pct"))
+        _levels = normalize_exit_levels(
+            entry_price=float(signal["entry_price"]),
+            stop_loss=float(signal["stop_loss"]),
+            take_profit=self._as_float(signal.get("take_profit")),
+            trailing_take_profit_distance=self._as_float(signal.get("trailing_take_profit_distance")),
+            trailing_take_profit_activation_pct=self._as_float(signal.get("trailing_take_profit_activation_pct")),
+            min_reward_risk=self.config.exit_min_reward_risk,
+            arm_r=self.config.exit_trailing_arm_r,
+            trail_r=self.config.exit_trailing_trail_r,
+        )
+        trailing_take_profit_distance = _levels["trailing_take_profit_distance"]
+        trailing_take_profit_activation_pct = _levels["trailing_take_profit_activation_pct"]
+        take_profit = _levels["take_profit"]
         trailing_stop_distance = self._as_float(signal.get("trailing_stop_distance"))
         target_entry_price = float(signal["entry_price"])
         provisional_quantity = (allocated_capital / target_entry_price) if target_entry_price > 0 else 0.0
         account_currency = self.config.provider_account_currency(provider)
+        _pm = planned_metrics(target_entry_price, float(signal["stop_loss"]), take_profit)
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
                 """
@@ -553,8 +536,9 @@ class TradeManager:
                     take_profit, trailing_take_profit_distance, trailing_take_profit_activation_pct,
                     stop_loss, trailing_stop_distance,
                     instrument_id, reasoning, confidence, trade_score,
-                    provider, account_currency
-                ) VALUES (?, ?, 'LONG', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider, account_currency,
+                    planned_risk_per_unit, planned_reward_risk
+                ) VALUES (?, ?, 'LONG', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
@@ -563,7 +547,7 @@ class TradeManager:
                     target_entry_price,
                     provisional_quantity,
                     allocated_capital,
-                    float(signal["take_profit"]),
+                    float(take_profit),
                     trailing_take_profit_distance,
                     trailing_take_profit_activation_pct,
                     float(signal["stop_loss"]),
@@ -574,9 +558,16 @@ class TradeManager:
                     self._as_float(signal.get("trade_score")),
                     provider,
                     account_currency,
+                    _pm["risk_per_unit"],
+                    _pm["reward_risk"],
                 ),
             )
         self.logger.info("Stored new pending (emulated-limit) trade for %s on %s", symbol, provider)
+        self.logger.info(
+            "OPEN %s qty=%s alloc=%.2f R=%.4f planned_RR=%s",
+            symbol, round(provisional_quantity, 8), float(allocated_capital),
+            _pm["risk_per_unit"], _pm["reward_risk"],
+        )
 
     def _signal_has_required_levels(self, signal: dict[str, Any]) -> bool:
         for field in ("entry_price", "take_profit", "stop_loss"):
@@ -589,6 +580,16 @@ class TradeManager:
                     value,
                 )
                 return False
+        entry_price = float(signal["entry_price"])
+        stop_loss = float(signal["stop_loss"])
+        if entry_price <= stop_loss:
+            self.logger.warning(
+                "GPT returned OPEN for %s with entry_price=%s <= stop_loss=%s (not a valid long); skipping trade",
+                signal.get("symbol"),
+                entry_price,
+                stop_loss,
+            )
+            return False
         trailing_take_profit_distance = signal.get("trailing_take_profit_distance")
         if trailing_take_profit_distance is not None:
             if not isinstance(trailing_take_profit_distance, (int, float)) or float(trailing_take_profit_distance) <= 0:
@@ -709,12 +710,14 @@ class TradeManager:
         return payloads
 
     def _rank_signals(self, signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        def sort_key(signal: dict[str, Any]) -> tuple[float, float]:
+        # Rank purely by GPT trade_score; confidence is intentionally excluded
+        # (historically uncorrelated-to-inverted with outcome). Tie-break on
+        # symbol so the ordering is deterministic and confidence-independent.
+        def sort_key(signal: dict[str, Any]) -> tuple[float, str]:
             score = self._as_float(signal.get("trade_score")) or 0.0
-            confidence = self._as_float(signal.get("confidence")) or 0.0
-            return (score, confidence)
-
-        return sorted(signals, key=sort_key, reverse=True)
+            symbol = str(signal.get("symbol") or "")
+            return (-score, symbol)
+        return sorted(signals, key=sort_key)
 
     def _open_trade_from_signal(
         self,
@@ -747,8 +750,26 @@ class TradeManager:
             return False
         if not self._signal_has_required_levels(signal):
             return False
+        if self.config.regime_gate_enabled:
+            bars = self.data_manager.get_symbol_history(
+                symbol, limit=self.config.regime_sma_period
+            ) or []
+            if not passes_regime_gate(
+                bars,
+                self.config.regime_sma_period,
+                current_price=self._as_float(signal.get("entry_price")),
+            ):
+                self.logger.info(
+                    "Regime gate blocked %s (price below SMA%s)",
+                    symbol, self.config.regime_sma_period,
+                )
+                return False
 
-        allocated_capital = self._risk_based_allocation(category, symbol, provider=provider)
+        allocated_capital = self._risk_based_allocation(
+            category, symbol, provider=provider,
+            entry_price=float(signal["entry_price"]),
+            stop_loss=self._as_float(signal.get("stop_loss")),
+        )
         if allocated_capital <= 0:
             self.logger.warning("Skipping %s because allocated capital is zero", symbol)
             return False
@@ -812,9 +833,6 @@ class TradeManager:
             return
         self._open_trade_from_signal(category, symbol, signal, provider=provider)
 
-    def _entry_fill_ceiling(self, target_entry_price: float) -> float:
-        return target_entry_price * (1 + (int(self.config.crypto_entry_max_chase_bps) / 10_000.0))
-
     def sync_pending_trade(self, trade: dict[str, Any]) -> None:
         """Emulated limit entry: fill at market once price touches the target.
 
@@ -857,8 +875,8 @@ class TradeManager:
         ask = self._as_float(quote.get("ask_price")) or self._as_float(quote.get("bid_price"))
         if ask is None or ask <= 0:
             return
-        if ask > self._entry_fill_ceiling(target):
-            return  # wait for price to come down to the limit
+        if not is_marketable(ask, target, float(self.config.crypto_entry_max_chase_bps)):
+            return  # ask above the fill band; wait for price to come down
 
         instrument_id = int(trade.get("instrument_id") or 0) or broker.instrument_id_for_symbol(trade["symbol"])
         if not instrument_id:
@@ -952,6 +970,7 @@ class TradeManager:
             provider=self._trade_provider(trade),
         )
         high_water_mark = max(self._as_float(trade.get("high_water_mark")) or entry_price, entry_price, current_price)
+        low_water_mark = min(self._as_float(trade.get("low_water_mark")) or entry_price, entry_price, current_price)
         trailing_stop_price = self._compute_trailing_stop_price(
             high_water_mark, self._as_float(trade.get("trailing_stop_distance"))
         )
@@ -967,13 +986,13 @@ class TradeManager:
                 """
                 UPDATE trades
                 SET status = 'OPEN', open_timestamp = ?, entry_price = ?, quantity = ?, current_price = ?, pnl = ?,
-                    high_water_mark = ?, trailing_take_profit_price = ?, trailing_stop_price = ?,
+                    high_water_mark = ?, low_water_mark = ?, trailing_take_profit_price = ?, trailing_stop_price = ?,
                     position_id = ?, order_reference_id = ?, position_confirmed = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (
                     isoformat_utc(utc_now()), entry_price, quantity, current_price, pnl,
-                    high_water_mark, trailing_take_profit_price, trailing_stop_price,
+                    high_water_mark, low_water_mark, trailing_take_profit_price, trailing_stop_price,
                     position_id, reference_id,
                     1 if isinstance(position, dict) and position else int(trade.get("position_confirmed") or 0),
                     trade["id"],
@@ -1091,17 +1110,29 @@ class TradeManager:
             if actual.get("close_timestamp"):
                 close_ts = actual["close_timestamp"]
 
+        _entry = float(trade["entry_price"])
+        _stop = self._as_float(trade.get("stop_loss"))
+        _rr = realized_r(_entry, _stop, float(close_price)) if _stop is not None else None
+        _hwm = self._as_float(trade.get("high_water_mark"))
+        _lwm = self._as_float(trade.get("low_water_mark"))
+        _mfe = excursion_r(_entry, _stop, _hwm) if (_stop is not None and _hwm is not None) else None
+        _mae = excursion_r(_entry, _stop, _lwm) if (_stop is not None and _lwm is not None) else None
+
         with db_cursor(self.config.db_trades) as cursor:
             cursor.execute(
                 """
                 UPDATE trades
                 SET status = 'CLOSED', close_price = ?, close_timestamp = ?, close_reason = ?, pending_close_reason = NULL,
-                    pnl = ?, updated_at = CURRENT_TIMESTAMP
+                    pnl = ?, realized_r = ?, mae = ?, mfe = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (close_price, close_ts, close_reason, pnl, trade["id"]),
+                (close_price, close_ts, close_reason, pnl, _rr, _mae, _mfe, trade["id"]),
             )
         self.logger.info("Trade %s closed with reason %s", trade["id"], close_reason)
+        self.logger.info(
+            "CLOSE %s reason=%s pnl=%.2f realized_R=%s",
+            trade["symbol"], close_reason, float(pnl) if pnl is not None else 0.0, _rr,
+        )
 
     def _request_market_close(self, trade: dict[str, Any], close_reason: str, trigger_price: float) -> None:
         if trade.get("exit_order_id"):
@@ -1316,6 +1347,7 @@ class TradeManager:
         trailing_take_profit_distance = self._as_float(trade.get("trailing_take_profit_distance"))
         trailing_take_profit_activation_pct = self._as_float(trade.get("trailing_take_profit_activation_pct"))
         high_water_mark = max(self._as_float(trade.get("high_water_mark")) or entry_price, current_price)
+        low_water_mark = min(self._as_float(trade.get("low_water_mark")) or entry_price, entry_price, current_price)
         trailing_take_profit_price = self._compute_trailing_take_profit_price(
             high_water_mark,
             entry_price,
@@ -1333,12 +1365,12 @@ class TradeManager:
             cursor.execute(
                 """
                 UPDATE trades
-                SET quantity = ?, current_price = ?, pnl = ?, high_water_mark = ?, trailing_take_profit_price = ?,
-                    trailing_stop_price = ?,
+                SET quantity = ?, current_price = ?, pnl = ?, high_water_mark = ?, low_water_mark = ?,
+                    trailing_take_profit_price = ?, trailing_stop_price = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (quantity, current_price, pnl, high_water_mark, trailing_take_profit_price, trailing_stop_price, trade["id"]),
+                (quantity, current_price, pnl, high_water_mark, low_water_mark, trailing_take_profit_price, trailing_stop_price, trade["id"]),
             )
 
         close_reason = self._trailing_take_profit_close_reason(current_price, trailing_take_profit_price)
