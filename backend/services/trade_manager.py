@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from clients.gpt_client import GPTClient
-from core.db import db_cursor, fetch_all, fetch_one, get_instrument_by_id
+from core.db import db_cursor, fetch_all, fetch_one
 from core.utils import (
     PROVIDER_ETORO,
     AppConfig,
@@ -1399,8 +1399,6 @@ class TradeManager:
 
     # --- closed-trade reconciliation against the broker's realized history ----
 
-    RECONCILE_DEFAULT_LOOKBACK_DAYS = 30
-
     def reconcile_closed_trades(
         self,
         *,
@@ -1411,22 +1409,26 @@ class TradeManager:
 
         The local DB stores *estimated* close prices/PnL (the bot guesses the
         fill on external/manual closes). The broker's ``trade/history`` is the
-        authoritative realized result, so for every closed position we:
+        authoritative realized result, so for every closed position the bot
+        already tracks we overwrite ``pnl``/``close_price``/``close_timestamp``
+        when they drift.
 
-        * overwrite ``pnl``/``close_price``/``close_timestamp`` when they drift, and
-        * backfill positions the bot never tracked at all.
-
-        Idempotent: backfilled rows carry the ``position_id`` so a re-run matches
-        them instead of duplicating. Returns a per-run counters summary.
+        Positions present in the broker history but absent from the local DB are
+        **ignored** (counted as ``ignored_unmanaged``): they belong to manual
+        trades or to history predating the algorithm, and must never enter the
+        dashboard. Returns a per-run counters summary.
         """
 
-        summary = {"corrected": 0, "backfilled": 0, "unchanged": 0, "skipped_open": 0}
+        summary = {"corrected": 0, "ignored_unmanaged": 0, "unchanged": 0, "skipped_open": 0}
         broker = self.broker(provider)
         if broker is None or not hasattr(broker, "list_trade_history"):
             return summary
 
         if min_date is None:
-            min_date = (utc_now() - timedelta(days=self.RECONCILE_DEFAULT_LOOKBACK_DAYS)).date()
+            min_date = self._algorithm_start_cutoff(provider)
+            if min_date is None:
+                # Nessun trade aperto dall'algoritmo: niente da riconciliare.
+                return summary
 
         try:
             history = broker.list_trade_history(min_date)
@@ -1441,8 +1443,9 @@ class TradeManager:
                 continue
             row = existing.get(str(position_id))
             if row is None:
-                if self._backfill_closed_trade(record, provider):
-                    summary["backfilled"] += 1
+                # Position eToro non tracciata dall'algoritmo (storico precedente
+                # all'avvio o trade aperto manualmente): mai importarla.
+                summary["ignored_unmanaged"] += 1
                 continue
             if str(row.get("status")) != "CLOSED":
                 summary["skipped_open"] += 1
@@ -1452,9 +1455,21 @@ class TradeManager:
             else:
                 summary["unchanged"] += 1
 
-        if summary["corrected"] or summary["backfilled"]:
+        if summary["corrected"] or summary["ignored_unmanaged"]:
             self.logger.info("Closed-trade reconciliation (%s): %s", provider, summary)
         return summary
+
+    def _algorithm_start_cutoff(self, provider: str) -> str | None:
+        """Earliest open_timestamp among the algorithm's own trades for a
+        provider — the moment trading actually started. ``None`` if the
+        algorithm has not opened any position yet."""
+        row = fetch_one(
+            self.config.db_trades,
+            "SELECT MIN(open_timestamp) AS cutoff FROM trades "
+            "WHERE provider = ? AND open_timestamp IS NOT NULL",
+            (provider,),
+        )
+        return row["cutoff"] if row and row["cutoff"] else None
 
     def _closed_trades_by_position_id(self, provider: str) -> dict[str, dict[str, Any]]:
         rows = fetch_all(
@@ -1488,48 +1503,6 @@ class TradeManager:
                 WHERE id = ?
                 """,
                 (new_pnl, new_close_price, close_timestamp, row["id"]),
-            )
-        return True
-
-    def _backfill_closed_trade(self, record: dict[str, Any], provider: str) -> bool:
-        instrument_id = record.get("instrument_id")
-        mapping = (
-            get_instrument_by_id(self.config.db_market_data, instrument_id)
-            if instrument_id is not None
-            else None
-        )
-        if mapping is None:
-            self.logger.warning(
-                "Cannot backfill closed position %s: instrument %s not in instrument_map",
-                record.get("position_id"),
-                instrument_id,
-            )
-            return False
-
-        open_rate = record.get("open_rate") or 0.0
-        units = record.get("units") or 0.0
-        investment = record.get("investment")
-        allocated = investment if investment is not None else open_rate * units
-        direction = "LONG" if record.get("is_buy", True) else "SHORT"
-        account_currency = self.config.provider_account_currency(provider)
-
-        with db_cursor(self.config.db_trades) as cursor:
-            cursor.execute(
-                """
-                INSERT INTO trades (
-                    symbol, category, direction, status, entry_price, quantity, allocated_capital,
-                    open_timestamp, close_timestamp, close_price, pnl, close_reason,
-                    instrument_id, position_id, provider, account_currency, reasoning, position_confirmed
-                ) VALUES (?, ?, ?, 'CLOSED', ?, ?, ?, ?, ?, ?, ?, 'EXTERNAL_CLOSE', ?, ?, ?, ?, ?, 1)
-                """,
-                (
-                    mapping["symbol"], mapping["category"], direction,
-                    open_rate, units, allocated,
-                    record.get("open_timestamp"), record.get("close_timestamp"),
-                    record.get("close_rate"), record.get("net_profit"),
-                    instrument_id, str(record.get("position_id")), provider, account_currency,
-                    "Backfilled from eToro trade history",
-                ),
             )
         return True
 
