@@ -9,11 +9,14 @@ import { toast } from "sonner";
 
 import { api, errorMessage, ApiError } from "@/lib/api";
 import type {
+  AgentDetail,
   AppSettings,
   AccountCredentials,
+  ArenaEventsResponse,
+  ArenaOverview,
+  ArenaStateResponse,
   AuditResponse,
   BacktestSummary,
-  DecisionsResponse,
   EquityCurve,
   ExecutionsResponse,
   FxRates,
@@ -21,9 +24,6 @@ import type {
   KnowledgeStatus,
   MonthlyReturns,
   Portfolio,
-  RiskHistory,
-  RiskScore,
-  RunStartResponse,
   RunsResponse,
   SettingsUpdate,
   Status,
@@ -31,7 +31,6 @@ import type {
   TradeHistoryItem,
   TradeItem,
   NewsItem,
-  ReportItem,
   DateRangeValue,
 } from "@/lib/types";
 
@@ -56,10 +55,27 @@ export function useRuns(limit = 50) {
   });
 }
 
-export function useRunDecisions(runId: string) {
-  return useQuery<DecisionsResponse>({
-    queryKey: ["runs", runId, "decisions"],
-    queryFn: () => api.get<DecisionsResponse>(`/runs/${encodeURIComponent(runId)}/decisions`),
+export function useArena() {
+  return useQuery<ArenaOverview>({
+    queryKey: ["arena"],
+    queryFn: () => api.get<ArenaOverview>("/arena"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useArenaAgent(agentId: string | null) {
+  return useQuery<AgentDetail>({
+    queryKey: ["arena", "agents", agentId],
+    queryFn: () => api.get<AgentDetail>(`/arena/agents/${agentId}`),
+    refetchInterval: POLL_MS,
+    enabled: Boolean(agentId),
+  });
+}
+
+export function useArenaEvents(limit = 100) {
+  return useQuery<ArenaEventsResponse>({
+    queryKey: ["arena", "events", limit],
+    queryFn: () => api.get<ArenaEventsResponse>(`/arena/events?limit=${limit}`),
     refetchInterval: POLL_MS,
   });
 }
@@ -118,22 +134,6 @@ export function useMonthlyReturns() {
   });
 }
 
-export function useRiskScore() {
-  return useQuery<RiskScore>({
-    queryKey: ["risk", "score"],
-    queryFn: () => api.get<RiskScore>("/risk/score"),
-    refetchInterval: POLL_MS,
-  });
-}
-
-export function useRiskHistory() {
-  return useQuery<RiskHistory>({
-    queryKey: ["risk", "score-history"],
-    queryFn: () => api.get<RiskHistory>("/risk/score/history"),
-    refetchInterval: POLL_MS,
-  });
-}
-
 export function useKnowledgeStatus() {
   return useQuery<KnowledgeStatus>({
     queryKey: ["knowledge", "status"],
@@ -142,11 +142,12 @@ export function useKnowledgeStatus() {
   });
 }
 
-export function useSettings() {
+export function useSettings(enabled = true) {
   return useQuery<AppSettings>({
     queryKey: ["settings"],
     queryFn: () => api.get<AppSettings>("/settings"),
     refetchInterval: POLL_MS,
+    enabled,
   });
 }
 
@@ -154,12 +155,13 @@ export function useSettings() {
  * Tassi USD→valuta per la conversione di visualizzazione.
  * I cambi BCE si muovono una volta al giorno: inutile il polling a 15s.
  */
-export function useFxRates() {
+export function useFxRates(enabled = true) {
   return useQuery<FxRates>({
     queryKey: ["fx", "rates"],
     queryFn: () => api.get<FxRates>("/fx/rates"),
     staleTime: 30 * 60_000,
     refetchInterval: 60 * 60_000,
+    enabled,
   });
 }
 
@@ -208,51 +210,63 @@ export function useNews() {
   });
 }
 
-export function useReports() {
-  return useQuery<{ reports: ReportItem[] }>({
-    queryKey: ["reports"],
-    queryFn: () => api.get("/reports"),
-  });
-}
-
 // -------------------------------------------------------------- mutations
 
-export function useTriggerRun() {
+export function useTriggerCycle() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => api.post<RunStartResponse>("/run"),
-    onSuccess: (data) => {
-      toast.success(
-        "Run avviata",
-        data?.run_id ? { description: `Run ID: ${data.run_id}` } : undefined,
-      );
-      void qc.invalidateQueries({ queryKey: ["status"] });
-      void qc.invalidateQueries({ queryKey: ["runs"] });
+    mutationFn: () => api.post<{ status: string }>("/arena/cycle"),
+    onSuccess: () => {
+      toast.success("Ciclo di allenamento avviato", {
+        description: "Gli agenti stanno decidendo: i risultati compaiono a breve",
+      });
+      void qc.invalidateQueries({ queryKey: ["arena"] });
     },
     onError: (err) => {
-      if (err instanceof ApiError && err.status === 409) {
-        toast.warning("Run già in corso", { description: err.detail });
-      } else {
-        toast.error("Avvio run fallito", { description: errorMessage(err) });
-      }
+      toast.error("Avvio ciclo fallito", { description: errorMessage(err) });
     },
   });
 }
 
-export function useDeleteRun() {
+export function useArenaPause() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (runId: string) =>
-      api.del<{ deleted: boolean; run_id: string }>(`/runs/${encodeURIComponent(runId)}`),
-    onSuccess: () => {
-      toast.success("Run eliminata", {
-        description: "Rimosse anche le decisioni e le esecuzioni collegate",
-      });
-      void qc.invalidateQueries({ queryKey: ["runs"] });
-      void qc.invalidateQueries({ queryKey: ["executions"] });
+    mutationFn: (pause: boolean) =>
+      api.post<ArenaStateResponse>(pause ? "/arena/pause" : "/arena/resume"),
+    onSuccess: (_data, pause) => {
+      toast.success(pause ? "Allenamento in pausa" : "Allenamento ripreso");
+      void qc.invalidateQueries({ queryKey: ["arena"] });
       void qc.invalidateQueries({ queryKey: ["status"] });
     },
-    onError: (err) => toast.error("Eliminazione run fallita", { description: errorMessage(err) }),
+    onError: (err) =>
+      toast.error("Operazione fallita", { description: errorMessage(err) }),
+  });
+}
+
+export function useLiveToggle() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (enable: boolean) =>
+      enable
+        ? api.post<ArenaStateResponse>("/live/enable", { confirmation: true })
+        : api.post<ArenaStateResponse>("/live/disable"),
+    onSuccess: (_data, enable) => {
+      toast.success(
+        enable ? "TRADING LIVE ATTIVATO" : "Trading live disattivato",
+        enable
+          ? { description: "Il campione opera con denaro reale sul conto eToro" }
+          : undefined,
+      );
+      void qc.invalidateQueries({ queryKey: ["status"] });
+      void qc.invalidateQueries({ queryKey: ["arena"] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 422) {
+        toast.error("Attivazione respinta dal backend", { description: err.detail });
+      } else {
+        toast.error("Operazione live fallita", { description: errorMessage(err) });
+      }
+    },
   });
 }
 

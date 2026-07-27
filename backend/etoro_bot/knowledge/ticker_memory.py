@@ -140,7 +140,7 @@ def _llm_summary(
     )
     try:
         if llm is None:
-            from etoro_bot.graph.llm import call_llm
+            from etoro_bot.llm import call_llm
 
             llm = call_llm
         llm_cfg = (settings or {}).get("llm") or {}

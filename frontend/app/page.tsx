@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowRightIcon, OctagonXIcon, PlayIcon } from "lucide-react";
+import { ArrowRightIcon, OctagonXIcon, ZapIcon, ZapOffIcon } from "lucide-react";
 
 import {
   AlertDialog,
@@ -42,7 +42,7 @@ import {
 } from "@/components/mobile-list";
 import { SectorDonut } from "@/components/charts/sector-donut";
 import { ExecutionStatusBadge, SideBadge } from "@/components/status-badges";
-import { EnvBadge } from "@/components/site-header";
+import { LiveBadge } from "@/components/site-header";
 import { PageHeader } from "@/components/page-header";
 import { Stamp } from "@/components/stamp";
 import { DateRangeFilter, lastDaysRange } from "@/components/date-range-filter";
@@ -52,11 +52,10 @@ import {
   useBacktestSummary,
   useExecutions,
   useKillSwitch,
+  useLiveToggle,
   useNews,
   usePortfolio,
-  useRuns,
   useStatus,
-  useTriggerRun,
 } from "@/lib/queries";
 import { pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
@@ -73,15 +72,35 @@ function StatusCard() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Stato del bot</CardTitle>
-        <CardDescription>Ambiente e sistemi di sicurezza</CardDescription>
+        <CardTitle>Stato del sistema</CardTitle>
+        <CardDescription>Modalità, campione e freni d&apos;emergenza</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-1.5">
-          <EnvBadge environment={status.environment} />
-          {status.run_in_progress && <Stamp tone="accent">Run in corso</Stamp>}
+          <LiveBadge liveEnabled={status.arena.live_enabled} />
+          {status.market_open ? (
+            <Stamp tone="accent">Mercato aperto</Stamp>
+          ) : (
+            <Stamp tone="neutral">Mercato chiuso</Stamp>
+          )}
+          {status.arena.paused && <Stamp tone="caution">Training in pausa</Stamp>}
         </div>
         <div className="grid gap-0">
+          <div className="border-border/60 flex items-center justify-between border-b py-2">
+            <span className="text-muted-foreground">Campione live</span>
+            {status.champion ? (
+              <Link
+                href="/training"
+                className="hover:text-primary font-mono text-[13px] font-medium transition-colors"
+              >
+                {status.champion.name} · gen {status.champion.generation}
+              </Link>
+            ) : (
+              <span className="text-muted-foreground font-mono text-[13px]">
+                nessuno: serve vincere un mese di allenamento
+              </span>
+            )}
+          </div>
           <div className="border-border/60 flex items-center justify-between border-b py-2">
             <span className="text-muted-foreground">Kill switch</span>
             {status.kill_switch_active ? (
@@ -107,11 +126,11 @@ function StatusCard() {
             </p>
           )}
           <div className="flex items-center justify-between py-2">
-            <span className="text-muted-foreground">Prossima run</span>
+            <span className="text-muted-foreground">Prossimo ciclo</span>
             <span className="font-mono text-[13px] tabular-nums">
-              {status.next_run_at
-                ? `${d.dateTime(status.next_run_at)} ${d.tzLabel}`
-                : "non schedulata"}
+              {status.next_cycle_at
+                ? `${d.dateTime(status.next_cycle_at)} ${d.tzLabel}`
+                : "non schedulato"}
             </span>
           </div>
         </div>
@@ -129,7 +148,7 @@ function PortfolioOverviewCard() {
   const unrealized = data.positions.reduce((sum, position) => sum + (position.unrealized_pnl_usd ?? 0), 0);
   return (
     <Card>
-      <CardHeader><CardTitle>Distribuzione degli asset</CardTitle><CardDescription>{data.positions.length} posizioni · {d.money(data.exposure_usd)} esposti</CardDescription></CardHeader>
+      <CardHeader><CardTitle>Conto eToro (live)</CardTitle><CardDescription>{data.positions.length} posizioni · {d.money(data.exposure_usd)} esposti</CardDescription></CardHeader>
       <CardContent className="grid gap-6 sm:grid-cols-[minmax(0,1fr)_180px] sm:items-center">
         <div className="grid grid-cols-2 gap-5">
           <div><p className="font-mono text-[10px] tracking-[0.14em] text-muted-foreground uppercase">Disponibile eToro</p><p className="mt-2 font-mono text-xl font-semibold tabular-nums">{d.money(data.cash_usd)}</p></div>
@@ -183,52 +202,67 @@ function MetricsStrip({ range }: { range: DateRangeValue }) {
 
 function EquityCard({ range, onRangeChange }: { range: DateRangeValue; onRangeChange: (range: DateRangeValue) => void }) {
   const { data, isLoading, error } = useEquityCurve("spy", range);
-  return <Card><CardHeader><CardTitle>Andamento equity</CardTitle><CardDescription>Il grafico segue il periodo pagina, poi può essere regolato indipendentemente.</CardDescription><CardAction><DateRangeFilter value={range} onChange={onRangeChange} label="Grafico" /></CardAction></CardHeader><CardContent>
-    {isLoading ? <CardSkeleton className="h-80 w-full" /> : error ? <ErrorState error={error} /> : (data?.points.length ?? 0) < 2 ? <p className="text-muted-foreground py-28 text-center text-sm">La serie equity si costruisce a ogni run: dati insufficienti nel periodo selezionato.</p> : <EquityChart points={data!.points} showBenchmarks={false} />}
+  return <Card><CardHeader><CardTitle>Andamento equity live</CardTitle><CardDescription>Il grafico segue il periodo pagina, poi può essere regolato indipendentemente.</CardDescription><CardAction><DateRangeFilter value={range} onChange={onRangeChange} label="Grafico" /></CardAction></CardHeader><CardContent>
+    {isLoading ? <CardSkeleton className="h-80 w-full" /> : error ? <ErrorState error={error} /> : (data?.points.length ?? 0) < 2 ? <p className="text-muted-foreground py-28 text-center text-sm">La serie equity si costruisce a ogni giornata live: dati insufficienti nel periodo selezionato.</p> : <EquityChart points={data!.points} showBenchmarks={false} />}
   </CardContent></Card>;
 }
 
 function ActionsCard() {
   const { data: status } = useStatus();
-  const triggerRun = useTriggerRun();
+  const liveToggle = useLiveToggle();
   const killSwitch = useKillSwitch();
   const killActive = status?.kill_switch_active ?? false;
+  const liveEnabled = status?.arena.live_enabled ?? false;
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Azioni</CardTitle>
-        <CardDescription>Controllo manuale della pipeline</CardDescription>
+        <CardTitle>Controlli live</CardTitle>
+        <CardDescription>
+          Attivazione del denaro reale e arresto d&apos;emergenza
+        </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-2">
-        <AlertDialog>
-          <AlertDialogTrigger asChild>
-            <Button
-              disabled={triggerRun.isPending || status?.run_in_progress}
-              className="justify-start"
-            >
-              <PlayIcon className="size-4" /> Esegui run ora
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Avviare una run adesso?</AlertDialogTitle>
-              <AlertDialogDescription>
-                La pipeline completa verrà eseguita subito
-                {status
-                  ? ` in ambiente ${status.environment === "real" ? "REALE" : "demo"}: gli ordini approvati vengono inviati per davvero`
-                  : ""}
-                . Se una run è già in corso la richiesta verrà rifiutata (409).
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Annulla</AlertDialogCancel>
-              <AlertDialogAction onClick={() => triggerRun.mutate()}>
-                Avvia run
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+        {liveEnabled ? (
+          <Button
+            variant="outline"
+            className="justify-start"
+            disabled={liveToggle.isPending}
+            onClick={() => liveToggle.mutate(false)}
+          >
+            <ZapOffIcon className="size-4" /> Spegni trading live
+          </Button>
+        ) : (
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                disabled={liveToggle.isPending}
+                className="justify-start"
+              >
+                <ZapIcon className="size-4" /> Vai live col campione
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Attivare il trading live?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {status?.champion
+                    ? `${status.champion.name} (generazione ${status.champion.generation}), vincitore dell'ultimo mese di allenamento, inizierà a fare day trading con denaro REALE sul conto eToro. L'allenamento continua in parallelo sui conti simulati.`
+                    : "Non c'è ancora un campione: il live si attiva solo dopo che un agente ha vinto almeno un mese di allenamento."}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Annulla</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-negative text-white hover:bg-negative/90 dark:text-[#141517]"
+                  onClick={() => liveToggle.mutate(true)}
+                >
+                  Vai live
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        )}
 
         {killActive ? (
           <Button
@@ -271,116 +305,26 @@ function ActionsCard() {
             </AlertDialogContent>
           </AlertDialog>
         )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function RecentRunsCard() {
-  const { data, isLoading, error } = useRuns(5);
-  const d = useDisplay();
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Ultime run</CardTitle>
-        <CardDescription>Le 5 più recenti</CardDescription>
-        <CardAction>
-          <Button variant="ghost" size="sm" asChild>
-            <Link href="/runs">
-              Tutte <ArrowRightIcon className="size-3.5" />
-            </Link>
-          </Button>
-        </CardAction>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? (
-          <TableSkeleton rows={5} />
-        ) : error ? (
-          <ErrorState error={error} />
-        ) : (data?.runs.length ?? 0) === 0 ? (
-          <p className="text-muted-foreground py-6 text-center text-sm">
-            Nessuna run ancora — avvia la prima dalle Azioni
-          </p>
-        ) : (
-          <>
-            <div className="max-md:hidden">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Avvio</TableHead>
-                    <TableHead>Ambiente</TableHead>
-                    <TableHead className="text-right">Candidati</TableHead>
-                    <TableHead className="text-right">Eseguiti</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data!.runs.map((run) => (
-                    <TableRow key={run.run_id}>
-                      <TableCell className="font-mono text-[13px] tabular-nums">
-                        <Link
-                          href={`/runs/${run.run_id}`}
-                          className="hover:text-primary transition-colors"
-                        >
-                          {d.dateTime(run.started_at)}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        <EnvBadge environment={run.environment} />
-                      </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums">
-                        {run.summary?.candidates ?? "—"}
-                      </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums">
-                        {run.summary?.executed ?? "—"}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-            <MobileList>
-              {data!.runs.map((run) => (
-                <MobileItem key={run.run_id}>
-                  <Link href={`/runs/${run.run_id}`} className="block">
-                    <MobileItemHeader>
-                      <span className="font-mono text-[13px] font-medium tabular-nums">
-                        {d.dateTime(run.started_at)}
-                      </span>
-                      <EnvBadge environment={run.environment} />
-                    </MobileItemHeader>
-                    <MobileFields>
-                      <MobileField label="Candidati">
-                        <span className="font-mono tabular-nums">
-                          {run.summary?.candidates ?? "—"}
-                        </span>
-                      </MobileField>
-                      <MobileField label="Eseguiti">
-                        <span className="font-mono tabular-nums">
-                          {run.summary?.executed ?? "—"}
-                        </span>
-                      </MobileField>
-                    </MobileFields>
-                  </Link>
-                </MobileItem>
-              ))}
-            </MobileList>
-          </>
-        )}
+        <p className="text-muted-foreground pt-1 text-xs">
+          L&apos;allenamento degli agenti si gestisce dalla pagina{" "}
+          <Link href="/training" className="text-primary hover:underline">
+            Allenamento <ArrowRightIcon className="inline size-3" />
+          </Link>
+        </p>
       </CardContent>
     </Card>
   );
 }
 
 function RecentExecutionsCard() {
-  const { data, isLoading, error } = useExecutions(5);
+  const { data, isLoading, error } = useExecutions(8);
   const d = useDisplay();
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Ultime esecuzioni</CardTitle>
-        <CardDescription>Ordini più recenti dell&apos;executor</CardDescription>
+        <CardTitle>Ultime esecuzioni live</CardTitle>
+        <CardDescription>Ordini reali più recenti del campione</CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading ? (
@@ -389,7 +333,7 @@ function RecentExecutionsCard() {
           <ErrorState error={error} />
         ) : (data?.executions.length ?? 0) === 0 ? (
           <p className="text-muted-foreground py-6 text-center text-sm">
-            Nessuna esecuzione registrata — il registro si popola a ogni run
+            Nessuna esecuzione registrata — il registro si popola quando il live è attivo
           </p>
         ) : (
           <>
@@ -470,7 +414,7 @@ export default function DashboardPage() {
   };
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader eyebrow="Registro operativo" title="Dashboard" description="Equity, asset, risultati, rischio operativo e notizie in un’unica vista." actions={<DateRangeFilter value={pageRange} onChange={updatePageRange} label="Pagina" />} />
+      <PageHeader eyebrow="Conto reale" title="Dashboard live" description="Il campione dell'arena opera qui: equity, posizioni reali, esecuzioni e controlli." actions={<DateRangeFilter value={pageRange} onChange={updatePageRange} label="Pagina" />} />
       <MetricsStrip range={pageRange} />
       <EquityCard range={chartRange} onRangeChange={setChartRange} />
       <div className="grid gap-4 lg:grid-cols-2">
@@ -481,10 +425,7 @@ export default function DashboardPage() {
         <PortfolioOverviewCard />
         <NewsCard />
       </div>
-      <div className="grid gap-4 xl:grid-cols-2">
-        <RecentRunsCard />
-        <RecentExecutionsCard />
-      </div>
+      <RecentExecutionsCard />
     </div>
   );
 }

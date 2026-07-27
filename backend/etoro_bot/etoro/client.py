@@ -77,16 +77,11 @@ class EtoroClient:
         self,
         api_key: str,
         user_key: str,
-        environment: str = "demo",
         session: requests.Session | None = None,
         *,
         rate_limiter: RateLimiter | None = None,
         timeout_s: float = 30.0,
     ) -> None:
-        env = getattr(environment, "value", environment)
-        if env not in ("demo", "real"):
-            raise ValueError(f"environment non valido: {env!r} (atteso 'demo' o 'real')")
-        self._environment = env
         self._api_key = api_key
         self._user_key = user_key
         self._session = session or requests.Session()
@@ -99,8 +94,8 @@ class EtoroClient:
 
     @property
     def _trading_segment(self) -> str:
-        """Segmento `demo/` per le sole rotte trading (execution + trading/info)."""
-        return "demo/" if self._environment == "demo" else ""
+        """Rotte trading senza segmento: esiste solo il conto reale (niente demo)."""
+        return ""
 
     # ------------------------------------------------------------------ HTTP
 

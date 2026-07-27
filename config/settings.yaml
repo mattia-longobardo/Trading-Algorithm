@@ -1,15 +1,29 @@
 # Default di configurazione. Precedenza a runtime: app_settings (DB) > questo file > env.
-# Le chiavi API vivono SOLO in .env, mai qui.
-environment: demo          # demo | real
-schedule_utc: "08:30"      # SEMPRE UTC: lo scheduler non usa `timezone`
+# Le chiavi API vivono SOLO nelle credenziali cifrate (UI), mai qui.
 timezone: Europe/Rome      # solo presentazione: orari mostrati in questo fuso
 currency: USD              # valuta di visualizzazione; i dati restano in USD
-news_fetch_utc: "08:15"
-weekdays_only: true
 risk_free_rate_pct: 5.0    # T-bill 3M, usato da Sharpe/Sortino
 benchmark_symbol: SPY
 
+# Arena evolutiva: due agenti LLM rivali in day trading simulato; a fine mese
+# sopravvive solo chi è in profitto e davanti al rivale. Lo stato runtime
+# (mese, pausa, live) vive in app_settings sotto la chiave "arena".
+arena:
+  starting_capital_eur: 10000   # budget mensile di ogni agente (convertito in USD)
+  cycle_minutes: 60             # un ciclo di decisioni ogni ora di borsa
+  max_symbols: 80               # titoli mostrati ai trader per ciclo
+  # Sessioni di borsa (UTC, orari estivi). Ogni sessione ha il suo EOD:
+  # day trading per mercato, niente posizioni oltre la campanella.
+  markets:
+    europe:
+      open_utc: "07:00"         # 09:00 CEST (Milano/Xetra/Parigi/Amsterdam/Londra)
+      close_utc: "15:30"
+    usa:
+      open_utc: "13:30"         # NYSE 9:30 ET
+      close_utc: "20:00"
+
 watchlist:
+  # USA — tech & growth
   - AAPL
   - MSFT
   - NVDA
@@ -17,15 +31,82 @@ watchlist:
   - AMZN
   - META
   - TSLA
+  - AVGO
+  - AMD
+  - NFLX
+  - CRM
+  - ORCL
+  - INTC
+  - QCOM
+  - MU
+  - PLTR
+  - UBER
+  - PYPL
+  - COIN
+  # USA — finanza, salute, consumi, energia, industria
   - JPM
+  - BAC
+  - GS
   - V
   - UNH
+  - LLY
+  - MRK
+  - PFE
+  - ABBV
+  - COST
+  - WMT
+  - HD
+  - MCD
+  - NKE
+  - DIS
   - XOM
+  - COP
+  - CAT
+  - BA
+  - GE
+  # USA — ETF
   - SPY
   - QQQ
+  - IWM
+  - XLK
+  - XLE
+  # Europa (symbolFull eToro: suffisso = borsa)
+  - ENEL.MI
+  - ENI.MI
+  - ISP.MI
+  - UCG.MI
+  - RACE.MI
+  - G.MI
+  - LDO.MI
+  - STLAM.MI
+  - SAP.DE
+  - SIE.DE
+  - DTE.DE
+  - ALV.DE
+  - BMW.DE
+  - BAS.DE
+  - IFX.DE
+  - ASML.NV
+  - ADYEN.NV
+  - INGA.NV
+  - MC.PA
+  - TTE.PA
+  - AIR.PA
+  - OR.PA
+  - SAN.PA
+  - BNP.PA
+  - SU.PA
+  - SAN.MC
+  - IBE.MC
+  - BBVA.MC
+  - NESN.ZU
+  - NOVN.ZU
+  - AZN.L
+  - SHEL.L
+  - HSBA.L
+  - ULVR.L
+  - NOVO-B.CO
 
-max_candidates_per_run: 6
-debate_rounds: 2
 
 # Scoperta dinamica dell'universo: uno scout LLM legge le news del giorno e
 # propone candidati (con tesi e confidence); le citazioni esplicite nelle news
@@ -35,7 +116,7 @@ debate_rounds: 2
 universe_discovery:
   enabled: true
   mode: llm                          # llm (scout + fallback regex) | regex
-  size: 5                            # titoli dinamici oltre alla watchlist
+  size: 8                            # titoli dinamici oltre alla watchlist
   llm_max_proposals: 10              # tetto alle proposte dello scout
   min_confidence: 0.5                # confidence minima di una proposta
   keep_misses: 3                     # refresh senza riconferma prima di uscire

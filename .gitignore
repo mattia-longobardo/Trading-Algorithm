@@ -42,3 +42,4 @@ backend/.venv/
 backend/*.egg-info/
 backend/.pytest_cache/
 backend/.ruff_cache/
+backend/fx_rates.json

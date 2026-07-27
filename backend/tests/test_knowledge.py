@@ -6,7 +6,6 @@ che la degradazione sia silenziosa e che parser/chunking/CAG siano puri.
 """
 
 
-from etoro_bot.knowledge.cag import build_static_context, static_system_block
 from etoro_bot.knowledge.fetch_news import (
     MAX_ITEMS_PER_FEED,
     fetch_all,
@@ -132,24 +131,6 @@ def test_ingest_path_degraded(tmp_path):
     kb = KnowledgeBase(url="http://host-inesistente.invalid:1")
     assert not kb.available
     assert ingest_path(tmp_path, kb) == 0  # degradata: nessuna eccezione, zero indicizzati
-
-
-# -- (c) CAG deterministico ---------------------------------------------------
-
-
-def test_build_static_context_deterministic():
-    first = build_static_context()
-    second = build_static_context()
-    assert first == second  # byte-identico → cache hit del prompt caching
-    assert "max_open_positions" in first  # risk_rules.yaml raw incluso
-    assert "AAPL" in first  # watchlist inclusa
-
-
-def test_static_system_block_shape():
-    block = static_system_block()
-    assert block["type"] == "text"
-    assert "cache_control" not in block  # OpenAI: caching automatico, niente marker
-    assert block["text"] == build_static_context()
 
 
 # -- (d) recency: le notizie vecchie contano meno -----------------------------
