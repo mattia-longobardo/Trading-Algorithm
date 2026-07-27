@@ -19,16 +19,21 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from etoro_bot.config import load_settings
+from etoro_bot.config import load_breaker_rules, load_settings
 from etoro_bot.db.repo import Repository, make_engine, make_session_factory
 from etoro_bot.safety.circuit_breaker import CircuitBreaker
 from etoro_bot.safety.kill_switch import (
     engage_kill_switch,
     kill_switch_active,
     release_kill_switch,
+)
+
+# Senza handler sul root gli INFO dell'arena sarebbero invisibili nei log del
+# container (uvicorn configura solo i propri logger). No-op se già configurato.
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 
 log = logging.getLogger("etoro_bot.api")
@@ -70,19 +75,83 @@ def _user_keys(identity: UserIdentity):
     return get_user_keys(get_repo(), identity.user_id)
 
 
+def _arena_deps():
+    """ArenaDeps di sistema: chiavi del proprietario, settings completi."""
+    from etoro_bot.arena.engine import ArenaDeps
+
+    settings = _full_settings()
+    llm_cfg = settings.get("llm") or {}
+    return ArenaDeps(
+        repo=get_repo(),
+        client=_system_etoro_client(),
+        settings=settings,
+        llm=_system_llm(),
+        model=str(llm_cfg.get("model", "gpt-5.6-terra")),
+        max_tokens=int(llm_cfg.get("max_tokens", 2048)),
+    )
+
+
 def _start_scheduler() -> None:
     if os.environ.get("DISABLE_SCHEDULER") == "1":
         return
     try:
         from etoro_bot.services.scheduler import start_scheduler
 
-        def _run_job() -> None:
-            from etoro_bot.graph.runner import RunInProgressError, run_pipeline
+        def _cycle_job() -> None:
+            from etoro_bot.arena.engine import run_training_cycle
+            from etoro_bot.arena.live import run_live_cycle
+            from etoro_bot.arena.market import build_snapshot
+            from etoro_bot.services.app_settings import arena_state
 
-            try:
-                run_pipeline()
-            except RunInProgressError:
-                log.warning("run schedulata saltata: run già in corso")
+            deps = _arena_deps()
+            market = build_snapshot(deps.client, deps.settings) if deps.client else {}
+            log.info("arena: ciclo (%d titoli)", len(market))
+            log.info("arena: training %s", run_training_cycle(deps, market=market))
+            if arena_state(get_repo())["live_enabled"] and deps.client is not None:
+                log.info("arena: live %s",
+                         run_live_cycle(deps, breaker=get_breaker(), market=market))
+
+        def _eod_job(market_name: str, final: bool) -> None:
+            from etoro_bot.arena.engine import close_market_positions, run_eod
+            from etoro_bot.arena.live import (
+                close_live_market_positions,
+                run_live_eod,
+            )
+            from etoro_bot.arena.market import build_snapshot
+            from etoro_bot.services.app_settings import arena_state
+
+            deps = _arena_deps()
+            market = (
+                build_snapshot(deps.client, deps.settings, only_open=False)
+                if deps.client else {}
+            )
+            live_on = arena_state(get_repo())["live_enabled"] and deps.client is not None
+            log.info(
+                "arena: chiusura sessione %s",
+                close_market_positions(deps, market_name, market=market),
+            )
+            if live_on:
+                log.info(
+                    "arena: chiusura sessione live %s",
+                    close_live_market_positions(
+                        deps, market_name, breaker=get_breaker(), market=market
+                    ),
+                )
+            if final:  # ultima campanella del giorno: riflessione + snapshot
+                log.info("arena: EOD training %s", run_eod(deps, market=market))
+                if live_on:
+                    log.info("arena: EOD live %s",
+                             run_live_eod(deps, breaker=get_breaker()))
+
+        def _evolve_job() -> None:
+            from etoro_bot.arena.engine import bootstrap_if_needed
+            from etoro_bot.arena.evolution import maybe_evolve
+
+            deps = _arena_deps()
+            bootstrap_if_needed(deps)
+            outcome = maybe_evolve(deps)
+            if outcome:
+                log.info("arena: evoluzione %s", outcome)
 
         def _news_job() -> None:
             from etoro_bot.knowledge.pipeline import run_news_pipeline
@@ -96,8 +165,10 @@ def _start_scheduler() -> None:
             _mark_fetch(UserIdentity("system"))
 
         start_scheduler(
-            get_settings=lambda: get_settings_service().get_effective(),
-            run_job=_run_job,
+            get_settings=_full_settings,
+            cycle_job=_cycle_job,
+            eod_job=_eod_job,
+            evolve_job=_evolve_job,
             news_job=_news_job,
         )
     except Exception:
@@ -110,9 +181,7 @@ def get_repo() -> Repository:
 
 
 def get_breaker() -> CircuitBreaker:
-    from etoro_bot.services.app_settings import effective_risk_rules
-
-    return CircuitBreaker(effective_risk_rules(get_repo()).circuit_breaker)
+    return CircuitBreaker(load_breaker_rules())
 
 
 def get_settings_service():
@@ -125,9 +194,8 @@ def _full_settings() -> dict[str, Any]:
     """Settings completi: default yaml + override runtime (DB > yaml).
 
     get_effective() restituisce SOLO le chiavi runtime gestite dal DB
-    (environment, orari, valuta, risk_limits): per watchlist, news_feeds,
-    universe_discovery, knowledge e llm serve la base yaml — stesso pattern
-    di graph.runner._effective_settings.
+    (valuta, timezone, stato arena): per watchlist, news_feeds,
+    universe_discovery, knowledge e llm serve la base yaml.
     """
     return {**load_settings(), **get_settings_service().get_effective()}
 
@@ -142,14 +210,20 @@ def health() -> dict[str, str]:
 
 @app.get("/status")
 def status() -> dict[str, Any]:
-    from etoro_bot.graph.runner import is_run_in_progress
+    from etoro_bot.services.app_settings import arena_state
+    from etoro_bot.services.scheduler import (
+        market_is_open,
+        next_cycle_at,
+        open_sessions,
+    )
 
-    settings = get_settings_service().get_effective()
+    settings = _full_settings()
     breaker = get_breaker()
     repo = get_repo()
 
     equity_usd = None
     equity_change_day_pct = None
+    champion = None
     try:
         series = repo.equity_series()
         if series:
@@ -159,31 +233,29 @@ def status() -> dict[str, Any]:
                     (series[-1].equity_usd - series[-2].equity_usd)
                     / series[-2].equity_usd * 100
                 )
+        champ = repo.champion()
+        if champ is not None:
+            champion = {"id": str(champ.id), "name": champ.name,
+                        "generation": champ.generation}
     except Exception:  # DB giù: lo status resta consultabile
-        log.warning("equity series non disponibile", exc_info=True)
+        log.warning("stato arena non disponibile", exc_info=True)
 
+    arena = arena_state(repo)
     return {
-        "environment": settings["environment"],
         "kill_switch_active": kill_switch_active(),
         "circuit_breaker": {
             "tripped": breaker.blocks_openings(),
             "reason": breaker.state.reason,
             "until": breaker.state.cooloff_until,
         },
-        "run_in_progress": is_run_in_progress(),
-        "next_run_at": _next_run_at(settings),
+        "arena": arena,
+        "champion": champion,
+        "market_open": market_is_open(settings, datetime.now(timezone.utc)),
+        "open_sessions": open_sessions(settings, datetime.now(timezone.utc)),
+        "next_cycle_at": next_cycle_at(settings),
         "equity_usd": equity_usd,
         "equity_change_day_pct": equity_change_day_pct,
     }
-
-
-def _next_run_at(settings: dict[str, Any]) -> str | None:
-    try:
-        from etoro_bot.services.scheduler import next_run_at
-
-        return next_run_at(settings)
-    except Exception:
-        return None
 
 
 # --- runs / executions ------------------------------------------------------
@@ -273,12 +345,11 @@ def list_executions(limit: int = Query(50, le=500)) -> dict[str, Any]:
 @app.get("/portfolio")
 def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     repo = get_repo()
-    settings = get_settings_service().get_effective()
     positions = repo.open_positions()
 
     rates: dict[int, float] = {}
     try:
-        client = _make_client(settings, identity)
+        client = _make_client(identity)
         account_portfolio = client.get_portfolio()
         if account_portfolio.get("credit") is None:
             raise ValueError("portfolio eToro senza campo credit")
@@ -319,53 +390,29 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
             }
         )
 
-    anomalies = []
-    try:
-        for d in _recent_anomalies(repo):
-            anomalies.append(d)
-    except Exception:
-        pass
+    # size massima teorica per ordine live, dal DNA del campione (o default)
+    from etoro_bot.arena.dna import clamp_dna
 
-    from etoro_bot.services.app_settings import effective_risk_rules
-
-    rules = effective_risk_rules(repo)
+    champ = repo.champion()
+    dna = clamp_dna(champ.dna if champ else None)
     return {
         "positions": out,
         "cash_usd": cash_usd,
         "equity_usd": cash_usd + invested,
         "exposure_usd": invested,
-        "max_trade_amount_usd": cash_usd / rules.max_open_positions,
+        "max_trade_amount_usd": (cash_usd + invested) * dna["max_position_pct"] / 100.0,
         "capital_source": "etoro",
-        "anomalies": anomalies,
+        "anomalies": [],
     }
 
 
-def _recent_anomalies(repo: Repository, limit: int = 20) -> list[dict[str, Any]]:
-    anomalies: list[dict[str, Any]] = []
-    for r in repo.list_runs(limit=10):
-        for d in repo.get_run_decisions(r.run_id):
-            if d.stage == "reconcile_anomaly":
-                anomalies.append(
-                    {
-                        "symbol": d.symbol,
-                        "detail": d.payload.get("detail", str(d.payload)),
-                        "detected_at": d.created_at.isoformat(),
-                    }
-                )
-    return anomalies[:limit]
-
-
-def _make_client(settings: dict[str, Any], identity: UserIdentity):
+def _make_client(identity: UserIdentity):
     from etoro_bot.etoro.client import EtoroClient
 
     keys = _user_keys(identity)
     if not keys.etoro_configured:
         raise HTTPException(422, "Configura le chiavi eToro personali in Impostazioni")
-    return EtoroClient(
-        api_key=keys.etoro_api_key,
-        user_key=keys.etoro_user_key,
-        environment=settings["environment"],
-    )
+    return EtoroClient(api_key=keys.etoro_api_key, user_key=keys.etoro_user_key)
 
 
 # --- backtest ---------------------------------------------------------------
@@ -377,8 +424,7 @@ def _backtest_service(identity: UserIdentity):
     def price_fetcher(symbol: str, start_date):
         from datetime import date as _date
 
-        settings = get_settings_service().get_effective()
-        client = _make_client(settings, identity)
+        client = _make_client(identity)
         found = client.search_instruments(
             {"internalSymbolFull": symbol},
             fields=["instrumentId", "internalSymbolFull"],
@@ -469,25 +515,6 @@ def backtest_monthly_returns(identity: UserIdentity = Depends(current_user)) -> 
     return {"rows": _backtest_service(identity).monthly_returns()}
 
 
-# --- risk score -------------------------------------------------------------
-
-
-@app.get("/risk/score")
-def risk_score() -> dict[str, Any]:
-    from etoro_bot.services.risk_score import RiskScoreService
-    from etoro_bot.services.app_settings import effective_risk_rules
-
-    repo = get_repo()
-    result = RiskScoreService(repo, risk_rules=effective_risk_rules(repo)).compute_and_store()
-    return {"score": result.score, "band": result.band, "components": result.breakdown}
-
-
-@app.get("/risk/score/history")
-def risk_score_history() -> dict[str, Any]:
-    rows = get_repo().risk_score_history()
-    return {"points": [{"date": r.date.isoformat(), "score": r.score} for r in rows]}
-
-
 # --- knowledge --------------------------------------------------------------
 
 
@@ -510,12 +537,7 @@ def _system_etoro_client():
         keys = get_user_keys(repo, user_id)
         if not keys.etoro_api_key or not keys.etoro_user_key:
             return None
-        settings = get_settings_service().get_effective()
-        return EtoroClient(
-            api_key=keys.etoro_api_key,
-            user_key=keys.etoro_user_key,
-            environment=str(settings.get("environment", "demo")),
-        )
+        return EtoroClient(api_key=keys.etoro_api_key, user_key=keys.etoro_user_key)
     except Exception:
         log.warning("client eToro di sistema non disponibile", exc_info=True)
         return None
@@ -536,7 +558,7 @@ def _system_llm():
             return None
         import openai
 
-        from etoro_bot.graph.llm import call_llm
+        from etoro_bot.llm import call_llm
 
         return partial(call_llm, client=openai.OpenAI(api_key=keys.openai_api_key))
     except Exception:
@@ -840,7 +862,7 @@ def close_trade(
     position = repo.get_open_position(position_id)
     if position is None:
         raise HTTPException(404, "Posizione aperta non trovata")
-    client = _make_client(get_settings_service().get_effective(), identity)
+    client = _make_client(identity)
     client.close_position(position_id, position.instrument_id)
     close_price = None
     pnl = None
@@ -945,47 +967,12 @@ def trade_history(
     return {"items": items}
 
 
-# --- report su filesystem locale ------------------------------------------
-
-
-def _reports():
-    from etoro_bot.services.reports import ReportService
-
-    return ReportService(get_repo())
-
-
-@app.get("/reports")
-def list_reports(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
-    return {"reports": _reports().list(identity.user_id)}
-
-
-@app.get("/reports/{cadence}/{filename}")
-def read_report(
-    cadence: str,
-    filename: str,
-    download: bool = False,
-    identity: UserIdentity = Depends(current_user),
-):
-    try:
-        content, path = _reports().read(identity.user_id, f"{cadence}/{filename}")
-    except FileNotFoundError as exc:
-        raise HTTPException(404, "Report non trovato") from exc
-    if download:
-        return FileResponse(path, media_type="text/markdown", filename=path.name)
-    return {"id": f"{cadence}/{filename}", "content": content}
-
-
-# --- settings (§10) ---------------------------------------------------------
+# --- settings ---------------------------------------------------------------
 
 
 class SettingsBody(BaseModel):
-    environment: str | None = None
-    schedule_utc: str | None = None
     timezone: str | None = None
     currency: str | None = None
-    weekdays_only: bool | None = None
-    risk_limits: dict[str, float | int] | None = None
-    confirmation: bool | None = None
 
 
 class CredentialsBody(BaseModel):
@@ -1095,33 +1082,204 @@ def settings_audit() -> dict[str, Any]:
     }
 
 
-# --- run & kill switch ------------------------------------------------------
+# --- arena (allenamento evolutivo) ------------------------------------------
 
 
-@app.post("/run", status_code=202)
-def trigger_run(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
-    from etoro_bot.graph.runner import (
-        RunInProgressError,
-        is_run_in_progress,
-        run_pipeline,
+def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[str, Any]:
+    positions = repo.sim_positions(agent.id)
+    invested = sum(p.amount_usd for p in positions)
+    pnl_month = agent.cash_usd + invested - agent.starting_capital_usd
+    payload = {
+        "id": str(agent.id),
+        "name": agent.name,
+        "generation": agent.generation,
+        "status": agent.status,
+        "is_champion": agent.is_champion,
+        "parent_id": str(agent.parent_id) if agent.parent_id else None,
+        "born_at": agent.born_at.isoformat() if agent.born_at else None,
+        "died_at": agent.died_at.isoformat() if agent.died_at else None,
+        "death_reason": agent.death_reason,
+        "month": agent.month,
+        "dna": agent.dna,
+        "starting_capital_usd": agent.starting_capital_usd,
+        "cash_usd": agent.cash_usd,
+        "equity_usd": round(agent.cash_usd + invested, 2),
+        "pnl_month_usd": round(pnl_month, 2),
+        "open_positions": [
+            {
+                "id": str(p.id),
+                "symbol": p.symbol,
+                "amount_usd": p.amount_usd,
+                "entry_price": p.entry_price,
+                "opened_at": p.opened_at.isoformat(),
+                "open_reason": p.open_reason,
+            }
+            for p in positions
+        ],
+    }
+    if with_memory:
+        payload["memory"] = agent.memory
+    return payload
+
+
+@app.get("/arena")
+def arena_overview() -> dict[str, Any]:
+    from etoro_bot.services.app_settings import arena_state
+    from etoro_bot.services.scheduler import (
+        market_is_open,
+        market_sessions,
+        next_cycle_at,
+        open_sessions,
     )
 
-    if is_run_in_progress():
-        raise HTTPException(409, "run già in corso")
+    repo = get_repo()
+    settings = _full_settings()
+    agents = repo.all_agents()
+    alive = [a for a in agents if a.status == "alive"]
+    champ = repo.champion()
+    now = datetime.now(timezone.utc)
+    from calendar import monthrange
 
-    result: dict[str, Any] = {}
+    days_left = monthrange(now.year, now.month)[1] - now.day
+    now_open = set(open_sessions(settings, now))
+    return {
+        "state": arena_state(repo),
+        "market_open": market_is_open(settings, now),
+        "sessions": [
+            {"name": name, "open_utc": window[0], "close_utc": window[1],
+             "open_now": name in now_open}
+            for name, window in sorted(market_sessions(settings).items())
+        ],
+        "next_cycle_at": next_cycle_at(settings),
+        "days_to_evaluation": days_left,
+        "generation": max((a.generation for a in alive), default=0),
+        "agents": [_agent_payload(repo, a) for a in alive],
+        "champion": _agent_payload(repo, champ) if champ else None,
+        "lineage": [_agent_payload(repo, a, with_memory=False) for a in agents],
+    }
+
+
+@app.get("/arena/agents/{agent_id}")
+def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
+    repo = get_repo()
+    agent = repo.get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(404, "agente non trovato")
+    return {
+        "agent": _agent_payload(repo, agent),
+        "equity": [
+            {"ts": p.ts.isoformat(), "equity_usd": p.equity_usd}
+            for p in repo.sim_equity_series(agent_id)
+        ],
+        "trades": [
+            {
+                "id": str(t.id),
+                "symbol": t.symbol,
+                "amount_usd": t.amount_usd,
+                "entry_price": t.entry_price,
+                "close_price": t.close_price,
+                "pnl_usd": t.pnl_usd,
+                "opened_at": t.opened_at.isoformat(),
+                "closed_at": t.closed_at.isoformat(),
+                "open_reason": t.open_reason,
+                "close_reason": t.close_reason,
+            }
+            for t in repo.sim_trades(agent_id)
+        ],
+    }
+
+
+@app.get("/arena/events")
+def arena_events(limit: int = Query(100, le=500)) -> dict[str, Any]:
+    rows = get_repo().arena_events(limit=limit)
+    return {
+        "events": [
+            {"id": str(e.id), "ts": e.ts.isoformat(), "event": e.event,
+             "payload": e.payload}
+            for e in rows
+        ]
+    }
+
+
+@app.post("/arena/pause")
+def arena_pause() -> dict[str, Any]:
+    from etoro_bot.services.app_settings import set_arena_state
+
+    state = set_arena_state(get_repo(), paused=True)
+    get_repo().add_arena_event("pause", {})
+    return {"state": state}
+
+
+@app.post("/arena/resume")
+def arena_resume() -> dict[str, Any]:
+    from etoro_bot.services.app_settings import set_arena_state
+
+    state = set_arena_state(get_repo(), paused=False)
+    get_repo().add_arena_event("resume", {})
+    return {"state": state}
+
+
+@app.post("/arena/cycle", status_code=202)
+def arena_trigger_cycle(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
+    """Forza un ciclo di allenamento adesso (per test/monitoraggio manuale)."""
+    try:
+        owner = get_repo().owner_user_id()
+    except Exception:
+        owner = None
+    if owner and identity.user_id not in ("system", owner):
+        raise HTTPException(403, "solo il proprietario può forzare un ciclo")
 
     def _job() -> None:
         try:
-            result.update(run_pipeline(user_id=identity.user_id))
-        except RunInProgressError:
-            pass
-        except Exception:
-            log.exception("run fallita")
+            from etoro_bot.arena.engine import run_training_cycle
 
-    thread = threading.Thread(target=_job, daemon=True)
-    thread.start()
+            deps = _arena_deps()
+            log.info("arena: ciclo manuale %s", run_training_cycle(deps))
+        except Exception:
+            log.exception("ciclo manuale fallito")
+
+    threading.Thread(target=_job, daemon=True).start()
     return {"status": "accepted"}
+
+
+class LiveBody(BaseModel):
+    confirmation: bool | None = None
+
+
+@app.post("/live/enable")
+def live_enable(
+    body: LiveBody, identity: UserIdentity = Depends(current_user)
+) -> dict[str, Any]:
+    """Accende il trading live (denaro REALE) col DNA del campione."""
+    from etoro_bot.services.app_settings import (
+        SettingsValidationError,
+        check_live_activation,
+        set_arena_state,
+    )
+
+    if body.confirmation is not True:
+        raise HTTPException(422, "l'attivazione del live richiede confirmation: true")
+    try:
+        check_live_activation(
+            get_repo(), etoro_configured=_user_keys(identity).etoro_configured
+        )
+    except SettingsValidationError as exc:
+        raise HTTPException(422, exc.message) from exc
+    state = set_arena_state(get_repo(), live_enabled=True)
+    get_repo().add_arena_event("live_on", {"by": identity.user_id})
+    return {"state": state}
+
+
+@app.post("/live/disable")
+def live_disable(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
+    from etoro_bot.services.app_settings import set_arena_state
+
+    state = set_arena_state(get_repo(), live_enabled=False)
+    get_repo().add_arena_event("live_off", {"by": identity.user_id})
+    return {"state": state}
+
+
+# --- kill switch --------------------------------------------------------------
 
 
 @app.post("/kill-switch")

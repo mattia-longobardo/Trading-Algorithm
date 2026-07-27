@@ -1,67 +1,53 @@
 // Tipi del contratto API backend (FastAPI) — tutte le rotte passano da /api/*
 
-export type Environment = "demo" | "real";
-
 export interface CircuitBreakerStatus {
   tripped: boolean;
   reason: string | null;
   until: string | null;
 }
 
+export interface ArenaStateInfo {
+  month: string | null;
+  paused: boolean;
+  live_enabled: boolean;
+}
+
+export interface ChampionRef {
+  id: string;
+  name: string;
+  generation: number;
+}
+
 export interface Status {
-  environment: Environment;
   kill_switch_active: boolean;
   circuit_breaker: CircuitBreakerStatus;
-  run_in_progress: boolean;
-  next_run_at: string | null;
+  arena: ArenaStateInfo;
+  champion: ChampionRef | null;
+  market_open: boolean;
+  /** Sessioni di borsa aperte adesso: "europe" | "usa". */
+  open_sessions: string[];
+  next_cycle_at: string | null;
   equity_usd: number | null;
   equity_change_day_pct: number | null;
 }
 
 export interface RunSummary {
-  candidates: number;
-  proposed: number;
-  approved: number;
-  rejected: number;
-  executed: number;
-  /** Presenti dal journal, ma non su run vecchie: sempre opzionali. */
-  skipped?: number;
-  failed?: number;
-  anomalies?: number;
+  cycle?: string;
+  opened?: number;
+  closed?: number;
+  blocked?: number;
   errors?: string[];
 }
 
 export interface Run {
   run_id: string;
   started_at: string;
-  environment: Environment;
+  environment: string;
   summary: RunSummary | null;
 }
 
 export interface RunsResponse {
   runs: Run[];
-}
-
-export type DecisionStage =
-  | "analyst"
-  | "debate"
-  | "portfolio"
-  | "risk"
-  | "reconcile_anomaly";
-
-export interface Decision {
-  id: string;
-  symbol: string;
-  stage: DecisionStage;
-  payload: Record<string, unknown>;
-  created_at: string;
-}
-
-export interface DecisionsResponse {
-  run_id: string;
-  /** Anagrafica della run; assente sulle risposte servite da backend vecchi. */
-  run?: Run;
-  decisions: Decision[];
 }
 
 export type ExecutionStatus = "filled" | "failed" | "skipped" | "rejected";
@@ -139,16 +125,6 @@ export interface DateRangeValue {
   to: string;
 }
 
-export interface RiskLimits {
-  max_position_pct_equity: number;
-  max_total_exposure_pct: number;
-  max_sector_exposure_pct: number;
-  max_open_positions: number;
-  max_orders_per_run: number;
-  max_orders_per_day: number;
-  min_cash_buffer_pct: number;
-}
-
 export interface BacktestSummary {
   metrics: BacktestMetrics;
   n_closed_trades: number;
@@ -194,32 +170,6 @@ export interface MonthlyReturns {
   rows: MonthlyRow[];
 }
 
-export type RiskBand = "low" | "medium" | "high" | "extreme";
-
-export interface RiskComponent {
-  key: string;
-  label: string;
-  weight_pct: number;
-  value_0_10: number;
-  explanation: string;
-  suggestion: string | null;
-}
-
-export interface RiskScore {
-  score: number;
-  band: RiskBand;
-  components: RiskComponent[];
-}
-
-export interface RiskHistoryPoint {
-  date: string;
-  score: number;
-}
-
-export interface RiskHistory {
-  points: RiskHistoryPoint[];
-}
-
 export interface IngestResult {
   filename: string;
   chunks_indexed: number;
@@ -237,29 +187,26 @@ export interface KnowledgeStatus {
   last_fetch: string | null;
 }
 
+export interface ArenaConfigInfo extends ArenaStateInfo {
+  starting_capital_eur?: number;
+  cycle_minutes?: number;
+  max_symbols?: number;
+  markets?: Record<string, { open_utc?: string; close_utc?: string }>;
+}
+
 export interface AppSettings {
-  environment: Environment;
-  /** Orario della run automatica, SEMPRE in UTC. */
-  schedule_utc: string;
-  /** Fuso di sola presentazione: non sposta l'orario di esecuzione. */
+  /** Fuso di sola presentazione: non sposta gli orari di esecuzione (UTC). */
   timezone: string;
-  /** Valuta di sola presentazione: il journal resta in USD. */
+  /** Valuta di sola presentazione: i conti restano in USD. */
   currency: string;
-  weekdays_only: boolean;
-  live_ack: string | null;
+  arena: ArenaConfigInfo;
   api_keys_configured: boolean;
   openai_configured: boolean;
-  risk_limits: RiskLimits;
 }
 
 export interface SettingsUpdate {
-  environment?: Environment;
-  schedule_utc?: string;
   timezone?: string;
   currency?: string;
-  weekdays_only?: boolean;
-  risk_limits?: RiskLimits;
-  confirmation?: boolean;
 }
 
 export interface CurrencyOption {
@@ -289,10 +236,6 @@ export interface AuditEntry {
 
 export interface AuditResponse {
   entries: AuditEntry[];
-}
-
-export interface RunStartResponse {
-  run_id: string;
 }
 
 export interface AccountCredentials {
@@ -342,12 +285,108 @@ export interface NewsItem {
   url?: string;
 }
 
-export interface ReportItem {
+// --- Arena evolutiva ---------------------------------------------------------
+
+export type AgentStatus = "alive" | "dead" | "evolved";
+
+export interface AgentDna {
+  conviction_scale: number;
+  max_positions: number;
+  max_orders_per_cycle: number;
+  max_position_pct: number;
+  stop_loss_pct: number;
+  take_profit_pct: number;
+  min_cash_pct: number;
+  /** Giorni di borsa massimi per posizione: 1 = day trading, fino a 5 = swing. */
+  max_holding_days?: number;
+  risk_profile: string;
+  strategy: string;
+  [key: string]: unknown;
+}
+
+export interface AgentSimPosition {
   id: string;
-  cadence: "weekly" | "monthly" | "quarterly" | "semiannual" | "annual";
+  symbol: string;
+  amount_usd: number;
+  entry_price: number;
+  opened_at: string;
+  open_reason: string;
+}
+
+export interface ArenaAgent {
+  id: string;
   name: string;
-  filename: string;
-  size_bytes: number;
-  updated_at: string;
-  period_end: string;
+  generation: number;
+  status: AgentStatus;
+  is_champion: boolean;
+  parent_id: string | null;
+  born_at: string | null;
+  died_at: string | null;
+  death_reason: string | null;
+  month: string;
+  dna: AgentDna;
+  memory?: string;
+  starting_capital_usd: number;
+  cash_usd: number;
+  equity_usd: number;
+  pnl_month_usd: number;
+  open_positions: AgentSimPosition[];
+}
+
+export interface ArenaSession {
+  name: string;
+  open_utc: string;
+  close_utc: string;
+  open_now: boolean;
+}
+
+export interface ArenaOverview {
+  state: ArenaStateInfo;
+  market_open: boolean;
+  sessions: ArenaSession[];
+  next_cycle_at: string | null;
+  days_to_evaluation: number;
+  generation: number;
+  agents: ArenaAgent[];
+  champion: ArenaAgent | null;
+  lineage: ArenaAgent[];
+}
+
+export interface AgentEquityPoint {
+  ts: string;
+  equity_usd: number;
+}
+
+export interface AgentSimTrade {
+  id: string;
+  symbol: string;
+  amount_usd: number;
+  entry_price: number;
+  close_price: number;
+  pnl_usd: number;
+  opened_at: string;
+  closed_at: string;
+  open_reason: string;
+  close_reason: string;
+}
+
+export interface AgentDetail {
+  agent: ArenaAgent;
+  equity: AgentEquityPoint[];
+  trades: AgentSimTrade[];
+}
+
+export interface ArenaEventItem {
+  id: string;
+  ts: string;
+  event: string;
+  payload: Record<string, unknown>;
+}
+
+export interface ArenaEventsResponse {
+  events: ArenaEventItem[];
+}
+
+export interface ArenaStateResponse {
+  state: ArenaStateInfo;
 }

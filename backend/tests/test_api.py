@@ -1,4 +1,4 @@
-"""Smoke test dell'API FastAPI (§12.3) con TestClient su Postgres effimero."""
+"""Smoke test dell'API FastAPI con TestClient su Postgres effimero."""
 
 import importlib
 
@@ -30,27 +30,27 @@ def test_health(client):
 
 def test_status_shape(client):
     body = client.get("/status").json()
-    assert body["environment"] == "demo"
     assert body["kill_switch_active"] is False
     assert body["circuit_breaker"]["tripped"] is False
-    assert body["run_in_progress"] is False
+    assert body["arena"]["paused"] is False
+    assert body["arena"]["live_enabled"] is False
+    assert body["champion"] is None
+    assert "market_open" in body
+    assert body["next_cycle_at"]
 
 
-def test_settings_get_and_guardrail(client):
+def test_settings_get_and_update(client):
     body = client.get("/settings").json()
-    assert body["environment"] == "demo"
     assert body["api_keys_configured"] is False
-    assert body["risk_limits"]["max_open_positions"] == 10
     assert body["timezone"] == "Europe/Rome"
+    assert "arena" in body
 
-    # verso real senza conferma → 422
-    resp = client.put("/settings", json={"environment": "real"})
-    assert resp.status_code == 422
-
-    # verso demo sempre permesso; un cambio finisce nell'audit
     resp = client.put("/settings", json={"timezone": "UTC"})
     assert resp.status_code == 200
     assert client.get("/settings").json()["timezone"] == "UTC"
+
+    # chiave sconosciuta → 422 (environment non esiste più)
+    assert client.put("/settings", json={"timezone": "not-a-zone"}).status_code == 422
 
     audit = client.get("/settings/audit").json()
     assert len(audit["entries"]) >= 1
@@ -82,13 +82,39 @@ def test_backtest_endpoints_empty(client):
     assert client.get("/backtest/monthly-returns").status_code == 200
 
 
-def test_risk_score_empty_portfolio(client):
-    body = client.get("/risk/score").json()
-    assert 1.0 <= body["score"] <= 10.0
-    assert body["band"] in {"low", "medium", "high", "extreme"}
-    assert len(body["components"]) == 8
-    history = client.get("/risk/score/history").json()
-    assert len(history["points"]) == 1  # lo snapshot appena persistito
+def test_arena_overview_empty(client):
+    body = client.get("/arena").json()
+    assert body["agents"] == []
+    assert body["champion"] is None
+    assert body["generation"] == 0
+    assert body["state"]["paused"] is False
+    assert "days_to_evaluation" in body
+
+
+def test_arena_pause_resume(client):
+    assert client.post("/arena/pause").json()["state"]["paused"] is True
+    assert client.get("/status").json()["arena"]["paused"] is True
+    assert client.post("/arena/resume").json()["state"]["paused"] is False
+    events = client.get("/arena/events").json()["events"]
+    assert {e["event"] for e in events} >= {"pause", "resume"}
+
+
+def test_arena_agent_detail_404(client):
+    assert client.get(
+        "/arena/agents/00000000-0000-0000-0000-000000000000"
+    ).status_code == 404
+
+
+def test_live_enable_requires_confirmation_and_champion(client):
+    # senza conferma → 422
+    assert client.post("/live/enable", json={}).status_code == 422
+    # con conferma ma senza chiavi/campione → 422 (guardrail backend)
+    resp = client.post("/live/enable", json={"confirmation": True})
+    assert resp.status_code == 422
+    # lo stato non è cambiato
+    assert client.get("/status").json()["arena"]["live_enabled"] is False
+    # disable è sempre permesso e idempotente
+    assert client.post("/live/disable").json()["state"]["live_enabled"] is False
 
 
 def test_knowledge_status_degraded(client, monkeypatch):
@@ -109,12 +135,13 @@ def test_portfolio_empty(client, monkeypatch):
     body = client.get("/portfolio").json()
     assert body["positions"] == []
     assert body["equity_usd"] == body["cash_usd"] == 51_073.77
-    assert body["max_trade_amount_usd"] == pytest.approx(5_107.377)
+    # senza campione vale il DNA di default: max_position_pct 25%
+    assert body["max_trade_amount_usd"] == pytest.approx(51_073.77 * 0.25)
     assert body["capital_source"] == "etoro"
 
 
 def test_delete_run_endpoint(client, repo):
-    repo.create_run("run-api-del", environment="demo")
+    repo.create_run("run-api-del", environment="live")
     assert client.delete("/runs/run-api-del").json() == {
         "deleted": True, "run_id": "run-api-del",
     }

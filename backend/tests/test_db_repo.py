@@ -9,9 +9,9 @@ NOW = datetime(2026, 7, 20, 8, 30, tzinfo=timezone.utc)
 
 def test_run_lifecycle_and_journal(repo):
     repo.create_run("run-1", environment="demo")
-    repo.add_decision("run-1", "AAPL", DecisionStage.ANALYST,
+    repo.add_decision("run-1", "AAPL", DecisionStage.TRADER,
                       {"score": 0.4, "summary": "ok"})
-    repo.add_decision("run-1", "AAPL", DecisionStage.RISK,
+    repo.add_decision("run-1", "AAPL", DecisionStage.TRADER,
                       {"approved": False, "reasons": ["oltre limite"]})
     repo.add_execution("run-1", ExecutionResult(
         symbol="AAPL", side=Side.BUY, amount_usd=100.0,
@@ -22,13 +22,13 @@ def test_run_lifecycle_and_journal(repo):
     runs = repo.list_runs()
     assert len(runs) == 1 and runs[0].summary_json["executed"] == 1
     decisions = repo.get_run_decisions("run-1")
-    assert [d.stage for d in decisions] == ["analyst", "risk"]
+    assert [d.stage for d in decisions] == ["trader", "trader"]
     assert repo.count_filled_today() == 1
 
 
 def test_delete_run_removes_everything_that_points_at_it(repo):
     repo.create_run("run-del", environment="demo")
-    repo.add_decision("run-del", "AAPL", DecisionStage.ANALYST, {"score": 0.1})
+    repo.add_decision("run-del", "AAPL", DecisionStage.TRADER, {"score": 0.1})
     repo.add_execution("run-del", ExecutionResult(
         symbol="AAPL", side=Side.BUY, amount_usd=100.0,
         status=ExecutionStatus.FILLED, execution_price=200.0, etoro_position_id=42,
@@ -39,7 +39,7 @@ def test_delete_run_removes_everything_that_points_at_it(repo):
     )
     # Una seconda run non deve essere toccata.
     repo.create_run("run-keep", environment="demo")
-    repo.add_decision("run-keep", "MSFT", DecisionStage.ANALYST, {"score": 0.2})
+    repo.add_decision("run-keep", "MSFT", DecisionStage.TRADER, {"score": 0.2})
 
     assert repo.delete_run("run-del") is True
     assert repo.get_run("run-del") is None

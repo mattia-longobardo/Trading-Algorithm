@@ -321,11 +321,11 @@ def llm_scout(
         f"Digest di oggi:\n{digest}"
     )
     if llm is None:
-        from etoro_bot.graph.llm import call_llm
+        from etoro_bot.llm import call_llm
 
         llm = call_llm
     llm_cfg = (settings or {}).get("llm") or {}
-    from etoro_bot.graph.llm import extract_json
+    from etoro_bot.llm import extract_json
 
     raw = llm(
         system_blocks=[],
@@ -677,7 +677,6 @@ if __name__ == "__main__":
     cli_client = EtoroClient(
         api_key=os.environ.get("ETORO_API_KEY", ""),
         user_key=os.environ.get("ETORO_USER_KEY", ""),
-        environment=str(cli_settings.get("environment", "demo")),
     )
     result = refresh_universe(cli_client, cli_settings, fetch_all(cli_settings))
     print(json.dumps(result, ensure_ascii=False, indent=2))

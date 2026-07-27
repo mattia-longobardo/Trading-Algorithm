@@ -1,48 +1,154 @@
-"""Scheduler del bot: fetch news 15 minuti prima della run, run all'orario
-configurato (default 08:30, lun-ven). L'orario è riletto a ogni tick così un
-cambio dalle Impostazioni vale senza riavvio.
+"""Scheduler dell'arena: sessioni di borsa Europa + USA, cicli intraday, EOD.
 
-L'esecuzione è **sempre in UTC**: `schedule_utc` è un orario UTC e anche il
-filtro `weekdays_only` guarda il giorno UTC. L'impostazione `timezone` non
-tocca lo scheduling — serve solo alla UI per mostrare gli orari nel fuso
-dell'utente, così l'ora di run non si sposta con l'ora legale.
+Tutto in UTC. Un solo job APScheduler al minuto (tick) che rilegge le settings:
+- evoluzione mensile: primo tick di ogni giorno (no-op se il mese non è cambiato);
+- news: una volta al giorno, 30' prima della prima apertura;
+- ciclo di trading (training + live): ogni `cycle_minutes` quando almeno una
+  sessione è aperta;
+- EOD per sessione: alla chiusura di ogni mercato si chiudono le posizioni di
+  QUEL mercato (day trading); alla chiusura dell'ultima sessione parte anche
+  la riflessione serale degli agenti e lo snapshot equity.
+
+I job girano in thread dedicati: il tick non si blocca mai e lo stesso job
+non corre mai in due istanze sovrapposte.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any
+import threading
+from datetime import datetime, time, timedelta, timezone
+from typing import Any, Callable
 
 log = logging.getLogger("etoro_bot.scheduler")
 
-
-def _parse_hhmm(value: str) -> tuple[int, int]:
-    hh, mm = value.split(":")
-    return int(hh), int(mm)
-
-
-def next_run_at(settings: dict[str, Any]) -> str:
-    """Prossima esecuzione schedulata in ISO 8601 UTC."""
-    hh, mm = _parse_hhmm(str(settings.get("schedule_utc", "08:30")))
-    weekdays_only = bool(settings.get("weekdays_only", True))
-    now = datetime.now(timezone.utc)
-    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    while weekdays_only and candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate.isoformat()
+# Sessioni di default (UTC, orari estivi): Europa 09:00-17:30 CEST,
+# USA 9:30-16:00 ET. Configurabili da settings.yaml arena.markets.
+DEFAULT_SESSIONS: dict[str, tuple[str, str]] = {
+    "europe": ("07:00", "15:30"),
+    "usa": ("13:30", "20:00"),
+}
+DEFAULT_CYCLE_MINUTES = 60
 
 
-def start_scheduler(get_settings, run_job, news_job):
-    """Avvia APScheduler. get_settings() è richiamata a ogni minuto per leggere
-    l'orario effettivo (DB > yaml); run_job/news_job sono callable senza argomenti.
-    """
+def _parse_hhmm(value: Any, fallback: str) -> time:
+    try:
+        hh, mm = str(value).split(":")
+        return time(int(hh), int(mm))
+    except (ValueError, AttributeError):
+        hh, mm = fallback.split(":")
+        return time(int(hh), int(mm))
+
+
+def arena_cfg(settings: dict[str, Any]) -> dict[str, Any]:
+    return settings.get("arena") or {}
+
+
+def market_sessions(settings: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """name → (open_utc, close_utc). Config nuova, legacy o default EU+USA."""
+    cfg = arena_cfg(settings)
+    raw = cfg.get("markets")
+    if isinstance(raw, dict) and raw:
+        out: dict[str, tuple[str, str]] = {}
+        for name, window in raw.items():
+            window = window or {}
+            fallback = DEFAULT_SESSIONS.get(str(name), ("13:30", "20:00"))
+            out[str(name)] = (
+                str(window.get("open_utc", fallback[0])),
+                str(window.get("close_utc", fallback[1])),
+            )
+        return out
+    if cfg.get("market_open_utc") or cfg.get("market_close_utc"):  # config legacy
+        return {
+            "usa": (
+                str(cfg.get("market_open_utc", "13:30")),
+                str(cfg.get("market_close_utc", "20:00")),
+            )
+        }
+    return dict(DEFAULT_SESSIONS)
+
+
+def _session_times(settings: dict[str, Any]) -> dict[str, tuple[time, time]]:
+    return {
+        name: (_parse_hhmm(o, "13:30"), _parse_hhmm(c, "20:00"))
+        for name, (o, c) in market_sessions(settings).items()
+    }
+
+
+def open_sessions(settings: dict[str, Any], now: datetime) -> list[str]:
+    """Sessioni aperte adesso (giorni feriali UTC), in ordine stabile."""
+    if now.weekday() >= 5:
+        return []
+    return [
+        name
+        for name, (open_t, close_t) in sorted(_session_times(settings).items())
+        if open_t <= now.time() < close_t
+    ]
+
+
+def market_is_open(settings: dict[str, Any], now: datetime) -> bool:
+    return bool(open_sessions(settings, now))
+
+
+def _earliest_open(settings: dict[str, Any]) -> time:
+    return min(t for t, _ in _session_times(settings).values())
+
+
+def final_session(settings: dict[str, Any]) -> str:
+    """La sessione che chiude per ultima: al suo EOD parte la riflessione."""
+    times = _session_times(settings)
+    return max(times, key=lambda name: times[name][1])
+
+
+def cycle_slot(settings: dict[str, Any], now: datetime) -> int | None:
+    """Indice del ciclo dalla prima apertura del giorno; None a mercati chiusi."""
+    if not open_sessions(settings, now):
+        return None
+    open_t = _earliest_open(settings)
+    minutes = int(arena_cfg(settings).get("cycle_minutes", DEFAULT_CYCLE_MINUTES)) \
+        or DEFAULT_CYCLE_MINUTES
+    elapsed = (now.hour * 60 + now.minute) - (open_t.hour * 60 + open_t.minute)
+    return elapsed // minutes
+
+
+def next_cycle_at(settings: dict[str, Any], now: datetime | None = None) -> str:
+    """Prossimo ciclo di trading in ISO 8601 UTC (per la UI)."""
+    now = now or datetime.now(timezone.utc)
+    open_t = _earliest_open(settings)
+    minutes = int(arena_cfg(settings).get("cycle_minutes", DEFAULT_CYCLE_MINUTES)) \
+        or DEFAULT_CYCLE_MINUTES
+    open_minutes = open_t.hour * 60 + open_t.minute
+    probe = now.replace(second=0, microsecond=0)
+    for _ in range(10 * 24 * 60):
+        probe += timedelta(minutes=1)
+        if cycle_slot(settings, probe) is None:
+            continue
+        if ((probe.hour * 60 + probe.minute) - open_minutes) % minutes == 0:
+            return probe.isoformat()
+    return (now + timedelta(days=1)).replace(
+        hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0
+    ).isoformat()
+
+
+def start_scheduler(
+    get_settings: Callable[[], dict[str, Any]],
+    *,
+    cycle_job: Callable[[], None],
+    eod_job: Callable[[str, bool], None],
+    evolve_job: Callable[[], None],
+    news_job: Callable[[], None],
+):
+    """Avvia APScheduler; eod_job riceve (mercato, ultima_sessione_del_giorno)."""
     from apscheduler.schedulers.background import BackgroundScheduler
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    state: dict[str, str | None] = {"last_run_day": None, "last_news_day": None}
+    state: dict[str, Any] = {
+        "evolve_day": None,
+        "news_day": None,
+        "cycle_slot": None,
+        "eod_done": set(),  # {"YYYY-MM-DD#sessione"}
+    }
+    running: set[str] = set()  # job lunghi in thread: mai due istanze uguali
 
     def tick() -> None:
         try:
@@ -51,29 +157,54 @@ def start_scheduler(get_settings, run_job, news_job):
             log.warning("settings non disponibili, tick saltato", exc_info=True)
             return
         now = datetime.now(timezone.utc)
-        if bool(settings.get("weekdays_only", True)) and now.weekday() >= 5:
-            return
         today = now.date().isoformat()
 
-        run_hh, run_mm = _parse_hhmm(str(settings.get("schedule_utc", "08:30")))
-        news_time = now.replace(hour=run_hh, minute=run_mm) - timedelta(minutes=15)
+        if state["evolve_day"] != today:
+            state["evolve_day"] = today
+            _safe(evolve_job, "evolve")
 
-        if (
-            state["last_news_day"] != today
-            and (now.hour, now.minute) >= (news_time.hour, news_time.minute)
-        ):
-            state["last_news_day"] = today
+        if now.weekday() >= 5:
+            return
+
+        open_t = _earliest_open(settings)
+        news_at = (
+            datetime.combine(now.date(), open_t, tzinfo=timezone.utc)
+            - timedelta(minutes=30)
+        )
+        if state["news_day"] != today and now >= news_at:
+            state["news_day"] = today
             _safe(news_job, "news")
 
-        if state["last_run_day"] != today and (now.hour, now.minute) >= (run_hh, run_mm):
-            state["last_run_day"] = today
-            _safe(run_job, "run")
+        slot = cycle_slot(settings, now)
+        slot_key = None if slot is None else f"{today}#{slot}"
+        if slot_key is not None and state["cycle_slot"] != slot_key:
+            state["cycle_slot"] = slot_key
+            _safe(cycle_job, "cycle")
 
-    def _safe(job, name: str) -> None:
-        try:
-            job()
-        except Exception:
-            log.exception("job schedulato '%s' fallito", name)
+        last = final_session(settings)
+        for name, (_open_t, close_t) in _session_times(settings).items():
+            key = f"{today}#{name}"
+            if key not in state["eod_done"] and now.time() >= close_t:
+                state["eod_done"].add(key)
+                _safe(lambda n=name: eod_job(n, n == last), f"eod-{name}")
+
+    def _safe(job: Callable[[], None], name: str) -> None:
+        """Esegue il job in un thread: il tick non si blocca mai (news e cicli
+        durano minuti) e lo stesso job non gira mai in due istanze."""
+        if name in running:
+            log.warning("job '%s' ancora in corso: questa occorrenza è saltata", name)
+            return
+        running.add(name)
+
+        def _run() -> None:
+            try:
+                job()
+            except Exception:
+                log.exception("job schedulato '%s' fallito", name)
+            finally:
+                running.discard(name)
+
+        threading.Thread(target=_run, daemon=True, name=f"arena-{name}").start()
 
     scheduler.add_job(tick, "interval", minutes=1, id="etoro-bot-tick")
     scheduler.start()

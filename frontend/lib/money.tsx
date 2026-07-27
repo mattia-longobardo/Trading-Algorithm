@@ -14,6 +14,7 @@
  */
 
 import * as React from "react";
+import { usePathname } from "next/navigation";
 
 import {
   fmtDate,
@@ -92,8 +93,11 @@ function browserTimeZone(): string {
 }
 
 export function DisplayProvider({ children }: { children: React.ReactNode }) {
-  const settings = useSettings();
-  const fx = useFxRates();
+  // Sulla pagina di login non c'è sessione: /settings e /fx/rates
+  // risponderebbero solo 401. Si resta sul fallback USD/UTC.
+  const authenticated = usePathname() !== "/login";
+  const settings = useSettings(authenticated);
+  const fx = useFxRates(authenticated);
 
   const currency = settings.data?.currency?.toUpperCase() || "USD";
   const timeZone = settings.data?.timezone || browserTimeZone();

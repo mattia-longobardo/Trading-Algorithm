@@ -11,25 +11,26 @@ import { useStatus } from "@/lib/queries";
 import { useDisplay } from "@/lib/money";
 import { fmtDateTime } from "@/lib/format";
 
-export function EnvBadge({
-  environment,
+/** Timbro di modalità: live acceso (denaro reale) o solo allenamento. */
+export function LiveBadge({
+  liveEnabled,
   className,
 }: {
-  environment: "demo" | "real";
+  liveEnabled: boolean;
   className?: string;
 }) {
-  return environment === "real" ? (
+  return liveEnabled ? (
     <Stamp tone="solid-danger" className={className}>
-      Reale
+      Live
     </Stamp>
   ) : (
     <Stamp tone="accent" className={className}>
-      Demo
+      Allenamento
     </Stamp>
   );
 }
 
-/** Striscia strumenti: timbri di stato, indicatori safety, prossima run. */
+/** Striscia strumenti: timbri di stato, indicatori safety, prossimo ciclo. */
 export function SiteHeader({ userSlot }: { userSlot?: React.ReactNode }) {
   const { data: status, isLoading } = useStatus();
   const display = useDisplay();
@@ -43,14 +44,20 @@ export function SiteHeader({ userSlot }: { userSlot?: React.ReactNode }) {
           <Skeleton className="h-[18px] w-28" />
         ) : (
           <>
-            <EnvBadge environment={status.environment} />
-            {status.run_in_progress && (
+            <LiveBadge liveEnabled={status.arena.live_enabled} />
+            {status.arena.paused && (
+              <Stamp tone="caution">Training in pausa</Stamp>
+            )}
+            {status.market_open && (
               <Stamp tone="accent" className="gap-1.5">
                 <span className="relative flex size-1.5">
                   <span className="bg-primary absolute inline-flex h-full w-full animate-ping rounded-full opacity-60 motion-reduce:animate-none" />
                   <span className="bg-primary relative inline-flex size-1.5 rounded-full" />
                 </span>
-                Run in corso
+                {(status.open_sessions ?? [])
+                  .map((s) => (s === "europe" ? "EU" : s === "usa" ? "USA" : s))
+                  .join(" + ") || "Mercato"}{" "}
+                aperto
               </Stamp>
             )}
           </>
@@ -71,18 +78,18 @@ export function SiteHeader({ userSlot }: { userSlot?: React.ReactNode }) {
             />
           </div>
         )}
-        {status?.next_run_at && (
+        {status?.next_cycle_at && (
           <>
             <Separator orientation="vertical" className="hidden h-4 lg:block" />
             {/* Lo scheduling è in UTC, ma qui si legge nel fuso scelto: il
                 title conserva l'orario UTC per chi deve confrontarlo coi log. */}
             <span
               className="text-muted-foreground hidden font-mono text-[11px] tracking-[0.08em] uppercase lg:inline"
-              title={`${fmtDateTime(status.next_run_at, "UTC")} UTC`}
+              title={`${fmtDateTime(status.next_cycle_at, "UTC")} UTC`}
             >
-              Prossima run{" "}
+              Prossimo ciclo{" "}
               <span className="text-foreground tabular-nums normal-case">
-                {display.dateTime(status.next_run_at)}
+                {display.dateTime(status.next_cycle_at)}
               </span>{" "}
               {display.tzLabel}
             </span>
@@ -95,14 +102,14 @@ export function SiteHeader({ userSlot }: { userSlot?: React.ReactNode }) {
   );
 }
 
-/** Banner rosso persistente quando l'ambiente è REALE (§12.2). */
+/** Banner rosso persistente quando il trading LIVE è attivo. */
 export function RealEnvironmentBanner() {
   const { data: status } = useStatus();
-  if (!status || status.environment !== "real") return null;
+  if (!status || !status.arena.live_enabled) return null;
   return (
     <div className="bg-negative flex items-center justify-center gap-2 px-4 py-1.5 text-center font-mono text-xs font-medium tracking-[0.08em] text-white uppercase dark:text-[#141517]">
       <ShieldAlertIcon className="size-3.5 shrink-0" />
-      Ambiente reale — gli ordini muovono denaro vero
+      Trading live attivo — il campione muove denaro vero
     </div>
   );
 }

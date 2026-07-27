@@ -4,8 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   BrainIcon,
-  FileChartColumnIcon,
-  GaugeIcon,
+  DnaIcon,
   HistoryIcon,
   LayoutDashboardIcon,
   LineChartIcon,
@@ -26,14 +25,19 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
 
-const NAV_ITEMS = [
+const NAV_LIVE = [
   { href: "/", label: "Dashboard", icon: LayoutDashboardIcon },
   { href: "/trades", label: "Trade", icon: ReceiptTextIcon },
   { href: "/history", label: "Storico", icon: HistoryIcon },
   { href: "/benchmark", label: "Benchmark", icon: LineChartIcon },
-  { href: "/reports", label: "Report", icon: FileChartColumnIcon },
-  { href: "/risk", label: "Rischio", icon: GaugeIcon },
+] as const;
+
+const NAV_TRAINING = [
+  { href: "/training", label: "Allenamento", icon: DnaIcon },
   { href: "/knowledge", label: "Knowledge Base", icon: BrainIcon },
+] as const;
+
+const NAV_SYSTEM = [
   { href: "/settings", label: "Impostazioni", icon: SettingsIcon },
 ] as const;
 
@@ -63,33 +67,41 @@ export function AppSidebar() {
         </Link>
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel className="text-muted-foreground px-4 font-mono text-[10px] tracking-[0.18em] uppercase">
-            Registro
-          </SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu className="gap-0.5">
-              {NAV_ITEMS.map((item) => {
-                const active = isActive(item.href);
-                return (
-                  <SidebarMenuItem key={item.href}>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={active}
-                      tooltip={item.label}
-                      className="text-muted-foreground hover:text-foreground relative h-8 rounded-none px-4 text-[13px] transition-colors before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:bg-transparent data-[active=true]:bg-transparent data-[active=true]:font-medium data-[active=true]:text-primary data-[active=true]:before:bg-primary hover:bg-accent/60 group-data-[collapsible=icon]:px-2"
-                    >
-                      <Link href={item.href}>
-                        <item.icon strokeWidth={1.5} />
-                        <span>{item.label}</span>
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {(
+          [
+            ["Live", NAV_LIVE],
+            ["Allenamento", NAV_TRAINING],
+            ["Sistema", NAV_SYSTEM],
+          ] as const
+        ).map(([groupLabel, items]) => (
+          <SidebarGroup key={groupLabel}>
+            <SidebarGroupLabel className="text-muted-foreground px-4 font-mono text-[10px] tracking-[0.18em] uppercase">
+              {groupLabel}
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu className="gap-0.5">
+                {items.map((item) => {
+                  const active = isActive(item.href);
+                  return (
+                    <SidebarMenuItem key={item.href}>
+                      <SidebarMenuButton
+                        asChild
+                        isActive={active}
+                        tooltip={item.label}
+                        className="text-muted-foreground hover:text-foreground relative h-8 rounded-none px-4 text-[13px] transition-colors before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:bg-transparent data-[active=true]:bg-transparent data-[active=true]:font-medium data-[active=true]:text-primary data-[active=true]:before:bg-primary hover:bg-accent/60 group-data-[collapsible=icon]:px-2"
+                      >
+                        <Link href={item.href}>
+                          <item.icon strokeWidth={1.5} />
+                          <span>{item.label}</span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
       </SidebarContent>
       <SidebarFooter className="px-4 pb-4" />
     </Sidebar>

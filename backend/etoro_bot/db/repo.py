@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from etoro_bot.config import database_url
 from etoro_bot.db.models import (
+    Agent,
     AppSetting,
+    ArenaEvent,
     BotPosition,
     Decision,
     EquitySnapshot,
@@ -18,6 +20,9 @@ from etoro_bot.db.models import (
     RiskScoreSnapshot,
     Run,
     SettingsAudit,
+    SimEquityPoint,
+    SimPosition,
+    SimTrade,
     UserCredential,
 )
 from etoro_bot.domain import DecisionStage, ExecutionResult, ExecutionStatus
@@ -261,6 +266,201 @@ class Repository:
                 s.scalars(
                     select(SettingsAudit).order_by(SettingsAudit.changed_at.desc()).limit(limit)
                 )
+            )
+
+    # --- arena evolutiva ----------------------------------------------------
+    def create_agent(
+        self,
+        name: str,
+        generation: int,
+        dna: dict[str, Any],
+        memory: str,
+        month: str,
+        starting_capital_usd: float,
+        parent_id: uuid.UUID | None = None,
+        is_champion: bool = False,
+    ) -> uuid.UUID:
+        with self._sf.begin() as s:
+            agent = Agent(
+                name=name,
+                generation=generation,
+                dna=dna,
+                memory=memory,
+                month=month,
+                starting_capital_usd=starting_capital_usd,
+                cash_usd=starting_capital_usd,
+                parent_id=parent_id,
+                is_champion=is_champion,
+            )
+            s.add(agent)
+            s.flush()
+            return agent.id
+
+    def get_agent(self, agent_id: uuid.UUID) -> Agent | None:
+        with self._sf() as s:
+            return s.get(Agent, agent_id)
+
+    def alive_agents(self) -> list[Agent]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(Agent).where(Agent.status == "alive").order_by(Agent.name)
+                )
+            )
+
+    def all_agents(self) -> list[Agent]:
+        with self._sf() as s:
+            return list(
+                s.scalars(select(Agent).order_by(Agent.generation, Agent.name))
+            )
+
+    def champion(self) -> Agent | None:
+        with self._sf() as s:
+            return s.scalars(
+                select(Agent)
+                .where(Agent.is_champion.is_(True))
+                .order_by(Agent.born_at.desc())
+                .limit(1)
+            ).first()
+
+    def set_champion(self, agent_id: uuid.UUID) -> None:
+        with self._sf.begin() as s:
+            for row in s.scalars(select(Agent).where(Agent.is_champion.is_(True))):
+                row.is_champion = False
+            agent = s.get(Agent, agent_id)
+            if agent is not None:
+                agent.is_champion = True
+
+    def retire_agent(self, agent_id: uuid.UUID) -> None:
+        """Il vincitore del mese non muore: evolve nella generazione successiva."""
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is not None and agent.status == "alive":
+                agent.status = "evolved"
+
+    def kill_agent(self, agent_id: uuid.UUID, reason: str) -> None:
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is not None and agent.status == "alive":
+                agent.status = "dead"
+                agent.died_at = datetime.now(timezone.utc)
+                agent.death_reason = reason
+
+    def update_agent_memory(self, agent_id: uuid.UUID, memory: str) -> None:
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is not None:
+                agent.memory = memory
+
+    def open_sim_position(
+        self,
+        agent_id: uuid.UUID,
+        symbol: str,
+        instrument_id: int,
+        amount_usd: float,
+        entry_price: float,
+        open_reason: str,
+        opened_at: datetime | None = None,
+    ) -> bool:
+        """Apre una posizione simulata scalando il cash; False se cash insufficiente."""
+        if amount_usd <= 0 or entry_price <= 0:
+            return False
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is None or agent.status != "alive" or agent.cash_usd < amount_usd:
+                return False
+            agent.cash_usd = agent.cash_usd - amount_usd
+            s.add(
+                SimPosition(
+                    agent_id=agent_id,
+                    symbol=symbol,
+                    instrument_id=instrument_id,
+                    amount_usd=amount_usd,
+                    units=amount_usd / entry_price,
+                    entry_price=entry_price,
+                    open_reason=open_reason,
+                    opened_at=opened_at or datetime.now(timezone.utc),
+                )
+            )
+            return True
+
+    def close_sim_position(
+        self, position_id: uuid.UUID, close_price: float, close_reason: str
+    ) -> float | None:
+        """Chiude una posizione simulata: accredita il ricavato, registra il trade.
+
+        Ritorna il PnL realizzato, None se la posizione non esiste.
+        """
+        with self._sf.begin() as s:
+            pos = s.get(SimPosition, position_id)
+            if pos is None:
+                return None
+            proceeds = pos.units * close_price
+            pnl = proceeds - pos.amount_usd
+            agent = s.get(Agent, pos.agent_id)
+            if agent is not None:
+                agent.cash_usd = agent.cash_usd + proceeds
+            s.add(
+                SimTrade(
+                    agent_id=pos.agent_id,
+                    symbol=pos.symbol,
+                    amount_usd=pos.amount_usd,
+                    entry_price=pos.entry_price,
+                    close_price=close_price,
+                    pnl_usd=pnl,
+                    opened_at=pos.opened_at,
+                    open_reason=pos.open_reason,
+                    close_reason=close_reason,
+                )
+            )
+            s.delete(pos)
+            return pnl
+
+    def sim_positions(self, agent_id: uuid.UUID) -> list[SimPosition]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(SimPosition)
+                    .where(SimPosition.agent_id == agent_id)
+                    .order_by(SimPosition.opened_at)
+                )
+            )
+
+    def sim_trades(self, agent_id: uuid.UUID, limit: int = 200) -> list[SimTrade]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(SimTrade)
+                    .where(SimTrade.agent_id == agent_id)
+                    .order_by(SimTrade.closed_at.desc())
+                    .limit(limit)
+                )
+            )
+
+    def record_sim_equity(
+        self, agent_id: uuid.UUID, ts: datetime, equity_usd: float
+    ) -> None:
+        with self._sf.begin() as s:
+            s.add(SimEquityPoint(agent_id=agent_id, ts=ts, equity_usd=equity_usd))
+
+    def sim_equity_series(self, agent_id: uuid.UUID) -> list[SimEquityPoint]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(SimEquityPoint)
+                    .where(SimEquityPoint.agent_id == agent_id)
+                    .order_by(SimEquityPoint.ts)
+                )
+            )
+
+    def add_arena_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
+        with self._sf.begin() as s:
+            s.add(ArenaEvent(event=event, payload=payload or {}))
+
+    def arena_events(self, limit: int = 100) -> list[ArenaEvent]:
+        with self._sf() as s:
+            return list(
+                s.scalars(select(ArenaEvent).order_by(ArenaEvent.ts.desc()).limit(limit))
             )
 
     # --- credenziali per identità Authentik -------------------------------

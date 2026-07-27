@@ -1,11 +1,13 @@
-"""Test dei guardrail di §10: enforced dal backend, mai solo dalla UI."""
+"""Test dei guardrail delle impostazioni e dell'attivazione live."""
 
 import pytest
 
 from etoro_bot.services.app_settings import (
-    LIVE_CONFIRMATION,
     AppSettingsService,
     SettingsValidationError,
+    arena_state,
+    check_live_activation,
+    set_arena_state,
 )
 
 
@@ -14,12 +16,6 @@ def safety_env(monkeypatch, tmp_path):
     """Kill switch/breaker su directory pulita e nessun kill via env."""
     monkeypatch.setenv("KILL_SWITCH_DIR", str(tmp_path))
     monkeypatch.delenv("ETORO_BOT_KILL", raising=False)
-
-
-# Le chiavi eToro non vivono più nell'ambiente: sono credenziali personali
-# cifrate su Postgres. Il servizio riceve quindi lo stato "configurate sì/no"
-# dal chiamante (l'API lo ricava dall'identità SSO della richiesta).
-CONFIGURED = {"etoro_configured": True}
 
 
 @pytest.fixture()
@@ -32,67 +28,64 @@ def svc(repo):
 
 def test_effective_defaults_from_yaml(svc):
     effective = svc.get_effective()
-    assert effective["environment"] == "demo"
-    assert effective["schedule_utc"] == "08:30"
     assert effective["timezone"] == "Europe/Rome"
-    assert effective["weekdays_only"] is True
-    assert effective["risk_limits"]["max_open_positions"] == 10
-    assert effective["live_ack"] is None
+    assert effective["currency"] in ("USD", "EUR")
+    assert effective["arena"]["paused"] is False
+    assert effective["arena"]["live_enabled"] is False
 
 
 def test_db_value_overrides_yaml(svc, repo):
-    limits = svc.get_effective()["risk_limits"]
-    repo.set_setting("risk_limits", {**limits, "max_open_positions": 7})
-    assert svc.get_effective()["risk_limits"]["max_open_positions"] == 7
+    repo.set_setting("timezone", "UTC")
+    assert svc.get_effective()["timezone"] == "UTC"
 
 
-# --- guardrail ---------------------------------------------------------------
+def test_arena_state_roundtrip(repo):
+    assert arena_state(repo)["paused"] is False
+    state = set_arena_state(repo, paused=True, month="2026-07")
+    assert state["paused"] is True and state["month"] == "2026-07"
+    # update parziale: le altre chiavi restano
+    state = set_arena_state(repo, live_enabled=True)
+    assert state["paused"] is True and state["live_enabled"] is True
 
 
-def test_to_real_without_confirmation_is_422(svc):
+# --- guardrail attivazione live ------------------------------------------------
+
+
+def test_live_blocked_without_etoro_keys(repo):
     with pytest.raises(SettingsValidationError) as exc:
-        svc.update({"environment": "real"})
-    assert exc.value.status_code == 422
-    assert "confirmation: true" in str(exc.value)
-
-
-def test_to_real_allowed_without_any_prior_demo_runs(svc, repo):
-    """Il guardrail "N run demo prima di real" è stato rimosso: la scelta
-    demo/real è solo quella dell'utente, senza altre condizioni bloccanti lato
-    codice, a patto che valgano gli altri guardrail (chiavi, kill switch,
-    breaker, conferma esplicita). Nessuna run pregressa nel journal."""
-    assert repo.list_runs() == []
-    effective = svc.update(
-        {"environment": "real", "confirmation": LIVE_CONFIRMATION}, **CONFIGURED
-    )
-    assert effective["environment"] == "real"
-    assert effective["live_ack"] is not None
-    audited_keys = {entry.key for entry in repo.settings_audit()}
-    assert {"environment", "live_ack"} <= audited_keys
-
-
-def test_real_blocked_without_etoro_keys(svc, repo):
-    with pytest.raises(SettingsValidationError) as exc:
-        svc.update({"environment": "real", "confirmation": LIVE_CONFIRMATION})
+        check_live_activation(repo, etoro_configured=False)
     assert "chiavi eToro" in str(exc.value)
 
 
-def test_real_blocked_by_kill_switch(svc, repo):
+def test_live_blocked_without_champion(repo):
+    with pytest.raises(SettingsValidationError) as exc:
+        check_live_activation(repo, etoro_configured=True)
+    assert "campione" in str(exc.value)
+
+
+def test_live_blocked_by_kill_switch(repo):
+    from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
     from etoro_bot.safety.kill_switch import engage_kill_switch
 
+    agent_id = repo.create_agent("G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-06",
+                                 10_000.0)
+    repo.set_champion(agent_id)
     engage_kill_switch("test")
     with pytest.raises(SettingsValidationError) as exc:
-        svc.update(
-            {"environment": "real", "confirmation": LIVE_CONFIRMATION}, **CONFIGURED
-        )
+        check_live_activation(repo, etoro_configured=True)
     assert "kill switch" in str(exc.value)
 
 
-def test_back_to_demo_always_allowed_without_confirmation(svc, repo):
-    # Stato di partenza real (scritto direttamente, come dopo un go-live)
-    repo.set_setting("environment", "real")
-    effective = svc.update({"environment": "demo"})
-    assert effective["environment"] == "demo"
+def test_live_allowed_with_champion_and_keys(repo):
+    from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
+
+    agent_id = repo.create_agent("G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-06",
+                                 10_000.0)
+    repo.set_champion(agent_id)
+    check_live_activation(repo, etoro_configured=True)  # non solleva
+
+
+# --- scrittura -----------------------------------------------------------------
 
 
 def test_audit_recorded_on_change(svc, repo):
@@ -103,18 +96,13 @@ def test_audit_recorded_on_change(svc, repo):
     assert entries[0].source == "test"
 
 
-# --- validazione valori ------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "changes",
     [
-        {"environment": "paper"},
-        {"schedule_utc": "25:99"},
-        {"schedule_utc": "8:30"},
         {"timezone": "Marte/Olympus"},
-        {"risk_limits": {}},
-        {"weekdays_only": "sì"},
+        {"currency": "???"},
+        {"environment": "real"},   # chiave rimossa col vecchio dual-env
+        {"risk_limits": {}},       # chiave rimossa col vecchio risk gate
         {"unknown_key": 1},
     ],
 )
