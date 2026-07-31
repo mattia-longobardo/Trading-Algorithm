@@ -6,6 +6,21 @@ import json
 import re
 from typing import Any
 
+# Nessuna chiamata LLM può bloccare un ciclo di trading: senza timeout una
+# risposta appesa terrebbe fermo lo stop loss fino al timeout di sistema.
+LLM_TIMEOUT_S = 60.0
+LLM_MAX_RETRIES = 1
+
+
+def make_openai_client(api_key: str | None = None) -> Any:
+    """Client OpenAI con timeout e retry limitati (usato ovunque nel bot)."""
+    import openai
+
+    kwargs: dict[str, Any] = {"timeout": LLM_TIMEOUT_S, "max_retries": LLM_MAX_RETRIES}
+    if api_key:
+        kwargs["api_key"] = api_key
+    return openai.OpenAI(**kwargs)
+
 
 def call_llm(
     system_blocks: list[dict],
@@ -23,9 +38,7 @@ def call_llm(
     automatico di OpenAI sui prefissi ripetuti.
     """
     if client is None:
-        import openai
-
-        client = openai.OpenAI()
+        client = make_openai_client()
     messages: list[dict[str, str]] = []
     if system_blocks:
         system_text = "\n\n".join(

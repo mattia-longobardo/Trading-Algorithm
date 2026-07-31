@@ -63,7 +63,12 @@ services:
       STATE_DIR: /app/state
       # Chiavi eToro/OpenAI: nessuna variabile d'ambiente — sono credenziali
       # personali cifrate su Postgres, inserite da Impostazioni nella UI.
-      TRADING_CREDENTIALS_SECRET: ${AUTH_SECRET}
+      # Segreto di cifratura dedicato (ripiego su AUTH_SECRET per le righe già
+      # scritte: la lettura prova le derivazioni vecchie e ri-cifra da sola).
+      TRADING_CREDENTIALS_SECRET: ${TRADING_CREDENTIALS_SECRET:-${AUTH_SECRET}}
+      # Il backend accetta solo richieste che portano questo token: senza,
+      # chiunque sulla rete interna potrebbe dichiararsi "system".
+      TRADING_INTERNAL_TOKEN: ${TRADING_INTERNAL_TOKEN}
       REPORTS_DIR: /app/reports
       TZ: ${TZ}
     volumes:
@@ -99,6 +104,9 @@ services:
     environment:
       BACKEND_URL: http://trading-backend:8000
       TZ: ${TZ}
+      # Stesso token del backend: il proxy /api lo aggiunge lato server, non
+      # è mai esposto al browser (niente prefisso NEXT_PUBLIC).
+      TRADING_INTERNAL_TOKEN: ${TRADING_INTERNAL_TOKEN}
       # Login SSO via Authentik (Auth.js v5) — vedi Application "trading" in Authentik
       AUTH_SECRET: ${AUTH_SECRET}
       AUTH_TRUST_HOST: "true"
