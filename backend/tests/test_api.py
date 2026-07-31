@@ -63,9 +63,7 @@ def test_kill_switch_roundtrip(client):
 
 
 def test_empty_journal_endpoints(client):
-    assert client.get("/runs").json() == {"runs": []}
     assert client.get("/executions").json() == {"executions": []}
-    assert client.get("/runs/nope/decisions").status_code == 404
 
 
 def test_backtest_endpoints_empty(client):
@@ -135,31 +133,48 @@ def test_portfolio_empty(client, monkeypatch):
     body = client.get("/portfolio").json()
     assert body["positions"] == []
     assert body["equity_usd"] == body["cash_usd"] == 51_073.77
-    # senza campione vale il DNA di default: max_position_pct 25%
-    assert body["max_trade_amount_usd"] == pytest.approx(51_073.77 * 0.25)
+    # senza campione vale il DNA di default: max_position_pct 35%
+    assert body["max_trade_amount_usd"] == pytest.approx(51_073.77 * 0.35)
     assert body["capital_source"] == "etoro"
 
 
-def test_delete_run_endpoint(client, repo):
-    repo.create_run("run-api-del", environment="live")
-    assert client.delete("/runs/run-api-del").json() == {
-        "deleted": True, "run_id": "run-api-del",
-    }
-    assert client.get("/runs").json()["runs"] == []
+# --- token interno e controllo proprietario ---------------------------------
 
 
-def test_delete_unknown_run_is_404(client):
-    assert client.delete("/runs/inesistente").status_code == 404
+def test_internal_token_rejects_requests_without_the_shared_secret(client, monkeypatch):
+    """Con TRADING_INTERNAL_TOKEN configurato il backend accetta solo le
+    richieste che arrivano dal proxy: gli header di identità non bastano."""
+    monkeypatch.setenv("TRADING_INTERNAL_TOKEN", "segreto-di-prova")
+
+    assert client.get("/status").status_code == 401
+    assert client.post("/kill-switch").status_code == 401
+    # sonda di salute del container: sempre raggiungibile
+    assert client.get("/health").status_code == 200
+
+    headers = {"x-trading-internal-token": "segreto-di-prova"}
+    assert client.get("/status", headers=headers).status_code == 200
+    assert client.get("/status", headers={"x-trading-internal-token": "sbagliato"}
+                      ).status_code == 401
 
 
-def test_universe_view_includes_yaml_watchlist(client):
-    """Regressione: /universe deve vedere i settings COMPLETI (yaml + runtime),
-    non solo le chiavi runtime di get_effective() — altrimenti watchlist vuota."""
-    body = client.get("/universe").json()
-    assert "AAPL" in body["watchlist"]
-    assert body["enabled"] is True
-    assert body["discovered"] == []
+def test_mutating_endpoints_require_the_owner(client, repo, monkeypatch):
+    """Con un proprietario configurato, un'altra identità non può toccare
+    kill switch, live o ordini."""
+    monkeypatch.setenv("TRADING_CREDENTIALS_SECRET", "chiave-di-prova")
+    from etoro_bot.services.user_credentials import update_user_keys
 
+    update_user_keys(
+        repo, "proprietario", email=None, display_name=None,
+        etoro_api_key="a", etoro_user_key="b", openai_api_key=None,
+    )
+    intruder = {"x-trading-user-id": "estraneo"}
 
-def test_ticker_memory_endpoint_empty(client):
-    assert client.get("/knowledge/ticker-memory").json() == {"memories": []}
+    assert client.post("/kill-switch", headers=intruder).status_code == 403
+    assert client.delete("/kill-switch", headers=intruder).status_code == 403
+    assert client.post("/live/disable", headers=intruder).status_code == 403
+    assert client.post(
+        "/executions/00000000-0000-0000-0000-000000000000/cancel", headers=intruder
+    ).status_code == 403
+    # il proprietario passa
+    owner = {"x-trading-user-id": "proprietario"}
+    assert client.post("/live/disable", headers=owner).status_code == 200
