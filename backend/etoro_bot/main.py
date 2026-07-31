@@ -1,40 +1,28 @@
-"""CLI della pipeline: python -m etoro_bot.main.
+"""CLI minimale: un ciclo di allenamento dell'arena, per prova e debug.
 
-Esegue sempre una run reale nell'ambiente scelto dalle impostazioni effettive
-(demo o real): non esiste più una modalità dry-run. L'unico modo per non
-muovere denaro vero è l'ambiente demo di eToro stesso, oppure kill switch e
-circuit breaker. Exit code 1 se la riconciliazione fallisce (run fermata, fail-safe).
+`python -m etoro_bot.main` esegue bootstrap (se serve) + un ciclo di trading
+simulato per entrambi gli agenti e stampa il summary JSON. Il servizio vero
+gira dentro l'API (scheduler in api/server.py).
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import sys
 
-from etoro_bot.graph.nodes.reconcile import ReconcileError
-from etoro_bot.graph.runner import RunInProgressError, run_pipeline
 
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    from etoro_bot.api.server import _arena_deps
+    from etoro_bot.arena.engine import bootstrap_if_needed, run_training_cycle
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="eToro multi-agent swing trading bot")
-    parser.parse_args(argv)
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-
-    try:
-        summary = run_pipeline()
-    except ReconcileError as exc:
-        print(f"run fermata (riconciliazione fallita): {exc}", file=sys.stderr)
-        return 1
-    except RunInProgressError as exc:
-        print(f"run non avviata: {exc}", file=sys.stderr)
-        return 1
-
-    print(json.dumps(summary, indent=2, default=str))
+    deps = _arena_deps()
+    bootstrap_if_needed(deps)
+    summary = run_training_cycle(deps)
+    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

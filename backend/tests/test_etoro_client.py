@@ -36,11 +36,11 @@ class FakeSession:
         return item(call) if callable(item) else item
 
 
-def make_client(responses, environment="demo"):
+def make_client(responses):
     """Client con session finta, rate limiter senza sleep e sleep registrato."""
     session = FakeSession(responses)
     client = EtoroClient(
-        "test-api-key", "test-user-key", environment=environment, session=session,
+        "test-api-key", "test-user-key", session=session,
         rate_limiter=RateLimiter(sleep=lambda s: None),
     )
     sleeps: list[float] = []
@@ -274,42 +274,23 @@ def test_get_instruments_by_type_loads_the_whole_catalogue_in_one_call():
     assert [r["symbolFull"] for r in rows] == ["AAPL", "AAPL.EUR"]
 
 
-# ------------------------------------------------------------------ (g) demo/real
+# ---------------------------------------------------------- (g) niente demo
 
-def test_demo_prefix_only_on_trading_routes():
+def test_trading_routes_have_no_demo_segment():
     client, session, _ = make_client([
         PORTFOLIO_OK,
-        FakeResponse(payload=[]),  # trade history
-        FakeResponse(payload={"rates": []}),  # market data: nessun prefisso
-        FakeResponse(payload={"orderForClose": {"orderID": 77, "statusID": 1}}),
+        FakeResponse(payload={"orderId": 555, "token": "t"}),
+        FakeResponse(payload=lookup_payload(3)),
+        FakeResponse(payload={"rates": []}),  # market data
     ])
     client.get_portfolio()
-    client.get_trade_history()
-    client.get_rates([1])
-    client.close_position(position_id=12, instrument_id=1001)
-    urls = [c["url"] for c in session.calls]
-    assert urls[0].endswith("/api/v1/trading/info/demo/portfolio")
-    assert urls[1].endswith("/api/v1/trading/info/trade/demo/history")
-    assert urls[2].endswith("/api/v1/market-data/instruments/rates")
-    assert "demo" not in urls[2]
-    assert urls[3].endswith("/api/v1/trading/execution/demo/market-close-orders/positions/12")
-
-
-def test_real_environment_has_no_demo_segment():
-    client, session, _ = make_client(
-        [
-            PORTFOLIO_OK,
-            FakeResponse(payload={"orderId": 555, "token": "t"}),
-            FakeResponse(payload=lookup_payload(3)),
-        ],
-        environment="real",
-    )
-    client.get_portfolio()
     client.open_position(instrument_id=1001, amount_usd=50.0, request_id="r")
+    client.get_rates([1])
     urls = [c["url"] for c in session.calls]
     assert urls[0].endswith("/api/v1/trading/info/portfolio")
     assert urls[1].endswith("/api/v2/trading/execution/orders")
     assert urls[2].endswith("/api/v2/trading/info/orders:lookup")
+    assert urls[3].endswith("/api/v1/market-data/instruments/rates")
     assert all("demo" not in u for u in urls)
 
 
@@ -405,6 +386,3 @@ def test_rate_limiter_uses_safety_margin():
     assert waits == [60.0]
 
 
-def test_invalid_environment_rejected():
-    with pytest.raises(ValueError):
-        EtoroClient("k", "u", environment="staging")

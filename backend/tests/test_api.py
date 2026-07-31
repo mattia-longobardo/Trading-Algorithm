@@ -1,4 +1,4 @@
-"""Smoke test dell'API FastAPI (§12.3) con TestClient su Postgres effimero."""
+"""Smoke test dell'API FastAPI con TestClient su Postgres effimero."""
 
 import importlib
 
@@ -30,27 +30,27 @@ def test_health(client):
 
 def test_status_shape(client):
     body = client.get("/status").json()
-    assert body["environment"] == "demo"
     assert body["kill_switch_active"] is False
     assert body["circuit_breaker"]["tripped"] is False
-    assert body["run_in_progress"] is False
+    assert body["arena"]["paused"] is False
+    assert body["arena"]["live_enabled"] is False
+    assert body["champion"] is None
+    assert "market_open" in body
+    assert body["next_cycle_at"]
 
 
-def test_settings_get_and_guardrail(client):
+def test_settings_get_and_update(client):
     body = client.get("/settings").json()
-    assert body["environment"] == "demo"
     assert body["api_keys_configured"] is False
-    assert body["risk_limits"]["max_open_positions"] == 10
     assert body["timezone"] == "Europe/Rome"
+    assert "arena" in body
 
-    # verso real senza conferma → 422
-    resp = client.put("/settings", json={"environment": "real"})
-    assert resp.status_code == 422
-
-    # verso demo sempre permesso; un cambio finisce nell'audit
     resp = client.put("/settings", json={"timezone": "UTC"})
     assert resp.status_code == 200
     assert client.get("/settings").json()["timezone"] == "UTC"
+
+    # chiave sconosciuta → 422 (environment non esiste più)
+    assert client.put("/settings", json={"timezone": "not-a-zone"}).status_code == 422
 
     audit = client.get("/settings/audit").json()
     assert len(audit["entries"]) >= 1
@@ -63,9 +63,7 @@ def test_kill_switch_roundtrip(client):
 
 
 def test_empty_journal_endpoints(client):
-    assert client.get("/runs").json() == {"runs": []}
     assert client.get("/executions").json() == {"executions": []}
-    assert client.get("/runs/nope/decisions").status_code == 404
 
 
 def test_backtest_endpoints_empty(client):
@@ -82,13 +80,39 @@ def test_backtest_endpoints_empty(client):
     assert client.get("/backtest/monthly-returns").status_code == 200
 
 
-def test_risk_score_empty_portfolio(client):
-    body = client.get("/risk/score").json()
-    assert 1.0 <= body["score"] <= 10.0
-    assert body["band"] in {"low", "medium", "high", "extreme"}
-    assert len(body["components"]) == 8
-    history = client.get("/risk/score/history").json()
-    assert len(history["points"]) == 1  # lo snapshot appena persistito
+def test_arena_overview_empty(client):
+    body = client.get("/arena").json()
+    assert body["agents"] == []
+    assert body["champion"] is None
+    assert body["generation"] == 0
+    assert body["state"]["paused"] is False
+    assert "days_to_evaluation" in body
+
+
+def test_arena_pause_resume(client):
+    assert client.post("/arena/pause").json()["state"]["paused"] is True
+    assert client.get("/status").json()["arena"]["paused"] is True
+    assert client.post("/arena/resume").json()["state"]["paused"] is False
+    events = client.get("/arena/events").json()["events"]
+    assert {e["event"] for e in events} >= {"pause", "resume"}
+
+
+def test_arena_agent_detail_404(client):
+    assert client.get(
+        "/arena/agents/00000000-0000-0000-0000-000000000000"
+    ).status_code == 404
+
+
+def test_live_enable_requires_confirmation_and_champion(client):
+    # senza conferma → 422
+    assert client.post("/live/enable", json={}).status_code == 422
+    # con conferma ma senza chiavi/campione → 422 (guardrail backend)
+    resp = client.post("/live/enable", json={"confirmation": True})
+    assert resp.status_code == 422
+    # lo stato non è cambiato
+    assert client.get("/status").json()["arena"]["live_enabled"] is False
+    # disable è sempre permesso e idempotente
+    assert client.post("/live/disable").json()["state"]["live_enabled"] is False
 
 
 def test_knowledge_status_degraded(client, monkeypatch):
@@ -109,30 +133,48 @@ def test_portfolio_empty(client, monkeypatch):
     body = client.get("/portfolio").json()
     assert body["positions"] == []
     assert body["equity_usd"] == body["cash_usd"] == 51_073.77
-    assert body["max_trade_amount_usd"] == pytest.approx(5_107.377)
+    # senza campione vale il DNA di default: max_position_pct 35%
+    assert body["max_trade_amount_usd"] == pytest.approx(51_073.77 * 0.35)
     assert body["capital_source"] == "etoro"
 
 
-def test_delete_run_endpoint(client, repo):
-    repo.create_run("run-api-del", environment="demo")
-    assert client.delete("/runs/run-api-del").json() == {
-        "deleted": True, "run_id": "run-api-del",
-    }
-    assert client.get("/runs").json()["runs"] == []
+# --- token interno e controllo proprietario ---------------------------------
 
 
-def test_delete_unknown_run_is_404(client):
-    assert client.delete("/runs/inesistente").status_code == 404
+def test_internal_token_rejects_requests_without_the_shared_secret(client, monkeypatch):
+    """Con TRADING_INTERNAL_TOKEN configurato il backend accetta solo le
+    richieste che arrivano dal proxy: gli header di identità non bastano."""
+    monkeypatch.setenv("TRADING_INTERNAL_TOKEN", "segreto-di-prova")
+
+    assert client.get("/status").status_code == 401
+    assert client.post("/kill-switch").status_code == 401
+    # sonda di salute del container: sempre raggiungibile
+    assert client.get("/health").status_code == 200
+
+    headers = {"x-trading-internal-token": "segreto-di-prova"}
+    assert client.get("/status", headers=headers).status_code == 200
+    assert client.get("/status", headers={"x-trading-internal-token": "sbagliato"}
+                      ).status_code == 401
 
 
-def test_universe_view_includes_yaml_watchlist(client):
-    """Regressione: /universe deve vedere i settings COMPLETI (yaml + runtime),
-    non solo le chiavi runtime di get_effective() — altrimenti watchlist vuota."""
-    body = client.get("/universe").json()
-    assert "AAPL" in body["watchlist"]
-    assert body["enabled"] is True
-    assert body["discovered"] == []
+def test_mutating_endpoints_require_the_owner(client, repo, monkeypatch):
+    """Con un proprietario configurato, un'altra identità non può toccare
+    kill switch, live o ordini."""
+    monkeypatch.setenv("TRADING_CREDENTIALS_SECRET", "chiave-di-prova")
+    from etoro_bot.services.user_credentials import update_user_keys
 
+    update_user_keys(
+        repo, "proprietario", email=None, display_name=None,
+        etoro_api_key="a", etoro_user_key="b", openai_api_key=None,
+    )
+    intruder = {"x-trading-user-id": "estraneo"}
 
-def test_ticker_memory_endpoint_empty(client):
-    assert client.get("/knowledge/ticker-memory").json() == {"memories": []}
+    assert client.post("/kill-switch", headers=intruder).status_code == 403
+    assert client.delete("/kill-switch", headers=intruder).status_code == 403
+    assert client.post("/live/disable", headers=intruder).status_code == 403
+    assert client.post(
+        "/executions/00000000-0000-0000-0000-000000000000/cancel", headers=intruder
+    ).status_code == 403
+    # il proprietario passa
+    owner = {"x-trading-user-id": "proprietario"}
+    assert client.post("/live/disable", headers=owner).status_code == 200

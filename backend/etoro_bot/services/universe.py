@@ -271,7 +271,13 @@ def _news_digest(news_items: list[dict]) -> str:
     Gli item sono interleave-ati per fonte (round-robin): con molti feed il
     tetto _DIGEST_MAX_ITEMS non deve far vedere allo scout solo i primi feed
     della configurazione, ma un campione di tutte le fonti.
+
+    Ogni testo è sanificato: le news arrivano da feed di terzi e il digest
+    finisce in un prompt: il contenuto informativo resta, i marcatori di ruolo
+    e le formule di iniezione no.
     """
+    from etoro_bot.knowledge.untrusted import sanitize_untrusted
+
     by_source: dict[str, list[dict]] = {}
     for item in news_items:
         if str(item.get("text") or "").strip():
@@ -283,7 +289,7 @@ def _news_digest(news_items: list[dict]) -> str:
                 interleaved.append(by_source[source].pop(0))
     return "\n".join(
         f"[{i}] ({item.get('source', '?')}) "
-        f"{str(item.get('text') or '').strip()[:_DIGEST_ITEM_CHARS]}"
+        f"{sanitize_untrusted(str(item.get('text') or '').strip())[:_DIGEST_ITEM_CHARS]}"
         for i, item in enumerate(interleaved, start=1)
     )
 
@@ -300,13 +306,17 @@ def llm_scout(
     scout è il segnale primario, mai un requisito. Gli item malformati nella
     risposta vengono scartati in silenzio (stesso pattern degli analisti).
     """
+    from etoro_bot.knowledge.untrusted import wrap_untrusted
+
     cfg = discovery_config(settings)
     digest = _news_digest(news_items)
     if not digest:
         return []
     prompt = (
-        "Sei l'analista di SCOUTING di un bot di swing trading long-only su "
-        "stock/ETF (orizzonte giorni/settimane). Dal digest di news di oggi "
+        "Sei l'analista di SCOUTING di un bot di trading long/short su "
+        "stock/ETF (orizzonte da intraday a swing multi-settimana). Anche le "
+        "opportunità RIBASSISTE contano: un titolo interessante da shortare "
+        "merita l'universo quanto uno da comprare. Dal digest di news di oggi "
         f"proponi da 3 a {int(cfg['llm_max_proposals'])} titoli QUOTATI che "
         "meritano di entrare nell'universo di monitoraggio: opportunità "
         "interessanti del momento ma affidabili (niente micro-cap, niente "
@@ -318,14 +328,14 @@ def llm_scout(
         "Rispondi SOLO con un array JSON:\n"
         '[{"symbol": "...", "company": "...", "thesis": "<max 30 parole>", '
         '"news_refs": [<indici>], "confidence": <0..1>}]\n\n'
-        f"Digest di oggi:\n{digest}"
+        f"Digest di oggi:\n{wrap_untrusted(digest, label='feed news del giorno')}"
     )
     if llm is None:
-        from etoro_bot.graph.llm import call_llm
+        from etoro_bot.llm import call_llm
 
         llm = call_llm
     llm_cfg = (settings or {}).get("llm") or {}
-    from etoro_bot.graph.llm import extract_json
+    from etoro_bot.llm import extract_json
 
     raw = llm(
         system_blocks=[],
@@ -677,7 +687,6 @@ if __name__ == "__main__":
     cli_client = EtoroClient(
         api_key=os.environ.get("ETORO_API_KEY", ""),
         user_key=os.environ.get("ETORO_USER_KEY", ""),
-        environment=str(cli_settings.get("environment", "demo")),
     )
     result = refresh_universe(cli_client, cli_settings, fetch_all(cli_settings))
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -5,11 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "etoro-bot"
 version = "3.0.0"
-description = "Trading Bot multi-agent (LangGraph + deterministic risk layer)"
+description = "Trading Bot evolutivo: arena di agenti LLM in day trading + live col campione"
 requires-python = ">=3.12"
 dependencies = [
-    "langgraph>=0.2",
-    "langgraph-checkpoint-postgres>=2.0",
     "openai>=1.50",
     "pydantic>=2",
     "pyyaml>=6",

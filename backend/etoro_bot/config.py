@@ -8,7 +8,7 @@ dal database così che risk/safety restino usabili anche a DB giù.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,40 +27,31 @@ def _load_yaml(name: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class CircuitBreakerRules:
-    max_daily_loss_pct: float = 2.0
-    max_consecutive_losses: int = 4
-    cooloff_hours: int = 24
+    """Soglie del circuit breaker: sopravvivenza, non prudenza.
+
+    max_daily_loss_pct è un drawdown da bancarotta (un quarto dell'equity in un
+    giorno), non un limite di rischio quotidiano; max_consecutive_losses = 0
+    disattiva il blocco per perdite in serie (era un freno di aggressività, non
+    di sopravvivenza); cooloff_hours è breve perché il bot deve tornare a
+    operare, non restare fermo un giorno intero.
+    """
+
+    max_daily_loss_pct: float = 25.0
+    max_consecutive_losses: int = 0
+    cooloff_hours: int = 1
 
 
-@dataclass(frozen=True)
-class RiskRules:
-    max_position_pct_equity: float = 5.0
-    max_total_exposure_pct: float = 60.0
-    max_sector_exposure_pct: float = 20.0
-    max_open_positions: int = 10
-    max_orders_per_run: int = 3
-    max_orders_per_day: int = 5
-    min_cash_buffer_pct: float = 20.0
-    allowed_asset_types: tuple[str, ...] = ("stock", "etf")
-    circuit_breaker: CircuitBreakerRules = field(default_factory=CircuitBreakerRules)
-
-
-def load_risk_rules() -> RiskRules:
+def load_breaker_rules() -> CircuitBreakerRules:
+    """Regole del circuit breaker (unico freno di sopravvivenza su file)."""
     raw = _load_yaml("risk_rules.yaml")
-    cb = raw.pop("circuit_breaker", {}) or {}
-    known = {k: v for k, v in raw.items() if k in RiskRules.__dataclass_fields__}
-    if "allowed_asset_types" in known:
-        known["allowed_asset_types"] = tuple(known["allowed_asset_types"])
-    return RiskRules(**known, circuit_breaker=CircuitBreakerRules(**cb))
+    cb = raw.get("circuit_breaker", {}) or {}
+    known = {k: v for k, v in cb.items() if k in CircuitBreakerRules.__dataclass_fields__}
+    return CircuitBreakerRules(**known)
 
 
 def load_settings() -> dict[str, Any]:
     """Default da config/settings.yaml (senza sovrapposizioni DB)."""
     return _load_yaml("settings.yaml")
-
-
-def load_risk_score_config() -> dict[str, Any]:
-    return _load_yaml("risk_score.yaml")
 
 
 def database_url() -> str:

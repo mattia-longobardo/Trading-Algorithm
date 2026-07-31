@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -10,14 +11,18 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from etoro_bot.config import database_url
 from etoro_bot.db.models import (
+    Agent,
     AppSetting,
+    ArenaEvent,
     BotPosition,
     Decision,
     EquitySnapshot,
     Execution,
-    RiskScoreSnapshot,
     Run,
     SettingsAudit,
+    SimEquityPoint,
+    SimPosition,
+    SimTrade,
     UserCredential,
 )
 from etoro_bot.domain import DecisionStage, ExecutionResult, ExecutionStatus
@@ -113,10 +118,6 @@ class Repository:
                 s.scalars(select(Execution).order_by(Execution.created_at.desc()).limit(limit))
             )
 
-    def get_execution(self, execution_id: uuid.UUID) -> Execution | None:
-        with self._sf() as s:
-            return s.get(Execution, execution_id)
-
     def cancel_pending_execution(self, execution_id: uuid.UUID) -> bool:
         with self._sf.begin() as s:
             row = s.get(Execution, execution_id)
@@ -174,7 +175,11 @@ class Repository:
         realized_pnl_usd: float | None,
         close_reason: str,
         closed_at: datetime | None = None,
+        close_order_id: int | None = None,
+        pnl_settled: bool = True,
     ) -> None:
+        """Registra la chiusura. `pnl_settled=False` marca il PnL come STIMA:
+        realized_pnl_usd verrà riscritto dal broker in una passata successiva."""
         with self._sf.begin() as s:
             pos = s.get(BotPosition, etoro_position_id)
             if pos is not None and pos.closed_at is None:
@@ -182,6 +187,43 @@ class Repository:
                 pos.close_price = close_price
                 pos.realized_pnl_usd = realized_pnl_usd
                 pos.close_reason = close_reason
+                pos.close_order_id = close_order_id
+                pos.pnl_settled = pnl_settled
+
+    def unsettled_closed_positions(self) -> list[BotPosition]:
+        """Chiusure il cui PnL reale non è ancora arrivato dal broker."""
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(BotPosition)
+                    .where(
+                        BotPosition.closed_at.is_not(None),
+                        BotPosition.pnl_settled.is_(False),
+                    )
+                    .order_by(BotPosition.closed_at)
+                )
+            )
+
+    def settle_position_pnl(
+        self,
+        etoro_position_id: int,
+        realized_pnl_usd: float,
+        close_price: float | None = None,
+    ) -> None:
+        """Sostituisce la stima col PnL reale del broker e chiude la partita."""
+        with self._sf.begin() as s:
+            pos = s.get(BotPosition, etoro_position_id)
+            if pos is None:
+                return
+            pos.realized_pnl_usd = realized_pnl_usd
+            if close_price is not None:
+                pos.close_price = close_price
+            pos.pnl_settled = True
+
+    def known_position_ids(self) -> set[int]:
+        """Tutti i positionId mai registrati dal bot (aperti o chiusi)."""
+        with self._sf() as s:
+            return {int(pid) for pid in s.scalars(select(BotPosition.etoro_position_id))}
 
     def open_positions(self) -> list[BotPosition]:
         with self._sf() as s:
@@ -208,7 +250,7 @@ class Repository:
                 )
             )
 
-    # --- equity & risk score ------------------------------------------------
+    # --- equity -------------------------------------------------------------
     def record_equity_snapshot(
         self, day: date, equity_usd: float, cash_usd: float, exposure_usd: float
     ) -> None:
@@ -222,14 +264,6 @@ class Repository:
     def equity_series(self) -> list[EquitySnapshot]:
         with self._sf() as s:
             return list(s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.date)))
-
-    def record_risk_score(self, day: date, score: float, breakdown: dict[str, Any]) -> None:
-        with self._sf.begin() as s:
-            s.merge(RiskScoreSnapshot(date=day, score=score, breakdown=breakdown))
-
-    def risk_score_history(self) -> list[RiskScoreSnapshot]:
-        with self._sf() as s:
-            return list(s.scalars(select(RiskScoreSnapshot).order_by(RiskScoreSnapshot.date)))
 
     # --- app settings (§10) -------------------------------------------------
     def get_setting(self, key: str) -> Any | None:
@@ -261,6 +295,201 @@ class Repository:
                 s.scalars(
                     select(SettingsAudit).order_by(SettingsAudit.changed_at.desc()).limit(limit)
                 )
+            )
+
+    # --- arena evolutiva ----------------------------------------------------
+    def create_agent(
+        self,
+        name: str,
+        generation: int,
+        dna: dict[str, Any],
+        memory: str,
+        month: str,
+        starting_capital_usd: float,
+        parent_id: uuid.UUID | None = None,
+        is_champion: bool = False,
+    ) -> uuid.UUID:
+        with self._sf.begin() as s:
+            agent = Agent(
+                name=name,
+                generation=generation,
+                dna=dna,
+                memory=memory,
+                month=month,
+                starting_capital_usd=starting_capital_usd,
+                cash_usd=starting_capital_usd,
+                parent_id=parent_id,
+                is_champion=is_champion,
+            )
+            s.add(agent)
+            s.flush()
+            return agent.id
+
+    def get_agent(self, agent_id: uuid.UUID) -> Agent | None:
+        with self._sf() as s:
+            return s.get(Agent, agent_id)
+
+    def alive_agents(self) -> list[Agent]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(Agent).where(Agent.status == "alive").order_by(Agent.name)
+                )
+            )
+
+    def all_agents(self) -> list[Agent]:
+        with self._sf() as s:
+            return list(
+                s.scalars(select(Agent).order_by(Agent.generation, Agent.name))
+            )
+
+    def champion(self) -> Agent | None:
+        with self._sf() as s:
+            return s.scalars(
+                select(Agent)
+                .where(Agent.is_champion.is_(True))
+                .order_by(Agent.born_at.desc())
+                .limit(1)
+            ).first()
+
+    def set_champion(self, agent_id: uuid.UUID) -> None:
+        with self._sf.begin() as s:
+            for row in s.scalars(select(Agent).where(Agent.is_champion.is_(True))):
+                row.is_champion = False
+            agent = s.get(Agent, agent_id)
+            if agent is not None:
+                agent.is_champion = True
+
+    def retire_agent(self, agent_id: uuid.UUID) -> None:
+        """Il vincitore del mese non muore: evolve nella generazione successiva."""
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is not None and agent.status == "alive":
+                agent.status = "evolved"
+
+    def kill_agent(self, agent_id: uuid.UUID, reason: str) -> None:
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is not None and agent.status == "alive":
+                agent.status = "dead"
+                agent.died_at = datetime.now(timezone.utc)
+                agent.death_reason = reason
+
+    def update_agent_memory(self, agent_id: uuid.UUID, memory: str) -> None:
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is not None:
+                agent.memory = memory
+
+    def open_sim_position(
+        self,
+        agent_id: uuid.UUID,
+        symbol: str,
+        instrument_id: int,
+        amount_usd: float,
+        entry_price: float,
+        open_reason: str,
+        opened_at: datetime | None = None,
+    ) -> bool:
+        """Apre una posizione simulata scalando il cash; False se cash insufficiente."""
+        if amount_usd <= 0 or entry_price <= 0:
+            return False
+        with self._sf.begin() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is None or agent.status != "alive" or agent.cash_usd < amount_usd:
+                return False
+            agent.cash_usd = agent.cash_usd - amount_usd
+            s.add(
+                SimPosition(
+                    agent_id=agent_id,
+                    symbol=symbol,
+                    instrument_id=instrument_id,
+                    amount_usd=amount_usd,
+                    units=amount_usd / entry_price,
+                    entry_price=entry_price,
+                    open_reason=open_reason,
+                    opened_at=opened_at or datetime.now(timezone.utc),
+                )
+            )
+            return True
+
+    def close_sim_position(
+        self, position_id: uuid.UUID, close_price: float, close_reason: str
+    ) -> float | None:
+        """Chiude una posizione simulata: accredita il ricavato, registra il trade.
+
+        Ritorna il PnL realizzato, None se la posizione non esiste.
+        """
+        with self._sf.begin() as s:
+            pos = s.get(SimPosition, position_id)
+            if pos is None:
+                return None
+            proceeds = pos.units * close_price
+            pnl = proceeds - pos.amount_usd
+            agent = s.get(Agent, pos.agent_id)
+            if agent is not None:
+                agent.cash_usd = agent.cash_usd + proceeds
+            s.add(
+                SimTrade(
+                    agent_id=pos.agent_id,
+                    symbol=pos.symbol,
+                    amount_usd=pos.amount_usd,
+                    entry_price=pos.entry_price,
+                    close_price=close_price,
+                    pnl_usd=pnl,
+                    opened_at=pos.opened_at,
+                    open_reason=pos.open_reason,
+                    close_reason=close_reason,
+                )
+            )
+            s.delete(pos)
+            return pnl
+
+    def sim_positions(self, agent_id: uuid.UUID) -> list[SimPosition]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(SimPosition)
+                    .where(SimPosition.agent_id == agent_id)
+                    .order_by(SimPosition.opened_at)
+                )
+            )
+
+    def sim_trades(self, agent_id: uuid.UUID, limit: int = 200) -> list[SimTrade]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(SimTrade)
+                    .where(SimTrade.agent_id == agent_id)
+                    .order_by(SimTrade.closed_at.desc())
+                    .limit(limit)
+                )
+            )
+
+    def record_sim_equity(
+        self, agent_id: uuid.UUID, ts: datetime, equity_usd: float
+    ) -> None:
+        with self._sf.begin() as s:
+            s.add(SimEquityPoint(agent_id=agent_id, ts=ts, equity_usd=equity_usd))
+
+    def sim_equity_series(self, agent_id: uuid.UUID) -> list[SimEquityPoint]:
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(SimEquityPoint)
+                    .where(SimEquityPoint.agent_id == agent_id)
+                    .order_by(SimEquityPoint.ts)
+                )
+            )
+
+    def add_arena_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
+        with self._sf.begin() as s:
+            s.add(ArenaEvent(event=event, payload=payload or {}))
+
+    def arena_events(self, limit: int = 100) -> list[ArenaEvent]:
+        with self._sf() as s:
+            return list(
+                s.scalars(select(ArenaEvent).order_by(ArenaEvent.ts.desc()).limit(limit))
             )
 
     # --- credenziali per identità Authentik -------------------------------

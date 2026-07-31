@@ -25,12 +25,19 @@ ma NON sostituiscono mai i limiti del risk manager deterministico.
 
 ## Gestione del rischio e del regime
 
+- In regime risk-on (indici sopra la 200 giorni, volatilità contenuta)
+  l'obiettivo è essere investiti: la selettività si esprime scegliendo gli
+  1-3 setup migliori del giorno, non evitando tutto. Un setup valido con
+  dubbi residui si apre con conviction ridotta: la size scala di conseguenza
+  e i limiti deterministici del risk manager proteggono il portafoglio.
 - In regime risk-off (indici sotto la 200 giorni, VIX elevato, rotazione
   difensiva) ridurre la size delle nuove posizioni e alzare l'asticella della
   conviction richiesta; nel dubbio, restare liquidi.
-- La liquidità è una posizione: nessun obbligo di essere sempre investiti.
+- La liquidità è una posizione legittima nei regimi ostili, non l'esito di
+  default quando il trend è favorevole.
 - Diversificare per settore: mai concentrare le nuove aperture su un solo tema.
 - Chiudere una posizione quando la tesi d'ingresso è invalidata, non quando
   fa male: il prezzo di carico è irrilevante per la decisione.
-- Preferire poche operazioni di qualità a molte operazioni mediocri: l'inattività
-  è spesso la scelta migliore di uno swing trader prudente.
+- Preferire poche operazioni di qualità a molte operazioni mediocri — ma un
+  dubbio marginale su un setup di qualità si esprime riducendo la size,
+  non rinunciando all'operazione.

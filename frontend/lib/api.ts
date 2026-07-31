@@ -11,8 +11,14 @@ export class ApiError extends Error {
 }
 
 async function handle<T>(res: Response): Promise<T> {
-  if (res.status === 401 && typeof window !== "undefined") {
-    // Sessione scaduta: il proxy autentica di nuovo via Authentik.
+  if (
+    res.status === 401 &&
+    typeof window !== "undefined" &&
+    window.location.pathname !== "/login"
+  ) {
+    // Sessione scaduta: il proxy autentica di nuovo via Authentik. Mai dalla
+    // pagina di login stessa: reindirizzare lì di nuovo ricarica la pagina in
+    // loop e impedisce di premere il bottone SSO.
     window.location.href = `/login?callbackUrl=${encodeURIComponent(window.location.pathname)}`;
   }
   if (!res.ok) {
