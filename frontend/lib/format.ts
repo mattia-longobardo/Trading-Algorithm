@@ -92,17 +92,6 @@ export function fmtDateTime(iso: string | null | undefined, timeZone?: string): 
   });
 }
 
-/** Solo l'ora (HH:MM) nel fuso indicato — per «prossima run» in barra. */
-export function fmtTime(iso: string | null | undefined, timeZone?: string): string {
-  const d = parse(iso);
-  if (!d) return ND;
-  return d.toLocaleTimeString("it-IT", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone,
-  });
-}
-
 export function fmtDate(iso: string | null | undefined, timeZone?: string): string {
   const d = parse(iso);
   if (!d) return iso || ND;

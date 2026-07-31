@@ -31,25 +31,6 @@ export interface Status {
   equity_change_day_pct: number | null;
 }
 
-export interface RunSummary {
-  cycle?: string;
-  opened?: number;
-  closed?: number;
-  blocked?: number;
-  errors?: string[];
-}
-
-export interface Run {
-  run_id: string;
-  started_at: string;
-  environment: string;
-  summary: RunSummary | null;
-}
-
-export interface RunsResponse {
-  runs: Run[];
-}
-
 export type ExecutionStatus = "filled" | "failed" | "skipped" | "rejected";
 
 export interface Execution {

@@ -108,15 +108,6 @@ def _build_items(body: str, source: str, manual: list[str] | None) -> tuple[list
     return items, document_tickers
 
 
-def ingest_text(text: str, kb: KnowledgeBase | None = None) -> IngestOutcome:
-    """Ingerisce testo incollato; i ticker sono dedotti dal contenuto."""
-    kb = kb or KnowledgeBase()
-    header_tickers, body = parse_document(text)
-    kb.ensure_collections()
-    items, detected = _build_items(body, "manual", header_tickers)
-    return IngestOutcome(chunks=kb.add_news(items), tickers=detected)
-
-
 def ingest_upload(
     filename: str, content: bytes, kb: KnowledgeBase | None = None
 ) -> IngestOutcome:
