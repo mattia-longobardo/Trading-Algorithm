@@ -57,7 +57,7 @@ import {
   usePortfolio,
   useStatus,
 } from "@/lib/queries";
-import { pnlClass } from "@/lib/format";
+import { fmtNum, fmtPct, pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
 import type { DateRangeValue } from "@/lib/types";
 
@@ -187,12 +187,11 @@ function MetricsStrip({ range }: { range: DateRangeValue }) {
   if (isLoading) return <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">{Array.from({ length: 8 }, (_, i) => <CardSkeleton key={i} className="h-28 w-full" />)}</div>;
   if (error || !data) return <ErrorState error={error} title="Indicatori non disponibili" />;
   const m = data.metrics;
-  const n = (v: number | null, digits = 2) => v == null ? "n/d" : v.toFixed(digits);
   return <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-    <MetricCard label="Sharpe ratio" value={n(m.sharpe)} hint={`${data.n_days} giorni nel campione`} />
-    <MetricCard label="Max drawdown" value={m.max_drawdown_pct == null ? "n/d" : `${m.max_drawdown_pct.toFixed(2)}%`} hint="Perdita dal picco massimo" tone="text-negative" />
-    <MetricCard label="Win rate" value={m.win_rate_pct == null ? "n/d" : `${m.win_rate_pct.toFixed(1)}%`} hint={`${data.n_closed_trades} trade chiusi`} />
-    <MetricCard label="Profit factor" value={n(m.profit_factor)} hint="Profitti lordi / perdite lorde" />
+    <MetricCard label="Sharpe ratio" value={fmtNum(m.sharpe)} hint={`${data.n_days} giorni nel campione`} />
+    <MetricCard label="Max drawdown" value={fmtPct(m.max_drawdown_pct)} hint="Perdita dal picco massimo" tone="text-negative" />
+    <MetricCard label="Win rate" value={fmtPct(m.win_rate_pct, 1)} hint={`${data.n_closed_trades} trade chiusi`} />
+    <MetricCard label="Profit factor" value={fmtNum(m.profit_factor)} hint="Profitti lordi / perdite lorde" />
     <MetricCard label="Miglior trade" value={d.moneySigned(m.max_win_usd)} hint="Massimo guadagno realizzato" tone={pnlClass(m.max_win_usd)} />
     <MetricCard label="Peggior trade" value={d.moneySigned(m.max_loss_usd)} hint="Massima perdita realizzata" tone={pnlClass(m.max_loss_usd)} />
     <MetricCard label="Std guadagni" value={d.money(m.std_win_usd)} hint="Dispersione dei trade positivi" />

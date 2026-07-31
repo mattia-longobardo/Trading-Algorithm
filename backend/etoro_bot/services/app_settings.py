@@ -19,8 +19,6 @@ from etoro_bot.db.repo import Repository
 from etoro_bot.safety import CircuitBreaker, kill_switch_active
 from etoro_bot.services.fx import SUPPORTED_CURRENCIES
 
-LIVE_CONFIRMATION = True
-
 # Default hardcoded: ultimo fallback se anche settings.yaml manca.
 _DEFAULTS: dict[str, Any] = {
     "timezone": "Europe/Rome",

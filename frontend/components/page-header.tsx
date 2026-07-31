@@ -32,14 +32,3 @@ export function PageHeader({
     </header>
   );
 }
-
-/** Eyebrow standalone per sezioni interne alle pagine. */
-export function SectionLabel({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return <p className={cn("eyebrow", className)}>{children}</p>;
-}

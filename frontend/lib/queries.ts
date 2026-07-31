@@ -24,7 +24,6 @@ import type {
   KnowledgeStatus,
   MonthlyReturns,
   Portfolio,
-  RunsResponse,
   SettingsUpdate,
   Status,
   TradesResponse,
@@ -43,14 +42,6 @@ export function useStatus() {
   return useQuery<Status>({
     queryKey: ["status"],
     queryFn: () => api.get<Status>("/status"),
-    refetchInterval: POLL_MS,
-  });
-}
-
-export function useRuns(limit = 50) {
-  return useQuery<RunsResponse>({
-    queryKey: ["runs", limit],
-    queryFn: () => api.get<RunsResponse>(`/runs?limit=${limit}`),
     refetchInterval: POLL_MS,
   });
 }
