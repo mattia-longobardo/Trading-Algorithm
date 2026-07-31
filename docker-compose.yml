@@ -66,6 +66,9 @@ services:
       # Segreto di cifratura dedicato (ripiego su AUTH_SECRET per le righe già
       # scritte: la lettura prova le derivazioni vecchie e ri-cifra da sola).
       TRADING_CREDENTIALS_SECRET: ${TRADING_CREDENTIALS_SECRET:-${AUTH_SECRET}}
+      # Solo come ripiego di lettura per le righe cifrate prima del segreto
+      # dedicato: alla prima lettura vengono ri-cifrate con quello nuovo.
+      AUTH_SECRET: ${AUTH_SECRET}
       # Il backend accetta solo richieste che portano questo token: senza,
       # chiunque sulla rete interna potrebbe dichiararsi "system".
       TRADING_INTERNAL_TOKEN: ${TRADING_INTERNAL_TOKEN}
