@@ -1,29 +1,39 @@
 """API REST del bot (FastAPI) — contratto §12.3.
 
-Nessuna autenticazione: pensata per girare solo dietro la rete interna del
-compose / localhost. Le chiavi API non sono mai esposte (solo configured sì/no).
+L'identità arriva dagli header del proxy Next (`X-Trading-User-Id`), che a sua
+volta la ricava dalla sessione Authentik. Quegli header sono fidati solo se la
+richiesta viene davvero dal proxy: con `TRADING_INTERNAL_TOKEN` configurato,
+ogni richiesta (tranne /health) deve portare `X-Trading-Internal-Token` uguale
+al segreto, altrimenti è 401 — senza, chiunque raggiunga la rete interna
+potrebbe dichiararsi "system" e comandare denaro reale. Variabile assente =
+comportamento storico (sviluppo in locale).
+
+Le chiavi API non sono mai esposte (solo configured sì/no).
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from etoro_bot.config import load_breaker_rules, load_settings
 from etoro_bot.db.repo import Repository, make_engine, make_session_factory
 from etoro_bot.safety.circuit_breaker import CircuitBreaker
+from etoro_bot.safety.circuit_breaker import get_breaker as shared_breaker
 from etoro_bot.safety.kill_switch import (
     engage_kill_switch,
     kill_switch_active,
@@ -49,6 +59,26 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Trading Bot API", version="3.0.0", lifespan=_lifespan)
 
+INTERNAL_TOKEN_HEADER = "x-trading-internal-token"
+# Rotte raggiungibili senza token: solo la sonda di salute del container.
+_TOKEN_EXEMPT_PATHS = frozenset({"/health"})
+
+
+def internal_token() -> str:
+    return os.environ.get("TRADING_INTERNAL_TOKEN", "").strip()
+
+
+@app.middleware("http")
+async def _require_internal_token(request, call_next):
+    """Il backend accetta solo richieste che arrivano dal proxy autenticato."""
+    expected = internal_token()
+    if expected and request.url.path not in _TOKEN_EXEMPT_PATHS:
+        provided = request.headers.get(INTERNAL_TOKEN_HEADER, "")
+        if not hmac.compare_digest(provided, expected):
+            log.warning("richiesta rifiutata senza token interno: %s", request.url.path)
+            return JSONResponse({"detail": "Non autorizzato"}, status_code=401)
+    return await call_next(request)
+
 
 @dataclass(frozen=True)
 class UserIdentity:
@@ -67,6 +97,20 @@ def current_user(
         email=x_trading_user_email,
         name=x_trading_user_name,
     )
+
+
+def require_owner(identity: UserIdentity, action: str) -> None:
+    """Solo il proprietario delle chiavi eToro (o i job di sistema) può mutare.
+
+    Finché nessuno ha configurato le chiavi non c'è un proprietario e il
+    controllo è un no-op: è il primo utente che si registra a diventarlo.
+    """
+    try:
+        owner = get_repo().owner_user_id()
+    except Exception:
+        owner = None
+    if owner and identity.user_id not in ("system", owner):
+        raise HTTPException(403, f"solo il proprietario può {action}")
 
 
 def _user_keys(identity: UserIdentity):
@@ -181,7 +225,8 @@ def get_repo() -> Repository:
 
 
 def get_breaker() -> CircuitBreaker:
-    return CircuitBreaker(load_breaker_rules())
+    """Istanza condivisa: lo stato del breaker è uno solo per tutto il processo."""
+    return shared_breaker(load_breaker_rules())
 
 
 def get_settings_service():
@@ -258,63 +303,7 @@ def status() -> dict[str, Any]:
     }
 
 
-# --- runs / executions ------------------------------------------------------
-
-
-@app.get("/runs")
-def list_runs(limit: int = Query(50, le=500)) -> dict[str, Any]:
-    runs = get_repo().list_runs(limit=limit)
-    return {
-        "runs": [
-            {
-                "run_id": r.run_id,
-                "started_at": r.started_at.isoformat(),
-                "environment": r.environment,
-                "summary": r.summary_json,
-            }
-            for r in runs
-        ]
-    }
-
-
-@app.delete("/runs/{run_id}")
-def delete_run(run_id: str) -> dict[str, Any]:
-    """Cancella una run e tutto ciò che ne discende (decisioni, esecuzioni,
-    posizioni registrate). Serve a ripulire le prove: il journal deve
-    contenere solo run vere."""
-    if not get_repo().delete_run(run_id):
-        raise HTTPException(404, "run non trovata")
-    return {"deleted": True, "run_id": run_id}
-
-
-@app.get("/runs/{run_id}/decisions")
-def run_decisions(run_id: str) -> dict[str, Any]:
-    run = get_repo().get_run(run_id)
-    if run is None:
-        raise HTTPException(404, "run non trovata")
-    decisions = get_repo().get_run_decisions(run_id)
-    return {
-        "run_id": run_id,
-        # Anagrafica della run insieme alle decisioni: la pagina di dettaglio
-        # deve poter dire quando è partita e come è finita senza rileggere
-        # l'elenco (che tiene solo le ultime N run).
-        "run": {
-            "run_id": run.run_id,
-            "started_at": run.started_at.isoformat(),
-            "environment": run.environment,
-            "summary": run.summary_json,
-        },
-        "decisions": [
-            {
-                "id": str(d.id),
-                "symbol": d.symbol,
-                "stage": d.stage,
-                "payload": d.payload,
-                "created_at": d.created_at.isoformat(),
-            }
-            for d in decisions
-        ],
-    }
+# --- executions -------------------------------------------------------------
 
 
 @app.get("/executions")
@@ -348,11 +337,21 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     positions = repo.open_positions()
 
     rates: dict[int, float] = {}
+    directions: dict[int, str] = {}
     try:
         client = _make_client(identity)
         account_portfolio = client.get_portfolio()
         if account_portfolio.get("credit") is None:
             raise ValueError("portfolio eToro senza campo credit")
+        for row in account_portfolio.get("positions") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("positionId"))
+            except (TypeError, ValueError):
+                continue
+            is_buy = row.get("isBuy")
+            directions[pid] = "long" if is_buy is None or is_buy else "short"
         cash_usd = max(float(account_portfolio["credit"]), 0.0)
         raw = client.get_rates([p.instrument_id for p in positions]) if positions else {}
         for iid, r in raw.items():
@@ -370,17 +369,22 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     out = []
     for p in positions:
         cur = rates.get(p.instrument_id)
+        direction = directions.get(p.etoro_position_id, "long")
         pnl = None
         pnl_pct = None
         if cur is not None and p.entry_price > 0:
-            pnl = p.amount_usd * (cur - p.entry_price) / p.entry_price
-            pnl_pct = (cur - p.entry_price) / p.entry_price * 100
+            change = (cur - p.entry_price) / p.entry_price
+            if direction == "short":
+                change = -change
+            pnl = p.amount_usd * change
+            pnl_pct = change * 100
         out.append(
             {
                 "etoro_position_id": p.etoro_position_id,
                 "symbol": p.symbol,
                 "instrument_id": p.instrument_id,
                 "amount_usd": p.amount_usd,
+                "direction": direction,
                 "entry_price": p.entry_price,
                 "current_price": cur,
                 "unrealized_pnl_usd": pnl,
@@ -556,11 +560,9 @@ def _system_llm():
         keys = get_user_keys(repo, repo.owner_user_id() or "system")
         if not keys.openai_api_key:
             return None
-        import openai
+        from etoro_bot.llm import call_llm, make_openai_client
 
-        from etoro_bot.llm import call_llm
-
-        return partial(call_llm, client=openai.OpenAI(api_key=keys.openai_api_key))
+        return partial(call_llm, client=make_openai_client(keys.openai_api_key))
     except Exception:
         log.warning("LLM di sistema non disponibile", exc_info=True)
         return None
@@ -721,68 +723,6 @@ async def knowledge_ingest(
     }
 
 
-@app.get("/knowledge/ticker-memory")
-def knowledge_ticker_memory(
-    ticker: str | None = Query(None), identity: UserIdentity = Depends(current_user)
-) -> dict[str, Any]:
-    from etoro_bot.knowledge.ticker_memory import all_memories, load_memory
-
-    if ticker:
-        memory = load_memory(ticker)
-        return {"memories": [memory] if memory else []}
-    return {"memories": all_memories()}
-
-
-# --- universo dinamico ------------------------------------------------------
-
-
-@app.get("/universe")
-def universe_view(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
-    from etoro_bot.services.universe import discovery_config, load_discovery_state
-
-    settings = _full_settings()
-    state = load_discovery_state(settings)
-    return {
-        "watchlist": [str(s).upper() for s in settings.get("watchlist") or []],
-        "discovered": (state or {}).get("tickers") or [],
-        "generated_at": (state or {}).get("generated_at"),
-        "enabled": bool(discovery_config(settings)["enabled"]),
-    }
-
-
-@app.post("/universe/refresh", status_code=202)
-def universe_refresh(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
-    """Discovery on-demand (fetch news + screening); gira in background.
-
-    Usa le chiavi eToro del proprietario: se un proprietario esiste, solo lui
-    (o il job di sistema) può forzare la discovery. Come per il resto
-    dell'API, l'identità arriva dagli header del proxy interno.
-    """
-    try:
-        owner = get_repo().owner_user_id()
-    except Exception:
-        owner = None
-    if owner and identity.user_id not in ("system", owner):
-        raise HTTPException(403, "solo il proprietario può forzare la discovery")
-
-    def _job() -> None:
-        try:
-            from etoro_bot.knowledge.fetch_news import fetch_all
-            from etoro_bot.services.universe import refresh_universe
-
-            client = _system_etoro_client()
-            if client is None:
-                log.warning("refresh universo saltato: chiavi eToro non configurate")
-                return
-            settings = _full_settings()
-            refresh_universe(client, settings, fetch_all(settings), llm=_system_llm())
-        except Exception:
-            log.exception("refresh universo fallito")
-
-    threading.Thread(target=_job, daemon=True).start()
-    return {"status": "accepted"}
-
-
 # --- trade operativi e storico --------------------------------------------
 
 
@@ -858,6 +798,7 @@ def close_trade(
 ) -> dict[str, Any]:
     if body.confirmation != "CHIUDI":
         raise HTTPException(422, "Conferma non valida: digita CHIUDI")
+    require_owner(identity, "chiudere una posizione reale")
     repo = get_repo()
     position = repo.get_open_position(position_id)
     if position is None:
@@ -867,7 +808,10 @@ def close_trade(
     close_price = None
     pnl = None
     try:
-        for item in client.get_trade_history():
+        # finestra corta: la chiusura è di adesso, e senza minDate l'API
+        # pagina l'intero storico del conto
+        recent = datetime.now(timezone.utc) - timedelta(days=3)
+        for item in client.get_trade_history(min_date=recent):
             if int(item.get("positionId") or -1) == position_id:
                 close_price = item.get("closeRate")
                 pnl = item.get("netProfit")
@@ -879,12 +823,18 @@ def close_trade(
         close_price=float(close_price) if close_price is not None else None,
         realized_pnl_usd=float(pnl) if pnl is not None else None,
         close_reason="manual_close",
+        # PnL non ancora pubblicato dal broker: la posizione resta in attesa e
+        # la liquidazione del prossimo ciclo live la completerà
+        pnl_settled=pnl is not None,
     )
     return {"status": "closed", "position_id": position_id}
 
 
 @app.post("/executions/{execution_id}/cancel")
-def cancel_execution(execution_id: uuid.UUID) -> dict[str, Any]:
+def cancel_execution(
+    execution_id: uuid.UUID, identity: UserIdentity = Depends(current_user)
+) -> dict[str, Any]:
+    require_owner(identity, "annullare un ordine")
     if not get_repo().cancel_pending_execution(execution_id):
         raise HTTPException(409, "L'ordine non è annullabile: è già terminale o inesistente")
     return {"status": "cancelled", "execution_id": str(execution_id)}
@@ -1053,6 +1003,7 @@ def put_settings(
 ) -> dict[str, Any]:
     from etoro_bot.services.app_settings import SettingsValidationError
 
+    require_owner(identity, "cambiare le impostazioni")
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
         return get_settings_service().update(
@@ -1202,18 +1153,20 @@ def arena_events(limit: int = Query(100, le=500)) -> dict[str, Any]:
 
 
 @app.post("/arena/pause")
-def arena_pause() -> dict[str, Any]:
+def arena_pause(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     from etoro_bot.services.app_settings import set_arena_state
 
+    require_owner(identity, "mettere in pausa l'arena")
     state = set_arena_state(get_repo(), paused=True)
     get_repo().add_arena_event("pause", {})
     return {"state": state}
 
 
 @app.post("/arena/resume")
-def arena_resume() -> dict[str, Any]:
+def arena_resume(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     from etoro_bot.services.app_settings import set_arena_state
 
+    require_owner(identity, "riavviare l'arena")
     state = set_arena_state(get_repo(), paused=False)
     get_repo().add_arena_event("resume", {})
     return {"state": state}
@@ -1222,12 +1175,7 @@ def arena_resume() -> dict[str, Any]:
 @app.post("/arena/cycle", status_code=202)
 def arena_trigger_cycle(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     """Forza un ciclo di allenamento adesso (per test/monitoraggio manuale)."""
-    try:
-        owner = get_repo().owner_user_id()
-    except Exception:
-        owner = None
-    if owner and identity.user_id not in ("system", owner):
-        raise HTTPException(403, "solo il proprietario può forzare un ciclo")
+    require_owner(identity, "forzare un ciclo")
 
     def _job() -> None:
         try:
@@ -1251,6 +1199,7 @@ def live_enable(
     body: LiveBody, identity: UserIdentity = Depends(current_user)
 ) -> dict[str, Any]:
     """Accende il trading live (denaro REALE) col DNA del campione."""
+    require_owner(identity, "attivare il trading live")
     from etoro_bot.services.app_settings import (
         SettingsValidationError,
         check_live_activation,
@@ -1274,6 +1223,7 @@ def live_enable(
 def live_disable(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     from etoro_bot.services.app_settings import set_arena_state
 
+    require_owner(identity, "spegnere il trading live")
     state = set_arena_state(get_repo(), live_enabled=False)
     get_repo().add_arena_event("live_off", {"by": identity.user_id})
     return {"state": state}
@@ -1283,12 +1233,19 @@ def live_disable(identity: UserIdentity = Depends(current_user)) -> dict[str, An
 
 
 @app.post("/kill-switch")
-def activate_kill_switch() -> dict[str, Any]:
+def activate_kill_switch(
+    identity: UserIdentity = Depends(current_user),
+) -> dict[str, Any]:
+    require_owner(identity, "attivare il kill switch")
     engage_kill_switch("api")
     return {"kill_switch_active": True}
 
 
 @app.delete("/kill-switch")
-def deactivate_kill_switch() -> dict[str, Any]:
+def deactivate_kill_switch(
+    identity: UserIdentity = Depends(current_user),
+) -> dict[str, Any]:
+    """Rilascia il freno d'emergenza: mutazione critica, solo il proprietario."""
+    require_owner(identity, "disattivare il kill switch")
     release_kill_switch()
     return {"kill_switch_active": kill_switch_active()}
