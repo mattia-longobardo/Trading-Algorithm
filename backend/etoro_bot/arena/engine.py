@@ -1,9 +1,15 @@
-"""Motore dell'arena: cicli di day trading simulato dei due agenti rivali.
+"""Motore dell'arena: cicli di trading simulato dei due agenti rivali.
 
-Ogni ciclo: stop loss / take profit automatici (codice), poi una decisione LLM
-per agente, applicata al conto simulato con i vincoli del DNA. A fine giornata
-tutte le posizioni vengono chiuse (day trading) e l'agente riflette: la sua
-memoria evolve, ancorata al credo di sopravvivenza.
+Ogni ciclo: chiusure automatiche previste dal DNA (se l'agente le ha attivate),
+poi una decisione LLM per agente applicata al conto simulato. Long e short sono
+entrambi ammessi; l'orizzonte (intraday o swing su più sedute) è un gene, non
+una regola di sistema. L'unico freno di sistema è il pavimento di bancarotta:
+sotto quella soglia l'agente muore all'istante.
+
+Il libro mastro simulato (repo) conosce solo posizioni "lunghe": lo short è
+rappresentato marcando la open_reason e specchiando il prezzo in valutazione e
+chiusura (uno short entrato a E e chiuso a P vale come un long chiuso a 2E-P,
+stesso PnL units*(E-P)).
 """
 
 from __future__ import annotations
@@ -15,13 +21,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna, mutate, survival_creed
-from etoro_bot.arena.trader import build_prompt, decide, enforce
+from etoro_bot.arena.dna import (
+    DEFAULT_DNA,
+    DEFAULT_SURVIVAL_FLOOR_PCT,
+    clamp_dna,
+    mutate,
+    survival_creed,
+)
+from etoro_bot.arena.trader import LONG, SHORT, build_prompt, decide, enforce
 from etoro_bot.db.repo import Repository
 
 logger = logging.getLogger(__name__)
 
-MEMORY_MAX_CHARS = 4000  # la memoria non cresce senza limite
+MEMORY_MAX_CHARS = 8000  # la memoria non cresce senza limite
+
+SHORT_TAG = "[SHORT]"  # marcatore di direzione dentro open_reason
 
 
 @dataclass
@@ -44,6 +58,60 @@ def arena_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return settings.get("arena") or {}
 
 
+def survival_floor_pct(settings: dict[str, Any]) -> float:
+    """% del capitale iniziale sotto cui l'agente è in bancarotta (0 = disattivo)."""
+    try:
+        return float(
+            arena_settings(settings).get("survival_floor_pct", DEFAULT_SURVIVAL_FLOOR_PCT)
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_SURVIVAL_FLOOR_PCT
+
+
+# ------------------------------------------------------------------ direzione
+
+
+def position_direction(pos) -> str:
+    """Direzione di una posizione simulata, letta dal marcatore in open_reason."""
+    return (
+        SHORT
+        if str(getattr(pos, "open_reason", "") or "").startswith(SHORT_TAG)
+        else LONG
+    )
+
+
+def tag_reason(direction: str, reason: str) -> str:
+    """Marca la open_reason con la direzione (il DB non ha una colonna dedicata)."""
+    return f"{SHORT_TAG} {reason}".strip() if direction == SHORT else reason
+
+
+def effective_price(pos, price: float) -> float:
+    """Prezzo da passare al libro mastro long-only per un PnL corretto.
+
+    Long: il prezzo stesso. Short: il prezzo specchiato sull'ingresso
+    (2*entry - price), azzerato se il titolo raddoppia (collaterale bruciato).
+    """
+    if position_direction(pos) != SHORT:
+        return float(price)
+    return max(2.0 * float(pos.entry_price) - float(price), 0.0)
+
+
+def position_value(pos, price: float | None) -> float:
+    """Valore mark-to-market della posizione; senza prezzo vale il suo costo."""
+    if not price:
+        return float(pos.amount_usd)
+    return float(pos.units) * effective_price(pos, float(price))
+
+
+def position_change_pct(pos, price: float) -> float:
+    """Variazione % a favore dell'agente (positiva = in profitto), per direzione."""
+    entry = float(pos.entry_price or 0.0)
+    if not entry:
+        return 0.0
+    change = (float(price) / entry - 1.0) * 100.0
+    return -change if position_direction(pos) == SHORT else change
+
+
 def starting_capital_usd(deps: ArenaDeps) -> float:
     """Budget iniziale in USD dal budget in EUR configurato (default 10.000 €)."""
     eur = float(arena_settings(deps.settings).get("starting_capital_eur", 10_000))
@@ -58,16 +126,19 @@ def starting_capital_usd(deps: ArenaDeps) -> float:
 
 
 def agent_equity(agent, positions, prices: dict[str, float]) -> float:
-    """Cash + mark-to-market; senza prezzo la posizione vale il suo costo."""
+    """Cash + mark-to-market (long e short); senza prezzo la posizione vale il costo."""
     equity = float(agent.cash_usd)
     for pos in positions:
-        price = prices.get(pos.symbol)
-        equity += pos.units * price if price else pos.amount_usd
+        equity += position_value(pos, prices.get(pos.symbol))
     return round(equity, 2)
 
 
 def auto_risk_closes(dna: dict, positions, prices: dict[str, float]) -> list[tuple]:
-    """(posizione, motivo) per ogni stop loss / take profit scattato."""
+    """(posizione, motivo) per ogni stop loss / take profit scattato.
+
+    Stop e take profit sono geni: a 0 sono DISATTIVATI e l'agente resta l'unico
+    a decidere quando uscire.
+    """
     closes: list[tuple] = []
     sl = float(dna["stop_loss_pct"])
     tp = float(dna["take_profit_pct"])
@@ -75,16 +146,21 @@ def auto_risk_closes(dna: dict, positions, prices: dict[str, float]) -> list[tup
         price = prices.get(pos.symbol)
         if not price or not pos.entry_price:
             continue
-        change_pct = (price / pos.entry_price - 1.0) * 100.0
-        if change_pct <= -sl:
+        change_pct = position_change_pct(pos, price)
+        if sl > 0 and change_pct <= -sl:
             closes.append((pos, f"stop loss automatico ({change_pct:+.2f}%)"))
-        elif change_pct >= tp:
+        elif tp > 0 and change_pct >= tp:
             closes.append((pos, f"take profit automatico ({change_pct:+.2f}%)"))
     return closes
 
 
 def bootstrap_if_needed(deps: ArenaDeps, now: datetime | None = None) -> bool:
-    """Prima generazione: due agenti dallo stesso DNA, uno mutato. True se creata."""
+    """Crea una nuova generazione quando non c'è nessun agente vivo. True se creata.
+
+    Primo avvio: generazione 1 dal DNA di default. Se invece i predecessori sono
+    morti in corso di mese (bancarotta), la vita riparte dalla generazione
+    successiva col DNA del campione — la selezione non si azzera.
+    """
     if deps.repo.alive_agents():
         return False
     from etoro_bot.arena.evolution import current_month
@@ -92,12 +168,21 @@ def bootstrap_if_needed(deps: ArenaDeps, now: datetime | None = None) -> bool:
     now = now or _utcnow()
     month = current_month(now)
     capital = starting_capital_usd(deps)
-    creed = survival_creed()
-    base = clamp_dna(DEFAULT_DNA)
+    creed = survival_creed(survival_floor_pct(deps.settings))
+    previous = deps.repo.all_agents()
+    champion = deps.repo.champion()
+    generation = (max(a.generation for a in previous) + 1) if previous else 1
+    source = champion.dna if champion is not None else (previous[-1].dna if previous else None)
+    base = clamp_dna(source or DEFAULT_DNA)
+    parent_id = champion.id if champion is not None else None
     rng = random.Random()
-    a_id = deps.repo.create_agent("G1-Alfa", 1, base, creed, month, capital)
+    a_id = deps.repo.create_agent(
+        f"G{generation}-Alfa", generation, base, creed, month, capital, parent_id=parent_id
+    )
     b_id = deps.repo.create_agent(
-        "G1-Beta", 1, mutate(base, rng, llm=deps.llm, model=deps.model), creed, month, capital
+        f"G{generation}-Beta", generation,
+        mutate(base, rng, llm=deps.llm, model=deps.model, max_tokens=deps.max_tokens),
+        creed, month, capital, parent_id=parent_id,
     )
     arena = deps.repo.get_setting("arena") or {}
     deps.repo.set_setting(
@@ -107,10 +192,12 @@ def bootstrap_if_needed(deps: ArenaDeps, now: datetime | None = None) -> bool:
     )
     deps.repo.add_arena_event(
         "birth",
-        {"generation": 1, "agents": [str(a_id), str(b_id)],
+        {"generation": generation, "agents": [str(a_id), str(b_id)],
          "starting_capital_usd": capital},
     )
-    logger.info("arena: creata generazione 1 (capitale %.2f USD a testa)", capital)
+    logger.info(
+        "arena: creata generazione %d (capitale %.2f USD a testa)", generation, capital
+    )
     return True
 
 
@@ -120,25 +207,39 @@ def _positions_view(
     lines = []
     for pos in positions:
         price = prices.get(pos.symbol)
-        pnl = (pos.units * price - pos.amount_usd) if price else 0.0
+        pnl = position_value(pos, price) - float(pos.amount_usd) if price else 0.0
         held = trading_days_held(pos.opened_at, now)
+        direction = position_direction(pos).upper()
         lines.append(
-            f"- {pos.symbol}: {pos.amount_usd:.2f} USD @ {pos.entry_price:.2f} "
-            f"(PnL {pnl:+.2f} USD, giorno {held}/{max_days})"
+            f"- {pos.symbol} {direction}: {pos.amount_usd:.2f} USD @ "
+            f"{pos.entry_price:.2f} (PnL {pnl:+.2f} USD, giorno {held}/{max_days})"
         )
     return lines
 
 
-def _survival_context(agent, equity: float, now: datetime) -> str:
+def _survival_context(agent, equity: float, now: datetime, floor_pct: float) -> str:
     from calendar import monthrange
 
     days_left = monthrange(now.year, now.month)[1] - now.day
     pnl = equity - agent.starting_capital_usd
-    return (
+    floor_usd = float(agent.starting_capital_usd) * floor_pct / 100.0
+    lines = [
         f"Mese in corso: PnL {pnl:+.2f} USD su {agent.starting_capital_usd:.2f} "
-        f"iniziali. Giorni alla valutazione: {days_left}. "
-        f"{'SEI IN ZONA MORTE: a questo ritmo a fine mese verrai eliminato.' if pnl <= 0 else 'Sei in profitto: difendilo e accrescilo.'}"
-    )
+        f"iniziali. Giorni alla valutazione: {days_left}.",
+        (
+            "SEI IN ZONA MORTE: a questo ritmo a fine mese verrai eliminato. "
+            "Cambia passo: più operazioni, entrambe le direzioni, idee nuove."
+            if pnl <= 0
+            else "Sei in profitto: difendilo e accrescilo, non rallentare."
+        ),
+    ]
+    if floor_pct > 0:
+        lines.append(
+            f"Pavimento di bancarotta: {floor_usd:.2f} USD di equity "
+            f"({floor_pct:.0f}% dell'iniziale). Se lo sfondi muori all'istante: "
+            "è l'unico limite che non puoi negoziare, tutto il resto è tuo."
+        )
+    return " ".join(lines)
 
 
 # Un solo ciclo di allenamento alla volta (scheduler + trigger manuale).
@@ -191,7 +292,9 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
     dna = clamp_dna(agent.dna)
     positions = deps.repo.sim_positions(agent.id)
     for pos, reason in auto_risk_closes(dna, positions, prices):
-        deps.repo.close_sim_position(pos.id, prices[pos.symbol], reason)
+        deps.repo.close_sim_position(
+            pos.id, effective_price(pos, prices[pos.symbol]), reason
+        )
 
     if deps.llm is not None:
         agent = deps.repo.get_agent(agent.id)  # cash aggiornato dopo SL/TP
@@ -201,7 +304,9 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             name=agent.name,
             dna=dna,
             memory=agent.memory,
-            survival=_survival_context(agent, equity, now),
+            survival=_survival_context(
+                agent, equity, now, survival_floor_pct(deps.settings)
+            ),
             cash=agent.cash_usd,
             equity=equity,
             positions_view=_positions_view(
@@ -218,24 +323,63 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             equity=equity,
             held_symbols={p.symbol for p in positions},
             market=market,
+            held_count=len(positions),
         )
-        by_symbol = {p.symbol: p for p in positions}
         for close in closes:
-            pos = by_symbol.get(close["symbol"])
             price = prices.get(close["symbol"])
-            if pos is not None and price:
-                deps.repo.close_sim_position(pos.id, price, close["reason"] or "chiusura")
+            if not price:
+                continue
+            wanted = close.get("direction")
+            for pos in positions:
+                if pos.symbol != close["symbol"]:
+                    continue
+                if wanted and position_direction(pos) != wanted:
+                    continue
+                deps.repo.close_sim_position(
+                    pos.id, effective_price(pos, price), close["reason"] or "chiusura"
+                )
         for order in opens:
             price = prices.get(order["symbol"])
             if price:
                 deps.repo.open_sim_position(
                     agent.id, order["symbol"], order["instrument_id"],
-                    order["amount_usd"], price, order["reason"], opened_at=now,
+                    order["amount_usd"], price,
+                    tag_reason(order["direction"], order["reason"]),
+                    opened_at=now,
                 )
 
     agent = deps.repo.get_agent(agent.id)
     equity = agent_equity(agent, deps.repo.sim_positions(agent.id), prices)
     deps.repo.record_sim_equity(agent.id, now, equity)
+    _enforce_survival_floor(deps, agent, equity, prices)
+
+
+def _enforce_survival_floor(deps: ArenaDeps, agent, equity: float, prices) -> None:
+    """Bancarotta: sotto il pavimento l'agente muore subito, senza aspettare il mese.
+
+    È l'unico veto di sistema rimasto sul conto simulato: non modera le
+    decisioni, decide solo quando la partita è finita.
+    """
+    floor_pct = survival_floor_pct(deps.settings)
+    if floor_pct <= 0:
+        return
+    floor = float(agent.starting_capital_usd) * floor_pct / 100.0
+    if equity > floor:
+        return
+    for pos in deps.repo.sim_positions(agent.id):
+        price = prices.get(pos.symbol)
+        deps.repo.close_sim_position(
+            pos.id,
+            effective_price(pos, price) if price else float(pos.entry_price),
+            "liquidazione per bancarotta",
+        )
+    reason = (
+        f"bancarotta: equity {equity:.2f} USD sotto il pavimento di "
+        f"sopravvivenza ({floor:.2f} USD)"
+    )
+    deps.repo.kill_agent(agent.id, reason[:128])
+    deps.repo.add_arena_event("death", {"agent": agent.name, "detail": reason})
+    logger.warning("arena: %s eliminato per bancarotta (%.2f USD)", agent.name, equity)
 
 
 def trading_days_held(opened_at: datetime, now: datetime) -> int:
@@ -258,9 +402,9 @@ def close_market_positions(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Fine sessione: chiude le posizioni simulate di QUEL mercato che hanno
-    raggiunto il holding massimo del DNA (max_holding_days=1 = day trading;
-    fino a 5 = swing). Le altre passano la notte, protette da SL/TP alla
-    riapertura."""
+    raggiunto il holding massimo del DNA (max_holding_days=1 = intraday puro,
+    fino a 60 = swing lungo). Le altre passano la notte: lo swing è
+    autorizzato, non è un'anomalia da correggere."""
     from etoro_bot.arena.market import build_snapshot, market_of_symbol
 
     now = now or _utcnow()
@@ -277,9 +421,10 @@ def close_market_positions(
             held = trading_days_held(pos.opened_at, now)
             if held < max_days:
                 continue
-            price = prices.get(pos.symbol) or pos.entry_price
+            price = prices.get(pos.symbol)
             deps.repo.close_sim_position(
-                pos.id, price,
+                pos.id,
+                effective_price(pos, price) if price else float(pos.entry_price),
                 f"fine sessione {market_name}: holding massimo raggiunto "
                 f"({held}/{max_days} giorni)",
             )
@@ -320,7 +465,7 @@ def run_eod(
 
 def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
     """La memoria dell'agente evolve: credo di sopravvivenza + diario compresso."""
-    creed = survival_creed()
+    creed = survival_creed(survival_floor_pct(deps.settings))
     diary = agent.memory
     if diary.startswith(creed):
         diary = diary[len(creed):].strip()
@@ -338,7 +483,11 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
             f"Trade recenti:\n{trades_text}\n\n"
             f"Diario attuale:\n{diary or '(vuoto)'}\n\n"
             "Aggiorna il diario: massimo 10 punti, conserva solo le lezioni che "
-            "aumentano il profitto di domani. Rispondi solo col diario."
+            "aumentano il profitto di domani. Sei libero di rinnegare qualunque "
+            "regola che ti sei dato: puoi cambiare direzione preferita (long o "
+            "short), orizzonte (intraday o swing), frequenza e size, e riscrivere "
+            "la tua strategia da capo. Se hai operato poco, annota che l'inerzia "
+            "ti sta uccidendo. Rispondi solo col diario."
         )
         try:
             lesson = deps.llm(

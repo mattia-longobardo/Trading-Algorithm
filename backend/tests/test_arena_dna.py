@@ -18,10 +18,11 @@ def test_default_dna_is_within_bounds():
         assert lo <= DEFAULT_DNA[key] <= hi
 
 
-def test_holding_days_gene_defaults_to_day_trading():
+def test_holding_days_gene_allows_swing():
+    """L'orizzonte è materiale genetico: da 1 seduta (intraday) fino a 60."""
     lo, hi, is_int = NUMERIC_BOUNDS["max_holding_days"]
-    assert (lo, hi, is_int) == (1, 5, True)
-    assert DEFAULT_DNA["max_holding_days"] == 1  # baseline: day trading puro
+    assert (lo, hi, is_int) == (1, 60, True)
+    assert DEFAULT_DNA["max_holding_days"] == 10  # baseline: swing autorizzato
 
 
 def test_clamp_fills_missing_and_bounds_extremes():

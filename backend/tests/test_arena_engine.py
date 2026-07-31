@@ -145,19 +145,29 @@ def test_training_cycle_closes_on_stop_loss_before_llm(repo):
 
 
 def test_session_close_plus_eod_reflection(repo):
+    """Alla campanella si liquida SOLO ciò che ha esaurito il proprio holding.
+
+    Col DNA di default (max_holding_days=10) lo swing è autorizzato: la
+    posizione aperta oggi passa la notte, quella vecchia di settimane no.
+    """
+    from datetime import timedelta
+
     def reflecting_llm(system_blocks, user_prompt, model, max_tokens):
         return "Lezione: non inseguire i breakout pomeridiani."
 
     deps = make_deps(repo, llm=reflecting_llm)
     bootstrap_if_needed(deps, now=NOW)
     agent = repo.alive_agents()[0]
-    # DNA di default: max_holding_days=1 → scade alla chiusura della sua sessione
-    repo.open_sim_position(agent.id, "MSFT", 2, 400.0, 400.0, "intraday",
+    repo.open_sim_position(agent.id, "MSFT", 2, 400.0, 400.0, "swing fresco",
                            opened_at=NOW)
+    repo.open_sim_position(agent.id, "AAPL", 1, 200.0, 200.0, "swing scaduto",
+                           opened_at=NOW - timedelta(days=25))
     close_market_positions(deps, "usa", market=MARKET, now=NOW)
     run_eod(deps, market=MARKET, now=NOW)
-    assert repo.sim_positions(agent.id) == []
+    # il fresco resta aperto oltre la campanella, lo scaduto è stato liquidato
+    assert [p.symbol for p in repo.sim_positions(agent.id)] == ["MSFT"]
     trades = repo.sim_trades(agent.id)
+    assert [t.symbol for t in trades] == ["AAPL"]
     assert any("holding massimo" in t.close_reason for t in trades)
     refreshed = repo.get_agent(agent.id)
     assert survival_creed() in refreshed.memory
