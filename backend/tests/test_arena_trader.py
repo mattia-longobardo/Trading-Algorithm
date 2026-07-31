@@ -31,6 +31,8 @@ class FakePosition:
 def test_parse_actions_normalizes_and_discards_garbage():
     raw = json.dumps([
         {"action": "open", "symbol": "aapl", "size_pct": 20, "reason": "breakout"},
+        {"action": "open", "symbol": "nvda", "direction": "ribasso", "size_pct": 5,
+         "reason": "rottura"},
         {"action": "close", "symbol": "MSFT", "reason": "target raggiunto"},
         {"action": "hold"},
         {"action": "open"},                      # senza simbolo: scartata
@@ -39,8 +41,14 @@ def test_parse_actions_normalizes_and_discards_garbage():
     ])
     actions = parse_actions(raw)
     assert actions == [
-        {"action": "open", "symbol": "AAPL", "size_pct": 20.0, "reason": "breakout"},
-        {"action": "close", "symbol": "MSFT", "size_pct": None,
+        # senza direzione esplicita un'apertura è long
+        {"action": "open", "symbol": "AAPL", "direction": "long", "size_pct": 20.0,
+         "reason": "breakout"},
+        # sinonimi accettati: "ribasso" è uno short
+        {"action": "open", "symbol": "NVDA", "direction": "short", "size_pct": 5.0,
+         "reason": "rottura"},
+        # sulle chiusure la direzione è un filtro opzionale: None = tutte
+        {"action": "close", "symbol": "MSFT", "direction": None, "size_pct": None,
          "reason": "target raggiunto"},
     ]
 
@@ -63,18 +71,37 @@ def test_enforce_respects_max_orders_per_cycle_and_position_cap():
     assert opens[1]["amount_usd"] == 1_000.0
 
 
-def test_enforce_skips_held_unknown_and_respects_max_positions():
+def test_enforce_allows_pyramiding_skips_unknown_and_respects_max_positions():
+    """Il piramidaggio è autorizzato di default: un simbolo già in mano non è
+    un motivo per scartare l'ordine. Restano i limiti contabili (simbolo fuori
+    mercato, tetto di posizioni simultanee)."""
     actions = [
-        {"action": "open", "symbol": "AAPL", "size_pct": 10.0, "reason": "già in mano"},
+        {"action": "open", "symbol": "AAPL", "size_pct": 10.0, "reason": "raddoppio"},
         {"action": "open", "symbol": "ZZZZ", "size_pct": 10.0, "reason": "sconosciuto"},
-        {"action": "open", "symbol": "MSFT", "size_pct": 10.0, "reason": "ok"},
+        {"action": "open", "symbol": "MSFT", "size_pct": 10.0, "reason": "troppe"},
         {"action": "open", "symbol": "NVDA", "size_pct": 10.0, "reason": "troppe"},
     ]
     opens, _ = enforce(
         actions, dna=DNA, cash=10_000.0, equity=10_000.0,
         held_symbols={"AAPL", "SPY"}, market=MARKET,
     )
-    # AAPL già aperta, ZZZZ non in mercato, MSFT ok, NVDA supererebbe max_positions=3
+    # AAPL passa (piramidaggio), ZZZZ non è in mercato, MSFT/NVDA sforerebbero
+    # max_positions=3 (2 già aperte + 1 pianificata)
+    assert [o["symbol"] for o in opens] == ["AAPL"]
+
+
+def test_enforce_skips_held_symbol_when_agent_forbids_pyramiding():
+    """allow_pyramiding=False è un gene: se l'agente se lo vieta, torna il
+    vecchio comportamento (una sola posizione per simbolo)."""
+    dna = clamp_dna({**DNA, "allow_pyramiding": False, "max_positions": 5})
+    actions = [
+        {"action": "open", "symbol": "AAPL", "size_pct": 10.0, "reason": "già in mano"},
+        {"action": "open", "symbol": "MSFT", "size_pct": 10.0, "reason": "ok"},
+    ]
+    opens, _ = enforce(
+        actions, dna=dna, cash=10_000.0, equity=10_000.0,
+        held_symbols={"AAPL", "SPY"}, market=MARKET,
+    )
     assert [o["symbol"] for o in opens] == ["MSFT"]
 
 

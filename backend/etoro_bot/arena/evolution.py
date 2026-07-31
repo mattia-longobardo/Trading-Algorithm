@@ -17,7 +17,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna, mutate, survival_creed
-from etoro_bot.arena.engine import ArenaDeps, agent_equity, starting_capital_usd
+from etoro_bot.arena.engine import (
+    ArenaDeps,
+    agent_equity,
+    effective_price,
+    starting_capital_usd,
+    survival_floor_pct,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +56,10 @@ def maybe_evolve(deps: ArenaDeps, now: datetime | None = None) -> dict[str, Any]
             logger.warning("evoluzione: prezzi di liquidazione non disponibili: %s", exc)
     for agent in alive:
         for pos in deps.repo.sim_positions(agent.id):
+            price = prices.get(pos.symbol)
             deps.repo.close_sim_position(
-                pos.id, prices.get(pos.symbol) or pos.entry_price,
+                pos.id,
+                effective_price(pos, price) if price else float(pos.entry_price),
                 "liquidazione di fine mese (valutazione)",
             )
 
@@ -75,6 +83,7 @@ def maybe_evolve(deps: ArenaDeps, now: datetime | None = None) -> dict[str, Any]
         )
         deps.repo.kill_agent(agent.id, reason)
 
+    floor_pct = survival_floor_pct(deps.settings)
     next_gen = max(a.generation for a in alive) + 1
     capital = starting_capital_usd(deps)
     rng = random.Random()
@@ -83,13 +92,13 @@ def maybe_evolve(deps: ArenaDeps, now: datetime | None = None) -> dict[str, Any]
         deps.repo.retire_agent(survivor.id)  # "evolved": vive nella prossima generazione
         deps.repo.set_champion(survivor.id)
         base_dna = clamp_dna(survivor.dna)
-        base_memory = survivor.memory or survival_creed()
+        base_memory = survivor.memory or survival_creed(floor_pct)
         parent_id = survivor.id
         clone_dna = base_dna
     else:
         champion = deps.repo.champion()
         base_dna = clamp_dna(champion.dna) if champion else clamp_dna(DEFAULT_DNA)
-        base_memory = survival_creed()
+        base_memory = survival_creed(floor_pct)
         parent_id = champion.id if champion else None
         clone_dna = base_dna
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from etoro_bot.arena.market import (
     build_snapshot,
     market_of_symbol,
@@ -28,6 +30,16 @@ def test_metrics_from_closes():
     assert m["day_pct"] == 1.0          # 103.02 vs ultima chiusura 102
     assert m["week_pct"] is not None
     assert m["sma20_dist_pct"] is not None
+
+
+@pytest.fixture(autouse=True)
+def _no_candles_cache():
+    """Le candele sono in cache per un'ora: i test devono restare indipendenti."""
+    from etoro_bot.arena.market import clear_candles_cache
+
+    clear_candles_cache()
+    yield
+    clear_candles_cache()
 
 
 class FakeMarketClient:

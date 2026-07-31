@@ -28,7 +28,12 @@ DEFAULT_SESSIONS: dict[str, tuple[str, str]] = {
     "europe": ("07:00", "15:30"),
     "usa": ("13:30", "20:00"),
 }
-DEFAULT_CYCLE_MINUTES = 60
+# Cadenza di default dei cicli di decisione (era 5'): un quarto d'ora dà agli
+# agenti abbastanza prezzo nuovo da giudicare e triplica il margine sui rate
+# limit del broker. Ogni ciclo è un'occasione di operare per ogni agente: la
+# frequenza qui e max_orders_per_cycle nel DNA sono i due moltiplicatori del
+# volume di trade.
+DEFAULT_CYCLE_MINUTES = 15
 
 
 def _parse_hhmm(value: Any, fallback: str) -> time:
@@ -109,6 +114,23 @@ def cycle_slot(settings: dict[str, Any], now: datetime) -> int | None:
         or DEFAULT_CYCLE_MINUTES
     elapsed = (now.hour * 60 + now.minute) - (open_t.hour * 60 + open_t.minute)
     return elapsed // minutes
+
+
+def cycle_slot_key(settings: dict[str, Any], now: datetime) -> str:
+    """Chiave stabile del ciclo logico: "YYYYMMDD#<indice>".
+
+    È la base delle chiavi di idempotenza degli ordini: un ciclo che va in
+    crash e viene ritentato dentro la stessa finestra deve produrre gli
+    STESSI request id, cosa che l'orologio al minuto non garantiva. A mercati
+    chiusi (EOD, trigger manuali) l'indice si calcola comunque, a partire da
+    mezzanotte UTC, con la stessa cadenza.
+    """
+    slot = cycle_slot(settings, now)
+    if slot is not None:
+        return f"{now:%Y%m%d}#{slot}"
+    minutes = int(arena_cfg(settings).get("cycle_minutes", DEFAULT_CYCLE_MINUTES)) \
+        or DEFAULT_CYCLE_MINUTES
+    return f"{now:%Y%m%d}#off{(now.hour * 60 + now.minute) // minutes}"
 
 
 def next_cycle_at(settings: dict[str, Any], now: datetime | None = None) -> str:

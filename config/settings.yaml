@@ -5,15 +5,18 @@ currency: USD              # valuta di visualizzazione; i dati restano in USD
 risk_free_rate_pct: 5.0    # T-bill 3M, usato da Sharpe/Sortino
 benchmark_symbol: SPY
 
-# Arena evolutiva: due agenti LLM rivali in day trading simulato; a fine mese
-# sopravvive solo chi è in profitto e davanti al rivale. Lo stato runtime
-# (mese, pausa, live) vive in app_settings sotto la chiave "arena".
+# Arena evolutiva: due agenti LLM rivali in trading simulato (long e short,
+# intraday o swing, secondo il loro DNA); a fine mese sopravvive solo chi è in
+# profitto e davanti al rivale. Lo stato runtime (mese, pausa, live) vive in
+# app_settings sotto la chiave "arena".
 arena:
   starting_capital_eur: 10000   # budget mensile di ogni agente (convertito in USD)
-  cycle_minutes: 60             # un ciclo di decisioni ogni ora di borsa
+  cycle_minutes: 15             # un ciclo di decisioni ogni 15 minuti di borsa (era 5)
   max_symbols: 80               # titoli mostrati ai trader per ciclo
-  # Sessioni di borsa (UTC, orari estivi). Ogni sessione ha il suo EOD:
-  # day trading per mercato, niente posizioni oltre la campanella.
+  survival_floor_pct: 25        # equity sotto il 25% dell'iniziale = bancarotta immediata (0 = disattivo)
+  # Sessioni di borsa (UTC, orari estivi). A fine sessione si chiudono solo le
+  # posizioni che hanno esaurito il max_holding_days del DNA: lo swing resta
+  # aperto oltre la campanella.
   markets:
     europe:
       open_utc: "07:00"         # 09:00 CEST (Milano/Xetra/Parigi/Amsterdam/Londra)

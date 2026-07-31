@@ -27,13 +27,22 @@ def _load_yaml(name: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class CircuitBreakerRules:
-    max_daily_loss_pct: float = 2.0
-    max_consecutive_losses: int = 4
-    cooloff_hours: int = 24
+    """Soglie del circuit breaker: sopravvivenza, non prudenza.
+
+    max_daily_loss_pct è un drawdown da bancarotta (un quarto dell'equity in un
+    giorno), non un limite di rischio quotidiano; max_consecutive_losses = 0
+    disattiva il blocco per perdite in serie (era un freno di aggressività, non
+    di sopravvivenza); cooloff_hours è breve perché il bot deve tornare a
+    operare, non restare fermo un giorno intero.
+    """
+
+    max_daily_loss_pct: float = 25.0
+    max_consecutive_losses: int = 0
+    cooloff_hours: int = 1
 
 
 def load_breaker_rules() -> CircuitBreakerRules:
-    """Regole del circuit breaker (unico freno di rischio configurato su file)."""
+    """Regole del circuit breaker (unico freno di sopravvivenza su file)."""
     raw = _load_yaml("risk_rules.yaml")
     cb = raw.get("circuit_breaker", {}) or {}
     known = {k: v for k, v in cb.items() if k in CircuitBreakerRules.__dataclass_fields__}
