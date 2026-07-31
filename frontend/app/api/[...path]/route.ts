@@ -1,6 +1,10 @@
 import { auth } from "@/auth";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://trading-backend:8000";
+// Segreto condiviso col backend: prova che la richiesta arriva da questo proxy
+// (e quindi da una sessione Authentik verificata). Resta lato server — niente
+// prefisso NEXT_PUBLIC, non finisce mai nel bundle del browser.
+const INTERNAL_TOKEN = process.env.TRADING_INTERNAL_TOKEN ?? "";
 
 async function forward(request: Request, context: { params: Promise<{ path: string[] }> }) {
   const session = await auth();
@@ -18,6 +22,8 @@ async function forward(request: Request, context: { params: Promise<{ path: stri
   const accept = request.headers.get("accept");
   if (contentType) headers.set("content-type", contentType);
   if (accept) headers.set("accept", accept);
+
+  if (INTERNAL_TOKEN) headers.set("x-trading-internal-token", INTERNAL_TOKEN);
 
   const user = session.user as typeof session.user & { id?: string };
   headers.set("x-trading-user-id", user.id ?? user.email ?? "unknown");

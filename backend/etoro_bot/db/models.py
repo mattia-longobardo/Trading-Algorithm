@@ -99,6 +99,12 @@ class BotPosition(Base):
     close_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_pnl_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Ordine di chiusura inviato al broker: il PnL reale arriva in trade history
+    # con ritardo, quindi la chiusura resta "non liquidata" (pnl_settled=False)
+    # finché una passata successiva non la riconcilia. Fino ad allora
+    # realized_pnl_usd contiene la STIMA mark-to-market.
+    close_order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    pnl_settled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class EquitySnapshot(Base):
@@ -133,17 +139,6 @@ class SettingsAudit(Base):
     old_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     new_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     source: Mapped[str] = mapped_column(String(32), default="api")
-
-
-class RiskScoreSnapshot(Base):
-    """Storico del risk score per la pagina /risk (non in §8: aggiunta necessaria
-    per GET /risk/score/history senza ricalcoli retroattivi)."""
-
-    __tablename__ = "risk_scores"
-
-    date: Mapped[date] = mapped_column(Date, primary_key=True)
-    score: Mapped[float] = mapped_column(Float)
-    breakdown: Mapped[dict] = mapped_column(JSONB)
 
 
 class Agent(Base):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -17,7 +18,6 @@ from etoro_bot.db.models import (
     Decision,
     EquitySnapshot,
     Execution,
-    RiskScoreSnapshot,
     Run,
     SettingsAudit,
     SimEquityPoint,
@@ -118,10 +118,6 @@ class Repository:
                 s.scalars(select(Execution).order_by(Execution.created_at.desc()).limit(limit))
             )
 
-    def get_execution(self, execution_id: uuid.UUID) -> Execution | None:
-        with self._sf() as s:
-            return s.get(Execution, execution_id)
-
     def cancel_pending_execution(self, execution_id: uuid.UUID) -> bool:
         with self._sf.begin() as s:
             row = s.get(Execution, execution_id)
@@ -179,7 +175,11 @@ class Repository:
         realized_pnl_usd: float | None,
         close_reason: str,
         closed_at: datetime | None = None,
+        close_order_id: int | None = None,
+        pnl_settled: bool = True,
     ) -> None:
+        """Registra la chiusura. `pnl_settled=False` marca il PnL come STIMA:
+        realized_pnl_usd verrà riscritto dal broker in una passata successiva."""
         with self._sf.begin() as s:
             pos = s.get(BotPosition, etoro_position_id)
             if pos is not None and pos.closed_at is None:
@@ -187,6 +187,43 @@ class Repository:
                 pos.close_price = close_price
                 pos.realized_pnl_usd = realized_pnl_usd
                 pos.close_reason = close_reason
+                pos.close_order_id = close_order_id
+                pos.pnl_settled = pnl_settled
+
+    def unsettled_closed_positions(self) -> list[BotPosition]:
+        """Chiusure il cui PnL reale non è ancora arrivato dal broker."""
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(BotPosition)
+                    .where(
+                        BotPosition.closed_at.is_not(None),
+                        BotPosition.pnl_settled.is_(False),
+                    )
+                    .order_by(BotPosition.closed_at)
+                )
+            )
+
+    def settle_position_pnl(
+        self,
+        etoro_position_id: int,
+        realized_pnl_usd: float,
+        close_price: float | None = None,
+    ) -> None:
+        """Sostituisce la stima col PnL reale del broker e chiude la partita."""
+        with self._sf.begin() as s:
+            pos = s.get(BotPosition, etoro_position_id)
+            if pos is None:
+                return
+            pos.realized_pnl_usd = realized_pnl_usd
+            if close_price is not None:
+                pos.close_price = close_price
+            pos.pnl_settled = True
+
+    def known_position_ids(self) -> set[int]:
+        """Tutti i positionId mai registrati dal bot (aperti o chiusi)."""
+        with self._sf() as s:
+            return {int(pid) for pid in s.scalars(select(BotPosition.etoro_position_id))}
 
     def open_positions(self) -> list[BotPosition]:
         with self._sf() as s:
@@ -213,7 +250,7 @@ class Repository:
                 )
             )
 
-    # --- equity & risk score ------------------------------------------------
+    # --- equity -------------------------------------------------------------
     def record_equity_snapshot(
         self, day: date, equity_usd: float, cash_usd: float, exposure_usd: float
     ) -> None:
@@ -227,14 +264,6 @@ class Repository:
     def equity_series(self) -> list[EquitySnapshot]:
         with self._sf() as s:
             return list(s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.date)))
-
-    def record_risk_score(self, day: date, score: float, breakdown: dict[str, Any]) -> None:
-        with self._sf.begin() as s:
-            s.merge(RiskScoreSnapshot(date=day, score=score, breakdown=breakdown))
-
-    def risk_score_history(self) -> list[RiskScoreSnapshot]:
-        with self._sf() as s:
-            return list(s.scalars(select(RiskScoreSnapshot).order_by(RiskScoreSnapshot.date)))
 
     # --- app settings (§10) -------------------------------------------------
     def get_setting(self, key: str) -> Any | None:

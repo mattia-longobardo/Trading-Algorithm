@@ -59,6 +59,36 @@ def _project(rows: list[dict], fields: list[str]) -> list[dict]:
     return [{k: v for k, v in row.items() if k in wanted} for row in rows]
 
 
+_SELL_WORDS = {"sell", "short", "s", "false"}
+
+
+def _transaction(direction: str) -> str:
+    """Direzione dell'ordine → campo `transaction` del payload eToro."""
+    return "sell" if str(direction).strip().lower() in _SELL_WORDS else "buy"
+
+
+def fill_from_lookup(info: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Estrae {position_id, execution_price, order_id} da orders:lookup.
+
+    None se l'ordine non è (ancora) eseguito: serve al recovery idempotente,
+    che deve saper distinguere "ordine passato" da "ordine mai arrivato".
+    """
+    if not isinstance(info, dict):
+        return None
+    status = info.get("status") or {}
+    if status.get("id") != ORDER_STATUS_FILLED:
+        return None
+    executions = info.get("positionExecutions") or []
+    if not executions:
+        return None
+    opening = executions[0].get("openingData") or {}
+    return {
+        "position_id": executions[0].get("positionId"),
+        "execution_price": opening.get("avgPrice"),
+        "order_id": info.get("orderId"),
+    }
+
+
 def _as_list(data: Any) -> list[dict]:
     """Trade history risponde con un array; tollera un eventuale wrapper dict."""
     if isinstance(data, list):
@@ -346,16 +376,25 @@ class EtoroClient:
 
     # ------------------------------------------------- execution (20/60s)
 
-    def open_position(self, instrument_id: int, amount_usd: float, request_id: str) -> dict:
-        """Apre una posizione long a mercato e attende il fill (docs §5.1 + §5.3).
+    def open_position(
+        self,
+        instrument_id: int,
+        amount_usd: float,
+        request_id: str,
+        direction: str = "buy",
+    ) -> dict:
+        """Apre una posizione a mercato e attende il fill (docs §5.1 + §5.3).
 
-        `request_id` è la chiave di idempotenza (x-request-id = referenceId):
-        DEVE arrivare dal chiamante (UUID5 deterministico della run).
+        `direction` finisce nel campo `transaction` del payload: "buy" per il
+        long, "sell" per la vendita allo scoperto (sinonimi accettati:
+        short/sell/long/buy). `request_id` è la chiave di idempotenza
+        (x-request-id = referenceId): DEVE arrivare dal chiamante (UUID5
+        deterministico della run).
         Ritorna {"position_id", "execution_price", "order_id"}.
         """
         body = {
             "action": "open",
-            "transaction": "buy",
+            "transaction": _transaction(direction),
             "instrumentId": instrument_id,
             "settlementType": "real",
             "orderType": "mkt",
@@ -380,15 +419,10 @@ class EtoroClient:
             status = info.get("status") or {}
             status_id = status.get("id")
             if status_id == ORDER_STATUS_FILLED:
-                executions = info.get("positionExecutions") or []
-                if not executions:
+                fill = fill_from_lookup(info)
+                if fill is None:
                     raise EtoroError(f"ordine {order_id} Filled ma senza positionExecutions")
-                opening = executions[0].get("openingData") or {}
-                return {
-                    "position_id": executions[0].get("positionId"),
-                    "execution_price": opening.get("avgPrice"),
-                    "order_id": order_id,
-                }
+                return {**fill, "order_id": order_id}
             if status_id in _ORDER_STATUS_TERMINAL_KO:
                 raise EtoroError(
                     f"ordine {order_id} terminato con status "
