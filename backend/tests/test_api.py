@@ -103,6 +103,54 @@ def test_arena_agent_detail_404(client):
     ).status_code == 404
 
 
+def test_arena_agent_detail_metrics_and_directions(client, repo):
+    """Il dettaglio agente espone metriche, direzione e durata dei trade."""
+    from datetime import datetime, timedelta, timezone
+
+    from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
+
+    agent_id = repo.create_agent(
+        "G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "memoria", "2026-07", 10_000.0
+    )
+    now = datetime.now(timezone.utc)
+
+    # trade long vincente: 1.000 $ a 100 chiusi a 110 → +100 $
+    repo.open_sim_position(
+        agent_id, "AAPL", 1, 1_000.0, 100.0, "long ok",
+        opened_at=now - timedelta(hours=5),
+    )
+    repo.close_sim_position(repo.sim_positions(agent_id)[0].id, 110.0, "tp")
+    # trade short perdente: il marcatore [SHORT] è nella open_reason
+    repo.open_sim_position(
+        agent_id, "TSLA", 2, 1_000.0, 100.0, "[SHORT] short ko",
+        opened_at=now - timedelta(hours=2),
+    )
+    repo.close_sim_position(repo.sim_positions(agent_id)[0].id, 90.0, "sl")
+    # posizione ancora aperta, short
+    repo.open_sim_position(agent_id, "NVDA", 3, 500.0, 50.0, "[SHORT] aperta")
+
+    repo.record_sim_equity(agent_id, now - timedelta(days=1), 10_000.0)
+    repo.record_sim_equity(agent_id, now, 9_900.0)
+
+    body = client.get(f"/arena/agents/{agent_id}").json()
+
+    metrics = body["metrics"]
+    assert metrics["n_trades"] == 2
+    assert metrics["win_rate_pct"] == 50.0
+    assert metrics["long"]["n"] == 1 and metrics["short"]["n"] == 1
+    assert metrics["insufficient_sample"] is True
+
+    assert body["agent"]["invested_usd"] == 500.0
+    assert body["agent"]["open_positions"][0]["direction"] == "short"
+
+    assert {"direction", "holding_hours", "return_pct"} <= set(body["trades"][0])
+    assert {t["direction"] for t in body["trades"]} == {"long", "short"}
+    by_dir = {t["direction"]: t for t in body["trades"]}
+    assert by_dir["long"]["return_pct"] == 10.0
+    assert by_dir["short"]["return_pct"] == -10.0
+    assert by_dir["long"]["holding_hours"] == 5.0
+
+
 def test_live_enable_requires_confirmation_and_champion(client):
     # senza conferma → 422
     assert client.post("/live/enable", json={}).status_code == 422
