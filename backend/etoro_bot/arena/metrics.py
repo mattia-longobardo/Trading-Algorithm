@@ -26,12 +26,30 @@ def _round(value: float | None, digits: int = 2) -> float | None:
     return None if value is None else round(value, digits)
 
 
+def _equity_series(equity_points: Sequence[Any]) -> list[float]:
+    """Serie equity completa (anche intraday) ordinata per timestamp."""
+    return [p.equity_usd for p in sorted(equity_points, key=lambda p: p.ts)]
+
+
 def _daily_closes(equity_points: Sequence[Any]) -> list[float]:
     """Ultimo valore equity per ogni giorno di calendario (UTC), in ordine."""
     by_day: dict[Any, float] = {}
     for p in sorted(equity_points, key=lambda p: p.ts):
         by_day[p.ts.date()] = p.equity_usd
     return [by_day[d] for d in sorted(by_day)]
+
+
+def _max_drawdown_pct(series: Sequence[float]) -> float | None:
+    """Peggior scostamento % dal massimo corrente; None sotto i 2 punti."""
+    if len(series) < 2:
+        return None
+    peak = series[0]
+    worst = 0.0
+    for value in series:
+        peak = max(peak, value)
+        if peak > 0:
+            worst = min(worst, (value - peak) / peak * 100.0)
+    return worst
 
 
 def _split_stats(trades: Sequence[Any]) -> dict[str, Any]:
@@ -71,17 +89,11 @@ def compute_agent_metrics(
     ]
     age_days = max(1, (now - born_at).days) if born_at else 1
 
-    # --- serie giornaliera per drawdown/volatilità/sharpe -------------------
-    closes = _daily_closes(equity_points)
-    max_dd: float | None = None
-    if len(closes) >= 2:
-        peak = closes[0]
-        max_dd = 0.0
-        for value in closes:
-            peak = max(peak, value)
-            if peak > 0:
-                max_dd = min(max_dd, (value - peak) / peak * 100.0)
+    # --- drawdown sulla serie completa (i minimi intraday contano) ----------
+    max_dd = _max_drawdown_pct(_equity_series(equity_points))
 
+    # --- serie giornaliera per volatilità/sharpe ----------------------------
+    closes = _daily_closes(equity_points)
     returns = [
         closes[i] / closes[i - 1] - 1.0
         for i in range(1, len(closes))
@@ -115,7 +127,7 @@ def compute_agent_metrics(
         "avg_loss_usd": _round(statistics.mean(losses)) if losses else None,
         "best_trade_usd": _round(max(pnls)) if pnls else None,
         "worst_trade_usd": _round(min(pnls)) if pnls else None,
-        "max_drawdown_pct": _round(max_dd) if max_dd is not None else None,
+        "max_drawdown_pct": _round(max_dd),
         "volatility_pct": _round(volatility),
         "sharpe": _round(sharpe),
         "avg_holding_hours": _round(statistics.mean(holding_hours), 1)

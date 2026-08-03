@@ -106,4 +106,24 @@ def test_intraday_collassa_a_ultimo_punto_del_giorno():
     )
     # solo 2 punti giornalieri -> volatilità/sharpe null, ma drawdown calcolato
     assert m["volatility_pct"] is None and m["sharpe"] is None
-    assert m["max_drawdown_pct"] is not None
+    # drawdown sulla serie completa: picco 10200 -> 10100 = -0.98%
+    assert m["max_drawdown_pct"] == -0.98
+
+
+def test_drawdown_usa_la_serie_completa_non_le_chiusure_giornaliere():
+    # Tre punti nello stesso giorno: il minimo intraday NON deve sparire.
+    day = NOW - timedelta(days=1)
+    pts = [
+        SimpleNamespace(ts=day - timedelta(hours=6), equity_usd=10_000),
+        SimpleNamespace(ts=day - timedelta(hours=3), equity_usd=9_000),
+        SimpleNamespace(ts=day, equity_usd=10_000),
+    ]
+    m = compute_agent_metrics(
+        starting_capital_usd=10_000.0, cash_usd=10_000.0, invested_usd=0.0,
+        born_at=NOW - timedelta(days=2), trades=[], equity_points=pts, now=NOW,
+    )
+    # picco 10000 -> minimo 9000: -10.0%
+    assert m["max_drawdown_pct"] == -10.0
+    # una sola chiusura giornaliera -> niente rendimenti giornalieri
+    assert m["volatility_pct"] is None and m["sharpe"] is None
+    assert m["insufficient_sample"] is True
