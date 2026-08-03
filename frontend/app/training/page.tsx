@@ -2,7 +2,14 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { DnaIcon, PauseIcon, PlayIcon, TrophyIcon, ZapIcon } from "lucide-react";
+import {
+  DnaIcon,
+  PauseIcon,
+  PlayIcon,
+  SwordsIcon,
+  TrophyIcon,
+  ZapIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -380,6 +387,11 @@ export default function TrainingPage() {
         description="Due versioni dello stesso agente si sfidano in day trading simulato con dati eToro reali: la loro vita dipende dal profitto."
         actions={
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/training/confronto">
+                <SwordsIcon className="size-4" /> Testa a testa
+              </Link>
+            </Button>
             <Button
               variant="outline"
               size="sm"
