@@ -1037,6 +1037,8 @@ def settings_audit() -> dict[str, Any]:
 
 
 def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[str, Any]:
+    from etoro_bot.arena.engine import position_direction
+
     positions = repo.sim_positions(agent.id)
     invested = sum(p.amount_usd for p in positions)
     pnl_month = agent.cash_usd + invested - agent.starting_capital_usd
@@ -1054,6 +1056,7 @@ def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[st
         "dna": agent.dna,
         "starting_capital_usd": agent.starting_capital_usd,
         "cash_usd": agent.cash_usd,
+        "invested_usd": round(invested, 2),
         "equity_usd": round(agent.cash_usd + invested, 2),
         "pnl_month_usd": round(pnl_month, 2),
         "open_positions": [
@@ -1064,6 +1067,7 @@ def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[st
                 "entry_price": p.entry_price,
                 "opened_at": p.opened_at.isoformat(),
                 "open_reason": p.open_reason,
+                "direction": position_direction(p),
             }
             for p in positions
         ],
@@ -1112,15 +1116,20 @@ def arena_overview() -> dict[str, Any]:
 
 @app.get("/arena/agents/{agent_id}")
 def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
+    from etoro_bot.arena.metrics import compute_agent_metrics, trade_direction
+
     repo = get_repo()
     agent = repo.get_agent(agent_id)
     if agent is None:
         raise HTTPException(404, "agente non trovato")
+    payload = _agent_payload(repo, agent)
+    trades = repo.sim_trades(agent_id)
+    equity_points = repo.sim_equity_series(agent_id)
     return {
-        "agent": _agent_payload(repo, agent),
+        "agent": payload,
         "equity": [
             {"ts": p.ts.isoformat(), "equity_usd": p.equity_usd}
-            for p in repo.sim_equity_series(agent_id)
+            for p in equity_points
         ],
         "trades": [
             {
@@ -1134,9 +1143,25 @@ def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
                 "closed_at": t.closed_at.isoformat(),
                 "open_reason": t.open_reason,
                 "close_reason": t.close_reason,
+                "direction": trade_direction(t),
+                "holding_hours": round(
+                    (t.closed_at - t.opened_at).total_seconds() / 3600.0, 1
+                ),
+                "return_pct": round(t.pnl_usd / t.amount_usd * 100.0, 2)
+                if t.amount_usd
+                else None,
             }
-            for t in repo.sim_trades(agent_id)
+            for t in trades
         ],
+        "metrics": compute_agent_metrics(
+            starting_capital_usd=agent.starting_capital_usd,
+            cash_usd=agent.cash_usd,
+            # già sommato dal payload dell'agente: evita una query in più
+            invested_usd=payload["invested_usd"],
+            born_at=agent.born_at,
+            trades=trades,
+            equity_points=equity_points,
+        ),
     }
 
 
