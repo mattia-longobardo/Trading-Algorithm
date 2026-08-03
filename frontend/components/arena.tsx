@@ -3,7 +3,27 @@
 import { SkullIcon, TrophyIcon } from "lucide-react";
 
 import { Stamp } from "@/components/stamp";
-import type { ArenaAgent } from "@/lib/types";
+import type { ArenaAgent, TradeDirection } from "@/lib/types";
+
+/** Valore mancante: il campione è troppo piccolo per calcolarlo. */
+export const DASH = "—";
+
+/** Applica il formattatore solo se il valore c'è, altrimenti trattino. */
+export function orDash(
+  value: number | null | undefined,
+  fmt: (v: number) => string,
+): string {
+  return value == null ? DASH : fmt(value);
+}
+
+/** Verso della posizione: lo short è l'eccezione, quindi è l'unico evidenziato. */
+export function DirectionStamp({ direction }: { direction: TradeDirection }) {
+  return direction === "short" ? (
+    <Stamp tone="accent">Short</Stamp>
+  ) : (
+    <Stamp tone="neutral">Long</Stamp>
+  );
+}
 
 /** Timbro di stato di un agente: campione, morto, evoluto o ancora in gara. */
 export function AgentStatusStamp({ agent }: { agent: ArenaAgent }) {

@@ -5,10 +5,14 @@ import { useParams } from "next/navigation";
 import { ArrowLeftIcon, DnaIcon, SwordsIcon } from "lucide-react";
 
 import { AgentEquityChart } from "@/components/charts/agent-equity-chart";
-import { AgentStatusStamp, DnaGrid } from "@/components/arena";
+import {
+  AgentStatusStamp,
+  DirectionStamp,
+  DnaGrid,
+  orDash,
+} from "@/components/arena";
 import { PageHeader } from "@/components/page-header";
 import { CardSkeleton, ErrorState, TableSkeleton } from "@/components/query-states";
-import { Stamp } from "@/components/stamp";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -29,23 +33,6 @@ import { fmtNum, fmtPct, fmtPctSigned, pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
 import { useArena, useArenaAgent } from "@/lib/queries";
 import type { AgentDetail, AgentMetrics, TradeDirection } from "@/lib/types";
-
-/** Valore mancante: il campione è troppo piccolo per calcolarlo. */
-const DASH = "—";
-
-/** Applica il formattatore solo se il valore c'è, altrimenti trattino. */
-function orDash(value: number | null | undefined, fmt: (v: number) => string): string {
-  return value == null ? DASH : fmt(value);
-}
-
-/** Verso della posizione: lo short è l'eccezione, quindi è l'unico evidenziato. */
-function DirectionStamp({ direction }: { direction: TradeDirection }) {
-  return direction === "short" ? (
-    <Stamp tone="accent">Short</Stamp>
-  ) : (
-    <Stamp tone="neutral">Long</Stamp>
-  );
-}
 
 function SummaryTile({
   label,
@@ -200,9 +187,9 @@ function PerformanceCard({ metrics }: { metrics: AgentMetrics }) {
 
 function DirectionCard({ metrics }: { metrics: AgentMetrics }) {
   const d = useDisplay();
-  const columns: [string, AgentMetrics["long"]][] = [
-    ["Long", metrics.long],
-    ["Short", metrics.short],
+  const columns: [TradeDirection, AgentMetrics["long"]][] = [
+    ["long", metrics.long],
+    ["short", metrics.short],
   ];
   return (
     <Card>
@@ -213,9 +200,9 @@ function DirectionCard({ metrics }: { metrics: AgentMetrics }) {
         </CardDescription>
       </CardHeader>
       <CardContent className="grid grid-cols-2 gap-4">
-        {columns.map(([label, split]) => (
-          <div key={label} className="space-y-2">
-            <Stamp tone={label === "Short" ? "accent" : "neutral"}>{label}</Stamp>
+        {columns.map(([direction, split]) => (
+          <div key={direction} className="space-y-2">
+            <DirectionStamp direction={direction} />
             <div className="space-y-1.5">
               <div>
                 <p className="text-muted-foreground font-mono text-[10px] tracking-[0.1em] uppercase">
@@ -314,13 +301,15 @@ function PositionsCard({ detail }: { detail: AgentDetail }) {
 function TradesCard({ detail }: { detail: AgentDetail }) {
   const d = useDisplay();
   const trades = detail.trades;
+  // Il registro tiene tutto: qui arriva solo la coda più recente, quindi il
+  // conteggio va detto per intero quando la lista è troncata.
+  const total = detail.metrics.n_trades;
+  const shown = trades.length < total ? `${trades.length} di ${total}` : String(total);
   return (
     <Card>
       <CardHeader>
         <CardTitle>Tutti i trade simulati</CardTitle>
-        <CardDescription>
-          {trades.length} chiusi, dal più recente (il registro conserva gli ultimi 200)
-        </CardDescription>
+        <CardDescription>{shown} trade chiusi, dal più recente</CardDescription>
       </CardHeader>
       <CardContent>
         {trades.length === 0 ? (
@@ -329,60 +318,60 @@ function TradesCard({ detail }: { detail: AgentDetail }) {
           </p>
         ) : (
           <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Simbolo</TableHead>
-                  <TableHead>Direzione</TableHead>
-                  <TableHead className="text-right">Importo</TableHead>
-                  <TableHead className="text-right">Ingresso → Uscita</TableHead>
-                  <TableHead className="text-right">PnL</TableHead>
-                  <TableHead className="text-right">Durata</TableHead>
-                  <TableHead>Chiusura</TableHead>
-                  <TableHead>Motivo chiusura</TableHead>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Simbolo</TableHead>
+                <TableHead>Direzione</TableHead>
+                <TableHead className="text-right">Importo</TableHead>
+                <TableHead className="text-right">Ingresso → Uscita</TableHead>
+                <TableHead className="text-right">PnL</TableHead>
+                <TableHead className="text-right">Durata</TableHead>
+                <TableHead>Chiusura</TableHead>
+                <TableHead>Motivo chiusura</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {trades.map((t) => (
+                <TableRow key={t.id}>
+                  {/* la motivazione di apertura sta nel tooltip: la riga è già larga */}
+                  <TableCell className="font-mono font-medium" title={t.open_reason}>
+                    {t.symbol}
+                  </TableCell>
+                  <TableCell>
+                    <DirectionStamp direction={t.direction} />
+                  </TableCell>
+                  <TableCell className="text-right font-mono tabular-nums">
+                    {d.money(t.amount_usd)}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs whitespace-nowrap tabular-nums">
+                    {d.money(t.entry_price)} → {d.money(t.close_price)}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right font-mono tabular-nums ${pnlClass(t.pnl_usd)}`}
+                  >
+                    {d.moneySigned(t.pnl_usd)}
+                    {t.return_pct != null && (
+                      <span className="ml-1.5 text-xs">
+                        ({fmtPctSigned(t.return_pct)})
+                      </span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right font-mono tabular-nums">
+                    {fmtNum(t.holding_hours, 1)} h
+                  </TableCell>
+                  <TableCell className="font-mono text-xs whitespace-nowrap">
+                    {d.dateTime(t.closed_at)}
+                  </TableCell>
+                  <TableCell
+                    className="text-muted-foreground max-w-64 truncate text-xs"
+                    title={t.close_reason}
+                  >
+                    {t.close_reason}
+                  </TableCell>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {trades.map((t) => (
-                  <TableRow key={t.id}>
-                    {/* la motivazione di apertura sta nel tooltip: la riga è già larga */}
-                    <TableCell className="font-mono font-medium" title={t.open_reason}>
-                      {t.symbol}
-                    </TableCell>
-                    <TableCell>
-                      <DirectionStamp direction={t.direction} />
-                    </TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {d.money(t.amount_usd)}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs whitespace-nowrap tabular-nums">
-                      {d.money(t.entry_price)} → {d.money(t.close_price)}
-                    </TableCell>
-                    <TableCell
-                      className={`text-right font-mono tabular-nums ${pnlClass(t.pnl_usd)}`}
-                    >
-                      {d.moneySigned(t.pnl_usd)}
-                      {t.return_pct != null && (
-                        <span className="ml-1.5 text-xs">
-                          ({fmtPctSigned(t.return_pct)})
-                        </span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">
-                      {fmtNum(t.holding_hours, 1)} h
-                    </TableCell>
-                    <TableCell className="font-mono text-xs whitespace-nowrap">
-                      {d.dateTime(t.closed_at)}
-                    </TableCell>
-                    <TableCell
-                      className="text-muted-foreground max-w-64 truncate text-xs"
-                      title={t.close_reason}
-                    >
-                      {t.close_reason}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+              ))}
+            </TableBody>
+          </Table>
         )}
       </CardContent>
     </Card>
