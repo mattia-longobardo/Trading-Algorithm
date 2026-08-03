@@ -1,14 +1,8 @@
 "use client";
 
 import * as React from "react";
-import {
-  DnaIcon,
-  PauseIcon,
-  PlayIcon,
-  SkullIcon,
-  TrophyIcon,
-  ZapIcon,
-} from "lucide-react";
+import Link from "next/link";
+import { DnaIcon, PauseIcon, PlayIcon, TrophyIcon, ZapIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -26,6 +20,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { AgentStatusStamp, DnaGrid } from "@/components/arena";
 import { EquitySparkline } from "@/components/charts/sparkline";
 import { PageHeader } from "@/components/page-header";
 import { Stamp } from "@/components/stamp";
@@ -41,51 +36,6 @@ import { pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
 import type { ArenaAgent, EquityPoint } from "@/lib/types";
 
-function AgentStatusStamp({ agent }: { agent: ArenaAgent }) {
-  if (agent.is_champion)
-    return (
-      <Stamp tone="approved">
-        <TrophyIcon /> Campione
-      </Stamp>
-    );
-  if (agent.status === "dead")
-    return (
-      <Stamp tone="rejected">
-        <SkullIcon /> Morto
-      </Stamp>
-    );
-  if (agent.status === "evolved") return <Stamp tone="accent">Evoluto</Stamp>;
-  return <Stamp tone="accent">In allenamento</Stamp>;
-}
-
-function DnaGrid({ agent }: { agent: ArenaAgent }) {
-  const dna = agent.dna;
-  const holding = dna.max_holding_days ?? 1;
-  const rows: [string, string][] = [
-    ["Profilo", String(dna.risk_profile)],
-    ["Orizzonte", holding <= 1 ? "day trading" : `swing ${holding}g`],
-    ["Stop loss", `${dna.stop_loss_pct}%`],
-    ["Take profit", `${dna.take_profit_pct}%`],
-    ["Max posizioni", String(dna.max_positions)],
-    ["Max per posizione", `${dna.max_position_pct}%`],
-    ["Aperture per ciclo", String(dna.max_orders_per_cycle)],
-    ["Riserva cash", `${dna.min_cash_pct}%`],
-    ["Convinzione", `×${dna.conviction_scale}`],
-  ];
-  return (
-    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-4">
-      {rows.map(([label, value]) => (
-        <div key={label}>
-          <p className="text-muted-foreground font-mono text-[10px] tracking-[0.1em] uppercase">
-            {label}
-          </p>
-          <p className="font-mono text-[13px] font-medium tabular-nums">{value}</p>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function AgentCard({ agent }: { agent: ArenaAgent }) {
   const d = useDisplay();
   const { data: detail } = useArenaAgent(agent.id);
@@ -100,7 +50,10 @@ function AgentCard({ agent }: { agent: ArenaAgent }) {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <DnaIcon className="text-primary size-4" /> {agent.name}
+          <DnaIcon className="text-primary size-4" />
+          <Link href={`/training/${agent.id}`} className="hover:underline">
+            {agent.name}
+          </Link>
           <AgentStatusStamp agent={agent} />
         </CardTitle>
         <CardDescription>
@@ -214,6 +167,12 @@ function AgentCard({ agent }: { agent: ArenaAgent }) {
             </Table>
           </div>
         )}
+
+        <div className="flex justify-end">
+          <Button variant="ghost" size="sm" asChild>
+            <Link href={`/training/${agent.id}`}>Dettagli →</Link>
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );
@@ -312,7 +271,11 @@ function LineageCard() {
             <TableBody>
               {data.lineage.map((agent) => (
                 <TableRow key={agent.id}>
-                  <TableCell className="font-mono font-medium">{agent.name}</TableCell>
+                  <TableCell className="font-mono font-medium">
+                    <Link href={`/training/${agent.id}`} className="hover:underline">
+                      {agent.name}
+                    </Link>
+                  </TableCell>
                   <TableCell className="font-mono tabular-nums">
                     {agent.generation}
                   </TableCell>
