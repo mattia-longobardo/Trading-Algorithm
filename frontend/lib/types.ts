@@ -270,6 +270,51 @@ export interface NewsItem {
 
 export type AgentStatus = "alive" | "dead" | "evolved";
 
+/** Verso di un trade o di una posizione aperta. */
+export type TradeDirection = "long" | "short";
+
+/** Aggregato per verso (long/short) dentro le metriche di un agente. */
+export interface DirectionSplit {
+  n: number;
+  pnl_usd: number;
+  /** null se non ci sono trade in quel verso. */
+  win_rate_pct: number | null;
+}
+
+/**
+ * Metriche di performance del conto simulato di un agente.
+ * I campi nullable lo sono quando il campione è troppo piccolo per calcolarli.
+ */
+export interface AgentMetrics {
+  pnl_usd: number;
+  /** null se il capitale iniziale è <= 0. */
+  return_pct: number | null;
+  equity_usd: number;
+  exposure_pct: number;
+  cash_pct: number;
+  n_trades: number;
+  n_wins: number;
+  n_losses: number;
+  win_rate_pct: number | null;
+  profit_factor: number | null;
+  expectancy_usd: number | null;
+  avg_win_usd: number | null;
+  /** Valore negativo. */
+  avg_loss_usd: number | null;
+  best_trade_usd: number | null;
+  worst_trade_usd: number | null;
+  /** Negativo o 0; null sotto i 2 punti di equity. */
+  max_drawdown_pct: number | null;
+  volatility_pct: number | null;
+  sharpe: number | null;
+  avg_holding_hours: number | null;
+  trades_per_day: number | null;
+  long: DirectionSplit;
+  short: DirectionSplit;
+  /** true se i trade o i punti giornalieri sono troppo pochi: metriche indicative. */
+  insufficient_sample: boolean;
+}
+
 export interface AgentDna {
   conviction_scale: number;
   max_positions: number;
@@ -292,6 +337,7 @@ export interface AgentSimPosition {
   entry_price: number;
   opened_at: string;
   open_reason: string;
+  direction: TradeDirection;
 }
 
 export interface ArenaAgent {
@@ -309,6 +355,8 @@ export interface ArenaAgent {
   memory?: string;
   starting_capital_usd: number;
   cash_usd: number;
+  /** Somma delle posizioni aperte; assente sui payload più vecchi. */
+  invested_usd?: number;
   equity_usd: number;
   pnl_month_usd: number;
   open_positions: AgentSimPosition[];
@@ -349,12 +397,18 @@ export interface AgentSimTrade {
   closed_at: string;
   open_reason: string;
   close_reason: string;
+  direction: TradeDirection;
+  /** Durata della posizione in ore (1 decimale). */
+  holding_hours: number;
+  /** pnl_usd / amount_usd * 100; null se amount_usd è 0. */
+  return_pct: number | null;
 }
 
 export interface AgentDetail {
   agent: ArenaAgent;
   equity: AgentEquityPoint[];
   trades: AgentSimTrade[];
+  metrics: AgentMetrics;
 }
 
 export interface ArenaEventItem {

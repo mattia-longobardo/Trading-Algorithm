@@ -455,16 +455,20 @@ class Repository:
                 )
             )
 
-    def sim_trades(self, agent_id: uuid.UUID, limit: int = 200) -> list[SimTrade]:
+    def sim_trades(
+        self, agent_id: uuid.UUID, limit: int | None = 200
+    ) -> list[SimTrade]:
+        """Trade chiusi dal più recente; `limit=None` li restituisce tutti
+        (serve alle metriche, che non possono guardare solo una finestra)."""
         with self._sf() as s:
-            return list(
-                s.scalars(
-                    select(SimTrade)
-                    .where(SimTrade.agent_id == agent_id)
-                    .order_by(SimTrade.closed_at.desc())
-                    .limit(limit)
-                )
+            stmt = (
+                select(SimTrade)
+                .where(SimTrade.agent_id == agent_id)
+                .order_by(SimTrade.closed_at.desc())
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return list(s.scalars(stmt))
 
     def record_sim_equity(
         self, agent_id: uuid.UUID, ts: datetime, equity_usd: float
