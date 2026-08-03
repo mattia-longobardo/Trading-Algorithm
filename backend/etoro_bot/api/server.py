@@ -1035,6 +1035,10 @@ def settings_audit() -> dict[str, Any]:
 
 # --- arena (allenamento evolutivo) ------------------------------------------
 
+# Quanti trade chiusi finiscono nella risposta del dettaglio: le metriche però
+# li leggono tutti, altrimenti descriverebbero solo la finestra più recente.
+ARENA_TRADES_SHOWN = 200
+
 
 def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[str, Any]:
     from etoro_bot.arena.engine import position_direction
@@ -1123,7 +1127,8 @@ def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
     if agent is None:
         raise HTTPException(404, "agente non trovato")
     payload = _agent_payload(repo, agent)
-    trades = repo.sim_trades(agent_id)
+    all_trades = repo.sim_trades(agent_id, limit=None)  # metriche su tutto lo storico
+    trades = all_trades[:ARENA_TRADES_SHOWN]
     equity_points = repo.sim_equity_series(agent_id)
     return {
         "agent": payload,
@@ -1159,7 +1164,7 @@ def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
             # già sommato dal payload dell'agente: evita una query in più
             invested_usd=payload["invested_usd"],
             born_at=agent.born_at,
-            trades=trades,
+            trades=all_trades,
             equity_points=equity_points,
         ),
     }

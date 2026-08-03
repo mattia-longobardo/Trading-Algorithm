@@ -103,8 +103,8 @@ def test_arena_agent_detail_404(client):
     ).status_code == 404
 
 
-def test_arena_agent_detail_metrics_and_directions(client, repo):
-    """Il dettaglio agente espone metriche, direzione e durata dei trade."""
+def _seed_arena_agent(repo):
+    """Agente con un long vincente, uno short perdente e una posizione aperta."""
     from datetime import datetime, timedelta, timezone
 
     from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
@@ -131,6 +131,12 @@ def test_arena_agent_detail_metrics_and_directions(client, repo):
 
     repo.record_sim_equity(agent_id, now - timedelta(days=1), 10_000.0)
     repo.record_sim_equity(agent_id, now, 9_900.0)
+    return agent_id
+
+
+def test_arena_agent_detail_metrics_and_directions(client, repo):
+    """Il dettaglio agente espone metriche, direzione e durata dei trade."""
+    agent_id = _seed_arena_agent(repo)
 
     body = client.get(f"/arena/agents/{agent_id}").json()
 
@@ -149,6 +155,24 @@ def test_arena_agent_detail_metrics_and_directions(client, repo):
     assert by_dir["long"]["return_pct"] == 10.0
     assert by_dir["short"]["return_pct"] == -10.0
     assert by_dir["long"]["holding_hours"] == 5.0
+
+
+def test_arena_agent_metrics_see_all_trades_not_just_the_shown_ones(
+    client, repo, monkeypatch
+):
+    """La lista trade è cappata per la UI, le metriche contano tutto lo storico."""
+    from etoro_bot.api import server
+
+    agent_id = _seed_arena_agent(repo)
+    # il limite del repo tronca davvero, e `None` restituisce tutto
+    assert len(repo.sim_trades(agent_id, limit=1)) == 1
+    assert len(repo.sim_trades(agent_id, limit=None)) == 2
+
+    monkeypatch.setattr(server, "ARENA_TRADES_SHOWN", 1)  # cap ridotto, stesso effetto
+    body = client.get(f"/arena/agents/{agent_id}").json()
+    assert len(body["trades"]) == 1
+    assert body["metrics"]["n_trades"] == 2
+    assert body["metrics"]["long"]["n"] == 1 and body["metrics"]["short"]["n"] == 1
 
 
 def test_live_enable_requires_confirmation_and_champion(client):
