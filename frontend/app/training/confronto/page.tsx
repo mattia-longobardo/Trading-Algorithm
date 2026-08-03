@@ -4,10 +4,9 @@ import Link from "next/link";
 import { ArrowLeftIcon, DnaIcon } from "lucide-react";
 
 import { DuelChart } from "@/components/charts/duel-chart";
-import { AgentStatusStamp } from "@/components/arena";
+import { AgentStatusStamp, DirectionStamp, orDash } from "@/components/arena";
 import { PageHeader } from "@/components/page-header";
 import { CardSkeleton, ErrorState, TableSkeleton } from "@/components/query-states";
-import { Stamp } from "@/components/stamp";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -27,29 +26,7 @@ import {
 import { fmtNum, fmtPct, fmtPctSigned, pnlClass } from "@/lib/format";
 import { useDisplay, type Display } from "@/lib/money";
 import { useArena, useArenaAgent } from "@/lib/queries";
-import type {
-  AgentDetail,
-  AgentMetrics,
-  AgentSimTrade,
-  TradeDirection,
-} from "@/lib/types";
-
-/** Valore mancante: il campione è troppo piccolo per calcolarlo. */
-const DASH = "—";
-
-/** Applica il formattatore solo se il valore c'è, altrimenti trattino. */
-function orDash(value: number | null | undefined, fmt: (v: number) => string): string {
-  return value == null ? DASH : fmt(value);
-}
-
-/** Verso della posizione: lo short è l'eccezione, quindi è l'unico evidenziato. */
-function DirectionStamp({ direction }: { direction: TradeDirection }) {
-  return direction === "short" ? (
-    <Stamp tone="accent">Short</Stamp>
-  ) : (
-    <Stamp tone="neutral">Long</Stamp>
-  );
-}
+import type { AgentDetail, AgentMetrics, AgentSimTrade } from "@/lib/types";
 
 /** Verso del confronto: più alto vince, oppure più vicino a zero vince. */
 type Better = "higher" | "zero";
