@@ -31,6 +31,11 @@ _BACKOFF_BASE_S = 1.0
 _ORDER_POLL_TIMEOUT_S = 30.0
 _ORDER_POLL_INTERVAL_S = 1.0
 
+# I budget eToro sono per chiave, non per oggetto client: un limiter per
+# istanza moltiplicherebbe il pool `execution` (20/60s) per ogni chiamante che
+# si costruisce il proprio client. Uno solo per processo, condiviso di default.
+_SHARED_RATE_LIMITER = RateLimiter()
+
 ORDER_STATUS_FILLED = 3
 # 4 Rejected, 7 Canceled, 8 Expired, 9 CanceledPartiallyFilled, 10 RejectedPartiallyFilled
 _ORDER_STATUS_TERMINAL_KO = {4, 7, 8, 9, 10}
@@ -115,7 +120,7 @@ class EtoroClient:
         self._api_key = api_key
         self._user_key = user_key
         self._session = session or requests.Session()
-        self._rate_limiter = rate_limiter or RateLimiter()
+        self._rate_limiter = rate_limiter or _SHARED_RATE_LIMITER
         self._timeout = timeout_s
         self._sleep = time.sleep  # iniettabile nei test
         self._clock = time.monotonic
