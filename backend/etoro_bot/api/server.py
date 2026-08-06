@@ -444,7 +444,7 @@ def _backtest_service(identity: UserIdentity):
             out[day] = float(c["close"])
         return out
 
-    return BacktestService(get_repo(), price_fetcher)
+    return BacktestService(get_repo(), price_fetcher, settings=_full_settings())
 
 
 def _pct(value: float | None) -> float | None:

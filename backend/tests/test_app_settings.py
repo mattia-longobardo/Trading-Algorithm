@@ -76,6 +76,28 @@ def test_live_blocked_by_kill_switch(repo):
     assert "kill switch" in str(exc.value)
 
 
+def test_live_usa_il_breaker_condiviso(repo):
+    """Lo stato in memoria del breaker singleton blocca il live.
+
+    Con un'istanza effimera il trip non ancora salvato su file resterebbe
+    invisibile (e il suo _save() sovrascriverebbe lo stato condiviso).
+    """
+    from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
+    from etoro_bot.config import load_breaker_rules
+    from etoro_bot.safety.circuit_breaker import get_breaker
+
+    agent_id = repo.create_agent("G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-06",
+                                 10_000.0)
+    repo.set_champion(agent_id)
+    breaker = get_breaker(load_breaker_rules())
+    breaker.state.tripped = True  # solo in memoria: il file di stato resta pulito
+    breaker.state.cooloff_until = None
+
+    with pytest.raises(SettingsValidationError) as exc:
+        check_live_activation(repo, etoro_configured=True)
+    assert "circuit breaker" in str(exc.value)
+
+
 def test_live_allowed_with_champion_and_keys(repo):
     from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
 

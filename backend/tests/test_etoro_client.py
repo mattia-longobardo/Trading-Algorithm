@@ -367,6 +367,14 @@ def test_search_instruments_paginates_and_requires_fields():
     assert session.calls[1]["params"]["pageNumber"] == 2
 
 
+def test_clients_share_the_default_rate_limiter():
+    """Il budget per pool è della chiave API, non del singolo oggetto client:
+    due client costruiti dalle stesse chiavi devono consumare lo stesso pool."""
+    a = EtoroClient("test-api-key", "test-user-key")
+    b = EtoroClient("test-api-key", "test-user-key")
+    assert a._rate_limiter is b._rate_limiter
+
+
 def test_rate_limiter_uses_safety_margin():
     now = {"t": 0.0}
     waits: list[float] = []
