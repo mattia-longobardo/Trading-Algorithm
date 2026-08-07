@@ -24,22 +24,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { EquityChart } from "@/components/charts/equity-chart";
-import {
-  MobileField,
-  MobileFields,
-  MobileItem,
-  MobileItemHeader,
-  MobileList,
-} from "@/components/mobile-list";
+import { ResponsiveTable, type ResponsiveColumn } from "@/components/responsive-table";
 import { SectorDonut } from "@/components/charts/sector-donut";
 import { ExecutionStatusBadge, SideBadge } from "@/components/status-badges";
 import { LiveBadge } from "@/components/site-header";
@@ -59,7 +45,7 @@ import {
 } from "@/lib/queries";
 import { fmtNum, fmtPct, pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
-import type { DateRangeValue } from "@/lib/types";
+import type { DateRangeValue, Execution } from "@/lib/types";
 
 function StatusCard() {
   const { data: status, isLoading, error } = useStatus();
@@ -315,6 +301,52 @@ function ActionsCard() {
   );
 }
 
+/** Colonne del registro esecuzioni: `d` arriva dall'hook, quindi è una fabbrica. */
+function executionColumns(
+  d: ReturnType<typeof useDisplay>,
+): ResponsiveColumn<Execution>[] {
+  return [
+    {
+      key: "created",
+      header: "Data",
+      className: "font-mono text-[13px] tabular-nums",
+      cell: (ex) => d.dateTime(ex.created_at),
+      mobile: {
+        label: "Data",
+        order: 2,
+        render: (ex) => (
+          <span className="font-mono text-xs tabular-nums">{d.dateTime(ex.created_at)}</span>
+        ),
+      },
+    },
+    {
+      key: "symbol",
+      header: "Simbolo",
+      className: "font-mono font-medium",
+      cell: (ex) => ex.symbol,
+    },
+    { key: "side", header: "Lato", cell: (ex) => <SideBadge side={ex.side} /> },
+    {
+      key: "amount",
+      header: "Importo",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (ex) => d.money(ex.amount_usd),
+      mobile: {
+        label: "Importo",
+        order: 1,
+        render: (ex) => <span className="font-mono tabular-nums">{d.money(ex.amount_usd)}</span>,
+      },
+    },
+    {
+      key: "status",
+      header: "Esito",
+      cell: (ex) => <ExecutionStatusBadge status={ex.status} />,
+    },
+  ];
+}
+
+
 function RecentExecutionsCard() {
   const { data, isLoading, error } = useExecutions(8);
   const d = useDisplay();
@@ -335,69 +367,20 @@ function RecentExecutionsCard() {
             Nessuna esecuzione registrata — il registro si popola quando il live è attivo
           </p>
         ) : (
-          <>
-            <div className="max-md:hidden">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Data</TableHead>
-                    <TableHead>Simbolo</TableHead>
-                    <TableHead>Lato</TableHead>
-                    <TableHead className="text-right">Importo</TableHead>
-                    <TableHead>Esito</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data!.executions.map((ex) => (
-                    <TableRow key={ex.id}>
-                      <TableCell className="font-mono text-[13px] tabular-nums">
-                        {d.dateTime(ex.created_at)}
-                      </TableCell>
-                      <TableCell className="font-mono font-medium">
-                        {ex.symbol}
-                      </TableCell>
-                      <TableCell>
-                        <SideBadge side={ex.side} />
-                      </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums">
-                        {d.money(ex.amount_usd)}
-                      </TableCell>
-                      <TableCell>
-                        <ExecutionStatusBadge status={ex.status} />
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-            <MobileList>
-              {data!.executions.map((ex) => (
-                <MobileItem key={ex.id}>
-                  <MobileItemHeader>
-                    <span className="font-mono text-sm font-medium">
-                      {ex.symbol}
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      <SideBadge side={ex.side} />
-                      <ExecutionStatusBadge status={ex.status} />
-                    </span>
-                  </MobileItemHeader>
-                  <MobileFields>
-                    <MobileField label="Importo">
-                      <span className="font-mono tabular-nums">
-                        {d.money(ex.amount_usd)}
-                      </span>
-                    </MobileField>
-                    <MobileField label="Data">
-                      <span className="font-mono text-xs tabular-nums">
-                        {d.dateTime(ex.created_at)}
-                      </span>
-                    </MobileField>
-                  </MobileFields>
-                </MobileItem>
-              ))}
-            </MobileList>
-          </>
+          <ResponsiveTable
+            rows={data!.executions}
+            rowKey={(ex) => ex.id}
+            columns={executionColumns(d)}
+            mobileHeader={(ex) => (
+              <>
+                <span className="font-mono text-sm font-medium">{ex.symbol}</span>
+                <span className="flex items-center gap-1.5">
+                  <SideBadge side={ex.side} />
+                  <ExecutionStatusBadge status={ex.status} />
+                </span>
+              </>
+            )}
+          />
         )}
       </CardContent>
     </Card>

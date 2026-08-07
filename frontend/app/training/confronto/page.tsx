@@ -4,7 +4,11 @@ import Link from "next/link";
 import { ArrowLeftIcon, DnaIcon } from "lucide-react";
 
 import { DuelChart } from "@/components/charts/duel-chart";
-import { AgentStatusStamp, DirectionStamp, orDash } from "@/components/arena";
+import {
+  AgentStatusStamp,
+  orDash,
+  SimTradesTable,
+} from "@/components/arena";
 import { PageHeader } from "@/components/page-header";
 import { CardSkeleton, ErrorState, TableSkeleton } from "@/components/query-states";
 import { Button } from "@/components/ui/button";
@@ -245,7 +249,6 @@ function mergeTrades(details: AgentDetail[]): MergedTrade[] {
 }
 
 function TradesCard({ left, right }: { left: AgentDetail; right: AgentDetail }) {
-  const d = useDisplay();
   const trades = mergeTrades([left, right]);
   return (
     <Card>
@@ -261,63 +264,7 @@ function TradesCard({ left, right }: { left: AgentDetail; right: AgentDetail }) 
             Ancora nessun trade chiuso
           </p>
         ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Agente</TableHead>
-                <TableHead>Simbolo</TableHead>
-                <TableHead>Direzione</TableHead>
-                <TableHead className="text-right">Importo</TableHead>
-                <TableHead className="text-right">PnL</TableHead>
-                <TableHead className="text-right">Durata</TableHead>
-                <TableHead>Chiusura</TableHead>
-                <TableHead>Motivo chiusura</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {trades.map((t) => (
-                <TableRow key={`${t.agentId}-${t.id}`}>
-                  <TableCell>
-                    <Link
-                      href={`/training/${t.agentId}`}
-                      className="font-mono text-xs hover:underline"
-                    >
-                      {t.agentName}
-                    </Link>
-                  </TableCell>
-                  <TableCell className="font-mono font-medium" title={t.open_reason}>
-                    {t.symbol}
-                  </TableCell>
-                  <TableCell>
-                    <DirectionStamp direction={t.direction} />
-                  </TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {d.money(t.amount_usd)}
-                  </TableCell>
-                  <TableCell
-                    className={`text-right font-mono tabular-nums ${pnlClass(t.pnl_usd)}`}
-                  >
-                    {d.moneySigned(t.pnl_usd)}
-                    {t.return_pct != null && (
-                      <span className="ml-1.5 text-xs">({fmtPctSigned(t.return_pct)})</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {fmtNum(t.holding_hours, 1)} h
-                  </TableCell>
-                  <TableCell className="font-mono text-xs whitespace-nowrap">
-                    {d.dateTime(t.closed_at)}
-                  </TableCell>
-                  <TableCell
-                    className="text-muted-foreground max-w-64 truncate text-xs"
-                    title={t.close_reason}
-                  >
-                    {t.close_reason}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <SimTradesTable trades={trades} showAgentColumn showPrices={false} />
         )}
       </CardContent>
     </Card>

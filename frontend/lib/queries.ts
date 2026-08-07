@@ -384,31 +384,11 @@ export function useFetchNews() {
 /** Upload multipart (file + tickers opzionali): non passa da `lib/api.ts`
  * (che serializza sempre JSON) — fetch diretto, niente Content-Type esplicito
  * così il browser imposta il boundary multipart corretto. */
-async function uploadDocument(formData: FormData): Promise<IngestResult> {
-  const res = await fetch("/api/knowledge/ingest", {
-    method: "POST",
-    body: formData,
-  });
-  if (!res.ok) {
-    let detail = `Errore HTTP ${res.status}`;
-    try {
-      const body: unknown = await res.json();
-      if (body && typeof body === "object" && "detail" in body) {
-        const d = (body as { detail: unknown }).detail;
-        detail = typeof d === "string" ? d : JSON.stringify(d);
-      }
-    } catch {
-      // body non-JSON: si tiene il messaggio generico
-    }
-    throw new ApiError(res.status, detail);
-  }
-  return (await res.json()) as IngestResult;
-}
-
 export function useIngestDocument() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (formData: FormData) => uploadDocument(formData),
+    mutationFn: (formData: FormData) =>
+      api.postForm<IngestResult>("/knowledge/ingest", formData),
     onSuccess: (data) => {
       const detected = data.tickers?.length
         ? `titoli rilevati: ${data.tickers.join(", ")}`

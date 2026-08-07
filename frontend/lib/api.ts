@@ -62,6 +62,10 @@ export const api = {
   del<T>(path: string): Promise<T> {
     return fetch(`/api${path}`, { method: "DELETE" }).then((r) => handle<T>(r));
   },
+  /** Upload multipart: niente Content-Type a mano, lo mette il browser col boundary. */
+  postForm<T>(path: string, form: FormData): Promise<T> {
+    return fetch(`/api${path}`, { method: "POST", body: form }).then((r) => handle<T>(r));
+  },
 };
 
 export function errorMessage(err: unknown): string {

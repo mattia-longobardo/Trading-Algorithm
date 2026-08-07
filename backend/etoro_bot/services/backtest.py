@@ -23,6 +23,7 @@ import numpy as np
 
 from etoro_bot.config import load_settings
 from etoro_bot.db.repo import Repository
+from etoro_bot.services import stats
 
 TRADING_DAYS_PER_YEAR = 252
 MIN_TRADES_FOR_STATS = 30    # §11.2: sotto, campione insufficiente
@@ -75,9 +76,7 @@ def cagr(returns: list[float], periods_per_year: int = TRADING_DAYS_PER_YEAR) ->
 def annualized_volatility(
     returns: list[float], periods_per_year: int = TRADING_DAYS_PER_YEAR
 ) -> float | None:
-    if len(returns) < 2:
-        return None
-    return float(np.std(returns, ddof=1) * np.sqrt(periods_per_year))
+    return stats.annualized_volatility(returns, periods_per_year)
 
 
 def sharpe(returns: list[float], risk_free_rate: float = 0.0) -> float | None:
@@ -102,12 +101,15 @@ def sortino(returns: list[float], risk_free_rate: float = 0.0) -> float | None:
 
 
 def max_drawdown(returns: list[float]) -> float | None:
-    """Massima perdita peak-to-trough sulla curva cumulata (valore ≤ 0)."""
+    """Massima perdita peak-to-trough sulla curva cumulata (valore ≤ 0).
+
+    In frazione, non in percentuale: qui i rendimenti sono frazionari e le
+    route moltiplicano per 100 in un punto solo.
+    """
     if not returns:
         return None
-    curve = np.cumprod(np.asarray(returns) + 1.0)
-    peaks = np.maximum.accumulate(curve)
-    return float(np.min(curve / peaks - 1.0))
+    worst = stats.max_drawdown_pct(stats.cumulative_levels(returns))
+    return 0.0 if worst is None else worst / 100.0
 
 
 def calmar(returns: list[float]) -> float | None:

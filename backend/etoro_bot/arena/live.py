@@ -36,7 +36,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from etoro_bot.arena.dna import clamp_dna
+from etoro_bot.arena.dna import clamp_dna, risk_close_reason
 from etoro_bot.arena.engine import ArenaDeps
 from etoro_bot.arena.trader import LONG, SHORT, build_prompt, decide, enforce
 from etoro_bot.domain import (
@@ -984,8 +984,6 @@ def _run_live_cycle_locked(
     # stop loss / take profit del DNA (0 = disattivati: decide solo il campione).
     # Girano PRIMA della chiamata all'LLM: un modello lento non deve poter
     # ritardare uno stop loss.
-    sl = float(dna["stop_loss_pct"])
-    tp = float(dna["take_profit_pct"])
     for pos in list(positions):
         price = prices.get(pos.symbol)
         if not price or not pos.entry_price:
@@ -1000,12 +998,8 @@ def _run_live_cycle_locked(
                 pos.etoro_position_id, pos.symbol,
             )
             continue
-        change_pct = position_change_pct(pos, price, direction)
-        reason = None
-        if sl > 0 and change_pct <= -sl:
-            reason = f"stop loss automatico ({change_pct:+.2f}%)"
-        elif tp > 0 and change_pct >= tp:
-            reason = f"take profit automatico ({change_pct:+.2f}%)"
+        # stesse soglie e stessi messaggi del ciclo simulato (arena/dna.py)
+        reason = risk_close_reason(dna, position_change_pct(pos, price, direction))
         if reason is None:
             continue
         try:
