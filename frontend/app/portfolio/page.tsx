@@ -9,28 +9,15 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { DirectionStamp } from "@/components/arena";
 import { SectorDonut } from "@/components/charts/sector-donut";
-import {
-  MobileField,
-  MobileFields,
-  MobileItem,
-  MobileItemHeader,
-  MobileList,
-} from "@/components/mobile-list";
+import { ResponsiveTable, type ResponsiveColumn } from "@/components/responsive-table";
 import { PageHeader } from "@/components/page-header";
 import { CardSkeleton, ErrorState, TableSkeleton } from "@/components/query-states";
 import { usePortfolio } from "@/lib/queries";
 import { fmtPctSigned, pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
+import type { Position } from "@/lib/types";
 
 function SummaryTiles({
   cash,
@@ -72,6 +59,91 @@ function SummaryTiles({
 export default function PortfolioPage() {
   const { data, isLoading, error } = usePortfolio();
   const d = useDisplay();
+
+  const columns: ResponsiveColumn<Position>[] = [
+    {
+      key: "symbol",
+      header: "Simbolo",
+      className: "font-mono font-medium",
+      cell: (p) => p.symbol,
+    },
+    {
+      key: "direction",
+      header: "Direzione",
+      cell: (p) => <DirectionStamp direction={p.direction} />,
+    },
+    {
+      key: "sector",
+      header: "Settore",
+      className: "text-muted-foreground",
+      cell: (p) => p.sector ?? "n/d",
+    },
+    {
+      key: "amount",
+      header: "Importo",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (p) => d.money(p.amount_usd),
+      mobile: {
+        label: "Importo",
+        order: 1,
+        render: (p) => <span className="font-mono tabular-nums">{d.money(p.amount_usd)}</span>,
+      },
+    },
+    {
+      key: "entry",
+      header: "Entry",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (p) => d.money(p.entry_price),
+      mobile: {
+        label: "Entry",
+        order: 3,
+        render: (p) => <span className="font-mono tabular-nums">{d.money(p.entry_price)}</span>,
+      },
+    },
+    {
+      key: "current",
+      header: "Attuale",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (p) => d.money(p.current_price),
+      mobile: {
+        label: "Attuale",
+        order: 4,
+        render: (p) => <span className="font-mono tabular-nums">{d.money(p.current_price)}</span>,
+      },
+    },
+    {
+      key: "pnl",
+      header: "PnL",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (p) => (
+        <span className={pnlClass(p.unrealized_pnl_usd)}>{d.moneySigned(p.unrealized_pnl_usd)}</span>
+      ),
+    },
+    {
+      key: "pnl_pct",
+      header: "PnL %",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (p) => (
+        <span className={pnlClass(p.unrealized_pnl_pct)}>{fmtPctSigned(p.unrealized_pnl_pct)}</span>
+      ),
+    },
+    {
+      key: "opened",
+      header: "Apertura",
+      className: "font-mono text-[13px] whitespace-nowrap tabular-nums",
+      cell: (p) => d.date(p.opened_at),
+      mobile: {
+        label: "Apertura",
+        order: 2,
+        render: (p) => <span className="font-mono text-xs tabular-nums">{d.date(p.opened_at)}</span>,
+      },
+    },
+  ];
 
   return (
     <div className="space-y-6">
@@ -142,85 +214,24 @@ export default function PortfolioPage() {
                     le run live
                   </p>
                 ) : (
-                  <>
-                  <div className="max-md:hidden">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Simbolo</TableHead>
-                        <TableHead>Direzione</TableHead>
-                        <TableHead>Settore</TableHead>
-                        <TableHead className="text-right">Importo</TableHead>
-                        <TableHead className="text-right">Entry</TableHead>
-                        <TableHead className="text-right">Attuale</TableHead>
-                        <TableHead className="text-right">PnL</TableHead>
-                        <TableHead className="text-right">PnL %</TableHead>
-                        <TableHead>Apertura</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {data.positions.map((p) => (
-                        <TableRow key={String(p.etoro_position_id)}>
-                          <TableCell className="font-mono font-medium">
-                            {p.symbol}
-                          </TableCell>
-                          <TableCell>
-                            <DirectionStamp direction={p.direction} />
-                          </TableCell>
-                          <TableCell className="text-muted-foreground">
-                            {p.sector ?? "n/d"}
-                          </TableCell>
-                          <TableCell className="text-right font-mono tabular-nums">
-                            {d.money(p.amount_usd)}
-                          </TableCell>
-                          <TableCell className="text-right font-mono tabular-nums">
-                            {d.money(p.entry_price)}
-                          </TableCell>
-                          <TableCell className="text-right font-mono tabular-nums">
-                            {d.money(p.current_price)}
-                          </TableCell>
-                          <TableCell
-                            className={`text-right font-mono tabular-nums ${pnlClass(p.unrealized_pnl_usd)}`}
-                          >
-                            {d.moneySigned(p.unrealized_pnl_usd)}
-                          </TableCell>
-                          <TableCell
-                            className={`text-right font-mono tabular-nums ${pnlClass(p.unrealized_pnl_pct)}`}
-                          >
-                            {fmtPctSigned(p.unrealized_pnl_pct)}
-                          </TableCell>
-                          <TableCell className="font-mono text-[13px] whitespace-nowrap tabular-nums">
-                            {d.date(p.opened_at)}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                  </div>
-                  <MobileList>
-                    {data.positions.map((p) => (
-                      <MobileItem key={String(p.etoro_position_id)}>
-                        <MobileItemHeader>
-                          <span className="flex min-w-0 items-baseline gap-2">
-                            <span className="font-mono text-sm font-medium">{p.symbol}</span>
-                            <DirectionStamp direction={p.direction} />
-                            <span className="text-muted-foreground truncate text-xs">{p.sector ?? "n/d"}</span>
-                          </span>
-                          <span className={`font-mono text-sm font-medium tabular-nums ${pnlClass(p.unrealized_pnl_usd)}`}>
-                            {d.moneySigned(p.unrealized_pnl_usd)}
-                            <span className="ml-1.5 text-xs">{fmtPctSigned(p.unrealized_pnl_pct)}</span>
-                          </span>
-                        </MobileItemHeader>
-                        <MobileFields>
-                          <MobileField label="Importo"><span className="font-mono tabular-nums">{d.money(p.amount_usd)}</span></MobileField>
-                          <MobileField label="Apertura"><span className="font-mono text-xs tabular-nums">{d.date(p.opened_at)}</span></MobileField>
-                          <MobileField label="Entry"><span className="font-mono tabular-nums">{d.money(p.entry_price)}</span></MobileField>
-                          <MobileField label="Attuale"><span className="font-mono tabular-nums">{d.money(p.current_price)}</span></MobileField>
-                        </MobileFields>
-                      </MobileItem>
-                    ))}
-                  </MobileList>
-                  </>
+                  <ResponsiveTable
+                    rows={data.positions}
+                    rowKey={(p) => String(p.etoro_position_id)}
+                    columns={columns}
+                    mobileHeader={(p) => (
+                      <>
+                        <span className="flex min-w-0 items-baseline gap-2">
+                          <span className="font-mono text-sm font-medium">{p.symbol}</span>
+                          <DirectionStamp direction={p.direction} />
+                          <span className="text-muted-foreground truncate text-xs">{p.sector ?? "n/d"}</span>
+                        </span>
+                        <span className={`font-mono text-sm font-medium tabular-nums ${pnlClass(p.unrealized_pnl_usd)}`}>
+                          {d.moneySigned(p.unrealized_pnl_usd)}
+                          <span className="ml-1.5 text-xs">{fmtPctSigned(p.unrealized_pnl_pct)}</span>
+                        </span>
+                      </>
+                    )}
+                  />
                 )}
               </CardContent>
             </Card>

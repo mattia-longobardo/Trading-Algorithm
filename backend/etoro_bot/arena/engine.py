@@ -27,6 +27,7 @@ from etoro_bot.arena.dna import (
     clamp_dna,
     mutate,
     position_direction,
+    risk_close_reason,
     survival_creed,
 )
 from etoro_bot.arena.trader import SHORT, build_prompt, decide, enforce
@@ -128,17 +129,13 @@ def auto_risk_closes(dna: dict, positions, prices: dict[str, float]) -> list[tup
     a decidere quando uscire.
     """
     closes: list[tuple] = []
-    sl = float(dna["stop_loss_pct"])
-    tp = float(dna["take_profit_pct"])
     for pos in positions:
         price = prices.get(pos.symbol)
         if not price or not pos.entry_price:
             continue
-        change_pct = position_change_pct(pos, price)
-        if sl > 0 and change_pct <= -sl:
-            closes.append((pos, f"stop loss automatico ({change_pct:+.2f}%)"))
-        elif tp > 0 and change_pct >= tp:
-            closes.append((pos, f"take profit automatico ({change_pct:+.2f}%)"))
+        reason = risk_close_reason(dna, position_change_pct(pos, price))
+        if reason is not None:
+            closes.append((pos, reason))
     return closes
 
 

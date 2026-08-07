@@ -17,18 +17,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { PageHeader } from "@/components/page-header";
 import { ErrorState, TableSkeleton } from "@/components/query-states";
 import { Stamp } from "@/components/stamp";
 import { MultiStatusFilter } from "@/components/multi-status-filter";
-import {
-  MobileField,
-  MobileFields,
-  MobileItem,
-  MobileItemHeader,
-  MobileList,
-} from "@/components/mobile-list";
+import { ResponsiveTable, type ResponsiveColumn } from "@/components/responsive-table";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useCancelExecution, useCloseTrade, useTrades } from "@/lib/queries";
 import { useDisplay } from "@/lib/money";
@@ -86,6 +79,85 @@ export default function TradesPage() {
   const cancelExecution = useCancelExecution();
   const d = useDisplay();
 
+  const columns: ResponsiveColumn<TradeItem>[] = [
+    {
+      key: "symbol",
+      header: "Simbolo",
+      className: "font-mono font-medium",
+      cell: (trade) => trade.symbol,
+    },
+    {
+      key: "status",
+      header: "Stato",
+      cell: (trade) => <Stamp tone={toneForStatus(trade.status)}>{trade.status}</Stamp>,
+    },
+    {
+      key: "side",
+      header: "Lato",
+      className: "font-mono text-xs uppercase",
+      cell: (trade) => trade.side,
+    },
+    {
+      key: "amount",
+      header: "Importo",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (trade) => d.money(trade.amount_usd),
+      mobile: {
+        label: "Importo",
+        render: (trade) => <span className="font-mono tabular-nums">{d.money(trade.amount_usd)}</span>,
+      },
+    },
+    {
+      key: "price",
+      header: "Prezzo",
+      headerClassName: "text-right",
+      className: "text-right font-mono tabular-nums",
+      cell: (trade) => d.money(trade.entry_price),
+      mobile: {
+        label: "Prezzo",
+        render: (trade) => <span className="font-mono tabular-nums">{d.money(trade.entry_price)}</span>,
+      },
+    },
+    {
+      key: "created",
+      header: "Data / ora",
+      className: "font-mono text-xs whitespace-nowrap tabular-nums",
+      cell: (trade) => d.dateTime(trade.created_at),
+      mobile: {
+        label: "Data / ora",
+        wide: true,
+        render: (trade) => (
+          <span className="font-mono text-xs tabular-nums">{d.dateTime(trade.created_at)}</span>
+        ),
+      },
+    },
+    {
+      key: "detail",
+      header: "Dettaglio",
+      className: "text-muted-foreground max-w-56 truncate text-xs",
+      cell: (trade) => trade.detail ?? "n/d",
+      mobile: {
+        label: "Dettaglio",
+        wide: true,
+        // niente dettaglio = niente campo sulla scheda
+        render: (trade) =>
+          trade.detail ? (
+            <span className="text-muted-foreground text-xs">{trade.detail}</span>
+          ) : null,
+      },
+    },
+    {
+      key: "actions",
+      header: "Azioni",
+      headerClassName: "text-right",
+      className: "text-right",
+      cell: (trade) => (
+        <TradeAction trade={trade} closeTrade={closeTrade} cancelExecution={cancelExecution} />
+      ),
+    },
+  ];
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
@@ -121,69 +193,27 @@ export default function TradesPage() {
           {trades.isLoading ? <TableSkeleton rows={8} /> : trades.error ? (
             <ErrorState error={trades.error} />
           ) : (
-            <>
-            <div className="max-md:hidden">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Simbolo</TableHead><TableHead>Stato</TableHead><TableHead>Lato</TableHead>
-                  <TableHead className="text-right">Importo</TableHead><TableHead className="text-right">Prezzo</TableHead>
-                  <TableHead>Data / ora</TableHead><TableHead>Dettaglio</TableHead><TableHead className="text-right">Azioni</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {(trades.data?.trades ?? []).map((trade) => (
-                  <TableRow key={trade.id}>
-                    <TableCell className="font-mono font-medium">{trade.symbol}</TableCell>
-                    <TableCell><Stamp tone={toneForStatus(trade.status)}>{trade.status}</Stamp></TableCell>
-                    <TableCell className="font-mono text-xs uppercase">{trade.side}</TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">{d.money(trade.amount_usd)}</TableCell>
-                    <TableCell className="text-right font-mono tabular-nums">{d.money(trade.entry_price)}</TableCell>
-                    <TableCell className="font-mono text-xs whitespace-nowrap tabular-nums">{d.dateTime(trade.created_at)}</TableCell>
-                    <TableCell className="text-muted-foreground max-w-56 truncate text-xs">{trade.detail ?? "n/d"}</TableCell>
-                    <TableCell className="text-right">
-                      <TradeAction trade={trade} closeTrade={closeTrade} cancelExecution={cancelExecution} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            </div>
-            <MobileList>
-              {(trades.data?.trades ?? []).map((trade) => (
-                <MobileItem key={trade.id}>
-                  <MobileItemHeader>
-                    <span className="flex items-center gap-2">
-                      <span className="font-mono text-sm font-medium">{trade.symbol}</span>
-                      <span className="text-muted-foreground font-mono text-xs uppercase">{trade.side}</span>
-                    </span>
-                    <Stamp tone={toneForStatus(trade.status)}>{trade.status}</Stamp>
-                  </MobileItemHeader>
-                  <MobileFields>
-                    <MobileField label="Importo">
-                      <span className="font-mono tabular-nums">{d.money(trade.amount_usd)}</span>
-                    </MobileField>
-                    <MobileField label="Prezzo">
-                      <span className="font-mono tabular-nums">{d.money(trade.entry_price)}</span>
-                    </MobileField>
-                    <MobileField label="Data / ora" wide>
-                      <span className="font-mono text-xs tabular-nums">{d.dateTime(trade.created_at)}</span>
-                    </MobileField>
-                    {trade.detail ? (
-                      <MobileField label="Dettaglio" wide>
-                        <span className="text-muted-foreground text-xs">{trade.detail}</span>
-                      </MobileField>
-                    ) : null}
-                  </MobileFields>
-                  {(trade.can_close && trade.position_id) || (trade.can_cancel && trade.execution_id) ? (
-                    <div className="mt-3">
-                      <TradeAction trade={trade} closeTrade={closeTrade} cancelExecution={cancelExecution} />
-                    </div>
-                  ) : null}
-                </MobileItem>
-              ))}
-            </MobileList>
-            </>
+            <ResponsiveTable
+              rows={trades.data?.trades ?? []}
+              rowKey={(trade) => trade.id}
+              columns={columns}
+              mobileHeader={(trade) => (
+                <>
+                  <span className="flex items-center gap-2">
+                    <span className="font-mono text-sm font-medium">{trade.symbol}</span>
+                    <span className="text-muted-foreground font-mono text-xs uppercase">{trade.side}</span>
+                  </span>
+                  <Stamp tone={toneForStatus(trade.status)}>{trade.status}</Stamp>
+                </>
+              )}
+              mobileFooter={(trade) =>
+                (trade.can_close && trade.position_id) || (trade.can_cancel && trade.execution_id) ? (
+                  <div className="mt-3">
+                    <TradeAction trade={trade} closeTrade={closeTrade} cancelExecution={cancelExecution} />
+                  </div>
+                ) : null
+              }
+            />
           )}
         </CardContent>
       </Card>

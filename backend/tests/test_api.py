@@ -16,10 +16,10 @@ def client(repo, pg_url, tmp_path, monkeypatch):
 
     from fastapi.testclient import TestClient
 
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     importlib.reload(server)  # ricostruisce app e cache col nuovo env
-    server.get_repo.cache_clear()
+    dependencies.get_repo.cache_clear()
     with TestClient(server.app) as tc:
         yield tc
 
@@ -60,10 +60,10 @@ def test_status_says_scheduler_inactive_when_lock_is_taken(
         monkeypatch.delenv("DISABLE_SCHEDULER", raising=False)
         monkeypatch.delenv("ETORO_BOT_KILL", raising=False)
 
-        from etoro_bot.api import server
+        from etoro_bot.api import dependencies, server
 
         importlib.reload(server)
-        server.get_repo.cache_clear()
+        dependencies.get_repo.cache_clear()
         with caplog.at_level("CRITICAL"), TestClient(server.app) as tc:
             body = tc.get("/status").json()
         assert body["scheduler_active"] is False
@@ -196,14 +196,14 @@ def test_arena_agent_metrics_see_all_trades_not_just_the_shown_ones(
     client, repo, monkeypatch
 ):
     """La lista trade è cappata per la UI, le metriche contano tutto lo storico."""
-    from etoro_bot.api import server
+    from etoro_bot.api.routers import arena as arena_router
 
     agent_id = _seed_arena_agent(repo)
     # il limite del repo tronca davvero, e `None` restituisce tutto
     assert len(repo.sim_trades(agent_id, limit=1)) == 1
     assert len(repo.sim_trades(agent_id, limit=None)) == 2
 
-    monkeypatch.setattr(server, "ARENA_TRADES_SHOWN", 1)  # cap ridotto, stesso effetto
+    monkeypatch.setattr(arena_router, "ARENA_TRADES_SHOWN", 1)  # cap ridotto, stesso effetto
     body = client.get(f"/arena/agents/{agent_id}").json()
     assert len(body["trades"]) == 1
     assert body["metrics"]["n_trades"] == 2
@@ -230,13 +230,13 @@ def test_knowledge_status_degraded(client, monkeypatch):
 
 
 def test_portfolio_empty(client, monkeypatch):
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     class FakeEtoro:
         def get_portfolio(self):
             return {"credit": 51_073.77}
 
-    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+    monkeypatch.setattr(dependencies, "make_client", lambda *_: FakeEtoro())
     body = client.get("/portfolio").json()
     assert body["positions"] == []
     assert body["equity_usd"] == body["cash_usd"] == 51_073.77
@@ -250,7 +250,7 @@ def test_portfolio_equity_is_marked_to_market(client, monkeypatch):
     /portfolio mostrava un numero e il circuit breaker ne usava un altro."""
     from datetime import datetime, timezone
 
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     class FakeEtoro:
         def get_portfolio(self):
@@ -259,11 +259,11 @@ def test_portfolio_equity_is_marked_to_market(client, monkeypatch):
         def get_rates(self, instrument_ids):
             return {1: {"lastExecution": 200.0}}  # comprata a 100: +100%
 
-    repo = server.get_repo()
+    repo = dependencies.get_repo()
     now = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
     repo.create_run("live-test", environment="live")
     repo.register_open_position(901, "live-test", "AAPL", 1, 500.0, 100.0, now)
-    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+    monkeypatch.setattr(dependencies, "make_client", lambda *_: FakeEtoro())
 
     body = client.get("/portfolio").json()
 
@@ -278,7 +278,7 @@ def test_typed_routes_serve_exactly_the_declared_contract(client, repo, monkeypa
     una in meno. Senza dati le liste sarebbero vuote e non proverebbero nulla."""
     from datetime import datetime, timezone
 
-    from etoro_bot.api import schemas, server
+    from etoro_bot.api import dependencies, schemas, server
     from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
     from etoro_bot.domain import ExecutionResult, ExecutionStatus, Side
 
@@ -307,7 +307,7 @@ def test_typed_routes_serve_exactly_the_declared_contract(client, repo, monkeypa
         def get_rates(self, instrument_ids):
             return {1: {"lastExecution": 200.0}}
 
-    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+    monkeypatch.setattr(dependencies, "make_client", lambda *_: FakeEtoro())
 
     attese = {
         "/portfolio": schemas.PortfolioResponse,
@@ -403,12 +403,12 @@ def test_mutating_endpoints_require_the_owner(client, repo, monkeypatch):
 def test_owner_check_returns_503_when_the_database_is_unreadable(client, monkeypatch):
     """DB giù: il proprietario non è verificabile. Fail-closed (503), non
     un via libera a chiunque sul kill switch."""
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     def boom():
         raise RuntimeError("Postgres irraggiungibile")
 
-    monkeypatch.setattr(server.get_repo(), "owner_user_id", boom)
+    monkeypatch.setattr(dependencies.get_repo(), "owner_user_id", boom)
 
     assert client.post("/kill-switch").status_code == 503
     assert client.put("/settings", json={"timezone": "UTC"}).status_code == 503
@@ -428,7 +428,7 @@ def test_startup_aborts_without_internal_token_and_without_dev_flag(monkeypatch)
     """Nessun token e nessun flag di sviluppo: il processo non deve partire."""
     from fastapi.testclient import TestClient
 
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     monkeypatch.delenv("TRADING_INTERNAL_TOKEN", raising=False)
     monkeypatch.delenv("TRADING_DEV_MODE", raising=False)
@@ -447,7 +447,7 @@ def test_close_trade_returns_502_when_the_broker_fails(client, repo, monkeypatch
     La posizione resta aperta a registro: nessun ordine è mai partito."""
     from datetime import UTC, datetime
 
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     class FakeEtoro:
         def close_position(self, position_id, instrument_id, request_id=None):
@@ -457,7 +457,7 @@ def test_close_trade_returns_502_when_the_broker_fails(client, repo, monkeypatch
     repo.register_open_position(
         4242, "live-close-502", "AAPL", 1, 100.0, 10.0, datetime.now(UTC)
     )
-    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+    monkeypatch.setattr(dependencies, "make_client", lambda *_: FakeEtoro())
 
     resp = client.post("/trades/4242/close", json={"confirmation": "CHIUDI"})
     assert resp.status_code == 502
@@ -470,7 +470,7 @@ def test_close_trade_does_not_500_when_the_registry_write_fails(client, repo, mo
     del reconcile."""
     from datetime import UTC, datetime
 
-    from etoro_bot.api import server
+    from etoro_bot.api import dependencies, server
 
     class FakeEtoro:
         def close_position(self, position_id, instrument_id, request_id=None):
@@ -483,9 +483,9 @@ def test_close_trade_does_not_500_when_the_registry_write_fails(client, repo, mo
     repo.register_open_position(
         4343, "live-close-db", "AAPL", 1, 100.0, 10.0, datetime.now(UTC)
     )
-    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+    monkeypatch.setattr(dependencies, "make_client", lambda *_: FakeEtoro())
     monkeypatch.setattr(
-        server.get_repo(), "close_position",
+        dependencies.get_repo(), "close_position",
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("DB KO")),
     )
 

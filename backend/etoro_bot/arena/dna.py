@@ -303,3 +303,20 @@ def survival_creed(floor_pct: float = DEFAULT_SURVIVAL_FLOOR_PCT) -> str:
         "RITMO — Chi opera poco non trova l'edge: l'inerzia è la forma di morte "
         "più comune. Ci si aspetta molte operazioni per sessione, non una."
     )
+
+
+def risk_close_reason(dna: dict[str, Any], change_pct: float) -> str | None:
+    """Motivo di chiusura automatica per una variazione %, o None.
+
+    Stop loss e take profit sono geni: a 0 sono DISATTIVATI e l'agente resta
+    l'unico a decidere quando uscire. Sta qui perché la usano sia il ciclo
+    simulato sia quello live, che prima ne avevano una copia per uno (stesse
+    soglie, stessi messaggi, due punti da tenere allineati a mano).
+    """
+    stop_loss = float(dna["stop_loss_pct"])
+    take_profit = float(dna["take_profit_pct"])
+    if stop_loss > 0 and change_pct <= -stop_loss:
+        return f"stop loss automatico ({change_pct:+.2f}%)"
+    if take_profit > 0 and change_pct >= take_profit:
+        return f"take profit automatico ({change_pct:+.2f}%)"
+    return None

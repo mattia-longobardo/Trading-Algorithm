@@ -77,23 +77,13 @@ def assert_public_url(url: str) -> str:
     return addresses[0]
 
 
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """Connessione all'IP già validato, con `self.host` intatto per l'header Host."""
+class _PinnedConnectionMixin:
+    """Apre il socket verso l'IP già validato lasciando intatto `self.host`.
 
-    pinned_ip: str | None = None
-
-    def _create_connection(self, address, timeout, source_address):
-        host, port = address
-        return socket.create_connection(
-            (self.pinned_ip or host, port), timeout, source_address
-        )
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """Come sopra: l'SNI e la verifica del certificato restano sull'hostname.
-
-    HTTPSConnection.connect() passa `server_hostname=self.host` a wrap_socket,
-    e self.host resta il nome: cambiamo solo il socket TCP sottostante.
+    L'header Host, l'SNI e la verifica del certificato continuano a usare il
+    nome (`HTTPSConnection.connect()` passa `server_hostname=self.host` a
+    wrap_socket): cambia solo l'indirizzo del socket TCP sottostante, che è
+    esattamente ciò che impedisce il rebinding DNS fra controllo e richiesta.
     """
 
     pinned_ip: str | None = None
@@ -103,6 +93,14 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         return socket.create_connection(
             (self.pinned_ip or host, port), timeout, source_address
         )
+
+
+class _PinnedHTTPConnection(_PinnedConnectionMixin, http.client.HTTPConnection):
+    pass
+
+
+class _PinnedHTTPSConnection(_PinnedConnectionMixin, http.client.HTTPSConnection):
+    pass
 
 
 def _connection_factory(ip: str | None, secure: bool):

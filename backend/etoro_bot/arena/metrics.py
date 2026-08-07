@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from etoro_bot.arena.dna import position_direction
+from etoro_bot.services import stats
 
 TRADING_DAYS = 252
 MIN_TRADES_SAMPLE = 5
@@ -39,17 +40,9 @@ def _daily_closes(equity_points: Sequence[Any]) -> list[float]:
     return [by_day[d] for d in sorted(by_day)]
 
 
-def _max_drawdown_pct(series: Sequence[float]) -> float | None:
-    """Peggior scostamento % dal massimo corrente; None sotto i 2 punti."""
-    if len(series) < 2:
-        return None
-    peak = series[0]
-    worst = 0.0
-    for value in series:
-        peak = max(peak, value)
-        if peak > 0:
-            worst = min(worst, (value - peak) / peak * 100.0)
-    return worst
+# drawdown e volatilità stanno in services/stats.py: stessa definizione del
+# track record, una sola implementazione.
+_max_drawdown_pct = stats.max_drawdown_pct
 
 
 def _split_stats(trades: Sequence[Any]) -> dict[str, Any]:
@@ -103,7 +96,9 @@ def compute_agent_metrics(
     if len(closes) >= MIN_DAILY_POINTS and len(returns) >= 2:
         std = statistics.stdev(returns)
         if std > 0:
-            volatility = std * (TRADING_DAYS ** 0.5) * 100.0
+            volatility = stats.annualized_volatility(returns, TRADING_DAYS) * 100.0
+            # Sharpe dell'arena: media dei rendimenti giornalieri, senza tasso
+            # privo di rischio. Diverso da quello del track record, apposta.
             sharpe = statistics.mean(returns) / std * (TRADING_DAYS ** 0.5)
 
     longs = [t for t in trades if trade_direction(t) != "short"]

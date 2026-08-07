@@ -22,6 +22,8 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
+from etoro_bot.domain import EXPLICIT_SYMBOL_PATTERNS
+
 # Alias → ticker. Vale solo per i simboli presenti nell'universo configurato:
 # la tabella può quindi restare generosa senza rischiare match fuori scope.
 COMPANY_ALIASES: dict[str, tuple[str, ...]] = {
@@ -78,13 +80,9 @@ COMPANY_ALIASES: dict[str, tuple[str, ...]] = {
 # Simboli così corti che, senza marcatore, coinciderebbero con parole comuni.
 _AMBIGUOUS_MAX_LEN = 2
 
-# $AAPL | (AAPL) | NASDAQ: AAPL | NYSE:AAPL | AAPL isolato fra separatori
-_EXPLICIT_MARKERS = (
-    r"\$(?P<sym>[A-Z]{1,5})\b",
-    r"\((?P<sym>[A-Z]{1,5})\)",
-    r"\b(?:NASDAQ|NYSE|AMEX|ARCA|BATS|TICKER|SYMBOL)\s*[:\-]\s*(?P<sym>[A-Z]{1,5})\b",
-)
-_EXPLICIT_CAPTURES = [re.compile(p) for p in _EXPLICIT_MARKERS]
+# $AAPL | (AAPL) | NASDAQ: AAPL | NYSE:AAPL | AAPL isolato fra separatori.
+# I marcatori espliciti sono gli stessi della discovery dell'universo.
+_EXPLICIT_CAPTURES = [re.compile(p) for p in EXPLICIT_SYMBOL_PATTERNS]
 
 _BARE_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9$.])([A-Z]{3,5})(?![A-Za-z0-9])")
 
