@@ -127,11 +127,6 @@ class EtoroClient:
         self._instrument_types: dict[int, str] | None = None
         self._stocks_industries: dict[int, str] | None = None
 
-    @property
-    def _trading_segment(self) -> str:
-        """Rotte trading senza segmento: esiste solo il conto reale (niente demo)."""
-        return ""
-
     # ------------------------------------------------------------------ HTTP
 
     def _request(
@@ -335,7 +330,7 @@ class EtoroClient:
     def get_portfolio(self) -> dict:
         """Portafoglio del conto: positions[] + credit (docs §4.1). Fonte reconcile."""
         data = self._request(
-            "GET", f"/api/v1/trading/info/{self._trading_segment}portfolio",
+            "GET", "/api/v1/trading/info/portfolio",
             pool="trading-info",
         )
         return data.get("clientPortfolio") or {}
@@ -350,7 +345,7 @@ class EtoroClient:
         while True:
             params = {"minDate": start, "page": page, "pageSize": page_size}
             data = self._request(
-                "GET", f"/api/v1/trading/info/trade/{self._trading_segment}history",
+                "GET", "/api/v1/trading/info/trade/history",
                 pool="default", params=params,
             )
             batch = _as_list(data)
@@ -375,7 +370,7 @@ class EtoroClient:
             {"orderId": order_id} if order_id is not None else {"referenceId": reference_id}
         )
         return self._request(
-            "GET", f"/api/v2/trading/info/{self._trading_segment}orders:lookup",
+            "GET", "/api/v2/trading/info/orders:lookup",
             pool="trading-info", params=params,
         )
 
@@ -408,7 +403,7 @@ class EtoroClient:
             "orderCurrency": "usd",
         }
         data = self._request(
-            "POST", f"/api/v2/trading/execution/{self._trading_segment}orders",
+            "POST", "/api/v2/trading/execution/orders",
             pool="execution", json_body=body, request_id=request_id,
         )
         order_id = data.get("orderId")
@@ -455,8 +450,7 @@ class EtoroClient:
         body = {"InstrumentID": instrument_id, "UnitsToDeduct": None}
         data = self._request(
             "POST",
-            f"/api/v1/trading/execution/{self._trading_segment}"
-            f"market-close-orders/positions/{position_id}",
+            f"/api/v1/trading/execution/market-close-orders/positions/{position_id}",
             pool="execution", json_body=body, request_id=request_id,
         )
         order = data.get("orderForClose") or {}

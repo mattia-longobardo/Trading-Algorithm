@@ -24,10 +24,6 @@ class ExecutionStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
-class DecisionStage(str, enum.Enum):
-    TRADER = "trader"
-
-
 class ExecutionResult(BaseModel):
     symbol: str
     side: Side

@@ -169,6 +169,12 @@ def sweep_direction(pos, broker: dict[int, str]) -> str | None:
     return recorded
 
 
+# "non ancora letto", distinto sia da None (lettura fallita) sia da {} (conto
+# vuoto): permette a chi ha già il portafoglio in mano di passarlo senza che il
+# chiamante di turno interroghi di nuovo il broker.
+_UNREAD: Any = object()
+
+
 def _portfolio_read(deps: ArenaDeps) -> dict[str, Any] | None:
     """Portafoglio del broker; None se la LETTURA è fallita.
 
@@ -209,6 +215,30 @@ def estimated_pnl_usd(pos, price: float | None, direction: str | None) -> float:
     if not price or not pos.entry_price or direction is None:
         return 0.0
     return float(pos.amount_usd) * position_change_pct(pos, price, direction) / 100.0
+
+
+def live_position_value(pos, price: float | None) -> float:
+    """Valore corrente della posizione: costo + PnL non realizzato.
+
+    Senza prezzo (o senza entry) resta il costo storico: è la stima migliore
+    disponibile, non un errore.
+    """
+    return float(pos.amount_usd) + estimated_pnl_usd(
+        pos, price, pos.direction or LONG
+    )
+
+
+def live_equity(positions, prices: dict[str, float] | None, cash: float) -> float:
+    """Equity live mark-to-market: cassa + valore corrente delle posizioni.
+
+    UNICA definizione, usata da circuit breaker, sizing e `/portfolio`. A costo
+    storico i tre numeri divergevano fra loro e dal conto vero: il denominatore
+    del drawdown giornaliero e la size massima per ordine restavano fermi al
+    prezzo di ingresso mentre il mercato si muoveva.
+    """
+    return float(cash) + sum(
+        live_position_value(p, (prices or {}).get(p.symbol)) for p in positions
+    )
 
 
 def _utcnow() -> datetime:
@@ -376,7 +406,8 @@ def _close_real_position(
 
 
 def settle_pending_closes(
-    deps: ArenaDeps, breaker=None, now: datetime | None = None
+    deps: ArenaDeps, breaker=None, now: datetime | None = None,
+    portfolio: Any = _UNREAD,
 ) -> dict[str, Any]:
     """Sostituisce le stime col PnL reale del broker per le chiusure in sospeso.
 
@@ -413,11 +444,19 @@ def settle_pending_closes(
     if by_position is None:
         return {"settled": 0, "pending": len(pending)}
 
-    equity = 0.0
-    try:
-        equity = _live_cash(deps) + sum(p.amount_usd for p in deps.repo.open_positions())
-    except Exception as exc:
-        logger.warning("live: equity non disponibile per la liquidazione: %s", exc)
+    # equity ignota NON è zero: con 0 il breaker salta in silenzio il controllo
+    # sul drawdown giornaliero (circuit_breaker.py: `equity_usd > 0`), cioè si
+    # disattiverebbe proprio mentre arrivano le perdite reali. Meglio non
+    # aggiornarlo affatto e dirlo a voce alta.
+    if portfolio is _UNREAD:
+        portfolio = _portfolio_read(deps)
+    cash = _as_float((portfolio or {}).get("credit"))
+    equity: float | None = (
+        None if cash is None
+        else live_equity(deps.repo.open_positions(), None, cash)
+    )
+    if equity is None:
+        logger.warning("live: equity non disponibile per la liquidazione")
 
     settled = 0
     for pos in pending:
@@ -436,7 +475,14 @@ def settle_pending_closes(
             close_price=float(close_rate) if close_rate is not None else None,
         )
         if breaker is not None and abs(pnl - estimate) > 1e-9:
-            breaker.record_closed_trade(pnl - estimate, equity, count_streak=False)
+            if equity is None:
+                logger.warning(
+                    "live: scarto di %.2f USD sulla posizione %s NON contato dal "
+                    "circuit breaker: equity non calcolabile in questo batch",
+                    pnl - estimate, pos.etoro_position_id,
+                )
+            else:
+                breaker.record_closed_trade(pnl - estimate, equity, count_streak=False)
         settled += 1
         logger.info(
             "live: PnL liquidato per posizione %s: stima %.2f → reale %.2f USD",
@@ -581,6 +627,7 @@ def _entry_price(
 def reconcile_live_positions(
     deps: ArenaDeps, run_id: str, now: datetime,
     market: dict[str, dict[str, Any]] | None = None, breaker=None,
+    portfolio: Any = _UNREAD,
 ) -> dict[str, Any]:
     """Allinea il registry al conto reale, nei due sensi.
 
@@ -598,7 +645,8 @@ def reconcile_live_positions(
     Le posizioni che il bot non ha aperto non vengono MAI toccate.
     """
     # lettura fallita (None): nessuna conclusione sul conto, tanto meno chiusure.
-    portfolio = _portfolio_read(deps)
+    if portfolio is _UNREAD:
+        portfolio = _portfolio_read(deps)
     rows = _portfolio_positions(deps, portfolio or {})
     open_ids: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -702,7 +750,10 @@ def reconcile_live_positions(
             execution.symbol, position_id,
         )
 
-    closed = _adopt_broker_closures(deps, portfolio, open_ids, now, breaker)
+    prices = {
+        s: float(r["price"]) for s, r in (market or {}).items() if r.get("price")
+    }
+    closed = _adopt_broker_closures(deps, portfolio, open_ids, now, breaker, prices)
     return {
         "adopted": adopted,
         "unresolved_symbols": sorted(unresolved),
@@ -713,6 +764,7 @@ def reconcile_live_positions(
 def _adopt_broker_closures(
     deps: ArenaDeps, portfolio: dict[str, Any] | None,
     open_ids: dict[int, dict[str, Any]], now: datetime, breaker,
+    prices: dict[str, float] | None = None,
 ) -> int:
     """Chiude a registro le posizioni del bot che il conto non ha più.
 
@@ -761,9 +813,13 @@ def _adopt_broker_closures(
         deps, now - timedelta(days=HISTORY_LOOKBACK_DAYS)
     ) or {}
     # l'esposizione delle posizioni che stiamo dichiarando sparite non fa più
-    # parte dell'equity su cui il breaker misura il drawdown.
-    equity = float(portfolio.get("credit") or 0.0) + sum(
-        p.amount_usd for p in positions if int(p.etoro_position_id) not in missing_ids
+    # parte dell'equity su cui il breaker misura il drawdown. Cassa assente =
+    # equity ignota, non zero: si chiude comunque a registro (il conto non ha
+    # più quelle posizioni) ma il breaker non viene aggiornato su un numero finto.
+    cash = _as_float(portfolio.get("credit"))
+    equity = None if cash is None else live_equity(
+        [p for p in positions if int(p.etoro_position_id) not in missing_ids],
+        prices, cash,
     )
 
     closed = 0
@@ -794,7 +850,14 @@ def _adopt_broker_closures(
         # il breaker deve vedere la perdita: una margin call è esattamente il
         # momento in cui il pavimento di sopravvivenza serve.
         if breaker is not None:
-            breaker.record_closed_trade(pnl or 0.0, equity)
+            if equity is None:
+                logger.warning(
+                    "live: chiusura esterna di %s NON contata dal circuit "
+                    "breaker: cassa eToro non disponibile in questa lettura",
+                    pos.symbol,
+                )
+            else:
+                breaker.record_closed_trade(pnl or 0.0, equity)
         closed += 1
         logger.error(
             "live: POSIZIONE SPARITA DAL CONTO — %s (%s) non è più nel "
@@ -879,38 +942,44 @@ def _run_live_cycle_locked(
     dna = clamp_dna(champion.dna)
     run_id = _ensure_run(deps, now)
 
+    # UNA sola lettura del portafoglio per ciclo: reconcile, controprova delle
+    # direzioni, cassa e liquidazione lavorano tutti sulla stessa fotografia.
+    # Letture separate sprecavano budget di rate limit e davano viste diverse
+    # dello stesso conto nello stesso ciclo.
+    portfolio = _portfolio_read(deps)
+
     # Prima di qualsiasi decisione: il libro mastro deve rispecchiare il conto
     # reale, e le chiusure in sospeso devono arrivare al circuit breaker.
     try:
         reconciled = reconcile_live_positions(
-            deps, run_id, now, market=market, breaker=breaker
+            deps, run_id, now, market=market, breaker=breaker, portfolio=portfolio
         )
     except Exception as exc:
         logger.warning("live: reconcile fallito: %s", exc)
         reconciled = {"adopted": 0}
     try:
-        settled = settle_pending_closes(deps, breaker=breaker, now=now)
+        settled = settle_pending_closes(
+            deps, breaker=breaker, now=now, portfolio=portfolio
+        )
     except Exception as exc:
         logger.warning("live: liquidazione PnL fallita: %s", exc)
         settled = {"settled": 0}
 
     positions = deps.repo.open_positions()
-    broker_directions = live_directions(deps)  # sola controprova del registro
+    # sola controprova del registro, dalla lettura già in mano
+    broker_directions = live_directions(deps, portfolio)
     # Capitale reale: se il broker non lo pubblica NON vale zero. Il ciclo non
     # deciderà e non aprirà (sizing e breaker sarebbero calcolati sul nulla), ma
     # le protezioni qui sotto girano lo stesso: una chiusura non si nega mai.
-    cash: float | None
-    try:
-        cash = _live_cash(deps)
-    except (TypeError, ValueError) as exc:  # credit assente o non numerico
+    cash = _as_float((portfolio or {}).get("credit"))
+    if cash is None:
         logger.error(
-            "live: capitale eToro non disponibile (%s): stop loss e take profit "
-            "girano comunque, decisione e aperture SALTATE", exc,
+            "live: capitale eToro non disponibile: stop loss e take profit "
+            "girano comunque, decisione e aperture SALTATE"
         )
-        cash = None
     # senza credit certo l'equity resta la sola esposizione nota: sottostimata,
     # quindi il breaker è più prudente, mai più permissivo.
-    equity = (cash or 0.0) + sum(p.amount_usd for p in positions)
+    equity = live_equity(positions, prices, cash or 0.0)
 
     # stop loss / take profit del DNA (0 = disattivati: decide solo il campione).
     # Girano PRIMA della chiamata all'LLM: un modello lento non deve poter
@@ -955,17 +1024,10 @@ def _run_live_cycle_locked(
     # Da qui in giù si DECIDE e si APRE: serve capitale certo e serve l'LLM. Le
     # protezioni sopra sono già girate, quindi mancare l'uno o l'altro degrada
     # il ciclo a sola sorveglianza invece di lasciare le posizioni scoperte.
+    # niente rilettura del portafoglio: la cassa è quella di inizio ciclo, quindi
+    # non conta ancora l'incasso delle chiusure automatiche qui sopra. Sizing e
+    # riserva restano più stretti del vero — prudente, e una lettura in meno.
     positions = deps.repo.open_positions()
-    if cash is not None:
-        # rilettura: le chiusure automatiche qui sopra hanno mosso la cassa
-        try:
-            cash = _live_cash(deps)
-        except (TypeError, ValueError) as exc:
-            logger.error(
-                "live: capitale eToro non disponibile alla rilettura (%s): "
-                "nessuna decisione e nessuna apertura", exc,
-            )
-            cash = None
     skipped = "no_cash" if cash is None else "no_llm" if deps.llm is None else None
     if skipped is not None:
         if skipped == "no_llm":
@@ -978,7 +1040,7 @@ def _run_live_cycle_locked(
         deps.repo.finish_run(run_id, {"cycle": slot, **summary})
         return summary
 
-    equity = cash + sum(p.amount_usd for p in positions)
+    equity = live_equity(positions, prices, cash)
     prompt = build_prompt(
         name=f"{champion.name} (CAMPIONE LIVE)",
         dna=dna,
@@ -1008,15 +1070,24 @@ def _run_live_cycle_locked(
     )
 
     executed = {"opened": 0, "closed": 0, "blocked": 0}
+    # una posizione si tocca UNA volta per ciclo: `enforce` già deduplica le
+    # azioni, ma un `close` senza direzione e uno con direzione sullo stesso
+    # simbolo restano due azioni diverse che colpirebbero la stessa riga. Il
+    # marchio si mette PRIMA del tentativo: un ordine andato in timeout può
+    # essere passato lo stesso, e un secondo invio sarebbe una doppia chiusura.
+    closed_ids: set[int] = set()
     for close in closes:
         wanted = close.get("direction")
         for pos in [p for p in positions if p.symbol == close["symbol"]]:
+            if int(pos.etoro_position_id) in closed_ids:
+                continue
             # la chiusura mirata si seleziona sul registro: l'ordine parte per
             # position_id ed è agnostico alla direzione, rifiutarlo lascerebbe
             # la posizione ingestibile. La stima di PnL invece resta firmata
             # solo se anche il conto conferma (sweep_direction).
             if wanted and registry_direction(pos) != wanted:
                 continue
+            closed_ids.add(int(pos.etoro_position_id))
             try:
                 _close_real_position(deps, breaker, run_id, pos, prices.get(pos.symbol),
                                      close["reason"] or "chiusura live", equity,
@@ -1132,9 +1203,17 @@ def _close_live_market_positions_locked(
     except Exception as exc:
         logger.warning("live: portafoglio non disponibile a fine sessione: %s", exc)
         portfolio = {}
-    cash = float(portfolio.get("credit") or 0.0)
+    cash = _as_float(portfolio.get("credit"))
+    if cash is None:
+        # qui NON si salta: la chiusura di fine sessione va fatta comunque. Con
+        # la sola esposizione l'equity è sottostimata, quindi il breaker misura
+        # un drawdown più grande del vero: prudente, mai permissivo.
+        logger.warning(
+            "live: cassa eToro non disponibile a fine sessione %s: equity "
+            "sottostimata per il circuit breaker", market_name,
+        )
     broker_directions = live_directions(deps, portfolio)
-    equity = cash + sum(p.amount_usd for p in deps.repo.open_positions())
+    equity = live_equity(deps.repo.open_positions(), prices, cash or 0.0)
     closed = 0
     for pos in expired:
         try:
@@ -1151,7 +1230,10 @@ def _close_live_market_positions_locked(
     return {"closed": closed, "market": market_name}
 
 
-def run_live_eod(deps: ArenaDeps, breaker=None, now: datetime | None = None) -> dict[str, Any]:
+def run_live_eod(
+    deps: ArenaDeps, breaker=None, now: datetime | None = None,
+    market: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Ultima campanella live: liquida i PnL in sospeso e fotografa l'equity.
 
     Le chiusure per scadenza holding avvengono ai singoli fine-sessione.
@@ -1160,12 +1242,15 @@ def run_live_eod(deps: ArenaDeps, breaker=None, now: datetime | None = None) -> 
         logger.error("live: EOD saltato, ciclo bloccato")
         return {"snapshot": False, "skipped": "cycle_in_progress"}
     try:
-        return _run_live_eod_locked(deps, breaker, now)
+        return _run_live_eod_locked(deps, breaker, now, market)
     finally:
         _live_lock.release()
 
 
-def _run_live_eod_locked(deps: ArenaDeps, breaker, now: datetime | None) -> dict[str, Any]:
+def _run_live_eod_locked(
+    deps: ArenaDeps, breaker, now: datetime | None,
+    market: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     now = now or _utcnow()
     positions = deps.repo.open_positions()
     if not positions and deps.repo.champion() is None:
@@ -1177,7 +1262,12 @@ def _run_live_eod_locked(deps: ArenaDeps, breaker, now: datetime | None) -> dict
         logger.warning("live: liquidazione PnL serale fallita: %s", exc)
     try:
         cash = _live_cash(deps)
-        exposure = sum(p.amount_usd for p in positions)
+        # snapshot mark-to-market come /portfolio e come il breaker: una serie
+        # equity a costo storico si muoverebbe solo alle chiusure.
+        prices = {
+            s: float(r["price"]) for s, r in (market or {}).items() if r.get("price")
+        }
+        exposure = sum(live_position_value(p, prices.get(p.symbol)) for p in positions)
         deps.repo.record_equity_snapshot(now.date(), cash + exposure, cash, exposure)
         return {"snapshot": True, "equity_usd": round(cash + exposure, 2),
                 "settled": settled}

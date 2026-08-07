@@ -110,10 +110,17 @@ def enforce(
     open_positions = len(held_symbols) if held_count is None else int(held_count)
     planned: list[str] = []
 
+    # una posizione si chiude UNA volta sola: due `close` sullo stesso simbolo
+    # (output plausibile del modello) manderebbero due ordini al broker e
+    # conterebbero la stessa perdita due volte nel drawdown del breaker.
+    closed_keys: set[tuple[str, str | None]] = set()
+
     for act in actions:
         symbol = act["symbol"]
         if act["action"] == "close":
-            if symbol in held_symbols:
+            key = (symbol, act.get("direction"))
+            if symbol in held_symbols and key not in closed_keys:
+                closed_keys.add(key)
                 closes.append(
                     {
                         "symbol": symbol,

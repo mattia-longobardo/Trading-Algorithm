@@ -10,7 +10,7 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from etoro_bot.arena.engine import position_direction
+from etoro_bot.arena.dna import position_direction
 
 TRADING_DAYS = 252
 MIN_TRADES_SAMPLE = 5

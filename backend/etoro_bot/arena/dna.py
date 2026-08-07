@@ -20,7 +20,31 @@ import logging
 import random
 from typing import Any, Callable
 
+from etoro_bot.arena.trader import LONG, SHORT
+
 logger = logging.getLogger(__name__)
+
+# Marcatore legacy: prima della colonna `direction` la direzione stava qui,
+# dentro il testo libero della open_reason. Si legge ancora, non si scrive più.
+SHORT_TAG = "[SHORT]"
+
+
+def position_direction(pos) -> str:
+    """Direzione di una posizione o di un trade simulato, dalla colonna.
+
+    Sta qui e non in `engine` perché la usano anche moduli puri (le metriche):
+    passare da engine si portava dietro repo, trader e motore evolutivo per un
+    helper di tre righe.
+
+    Il marcatore legacy nella open_reason resta letto per le righe scritte
+    prima della colonna che il backfill non avesse raggiunto: meglio un long
+    dichiarato short che uno short valutato come long.
+    """
+    if str(getattr(pos, "direction", "") or "").lower() == SHORT:
+        return SHORT
+    if str(getattr(pos, "open_reason", "") or "").startswith(SHORT_TAG):
+        return SHORT
+    return LONG
 
 # nome → (min, max, intero). Bound larghi: servono solo a tenere i numeri
 # rappresentabili, non a moderare l'aggressività dell'agente.

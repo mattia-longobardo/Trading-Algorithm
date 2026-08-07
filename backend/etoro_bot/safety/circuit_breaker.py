@@ -14,6 +14,7 @@ lo vuole riaccendere.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from dataclasses import asdict, dataclass
@@ -21,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from etoro_bot.config import CircuitBreakerRules
+
+logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "circuit_breaker.json"
 
@@ -115,6 +118,13 @@ class CircuitBreaker:
 
             streak_limit = int(self.rules.max_consecutive_losses)
             daily_limit = float(self.rules.max_daily_loss_pct)
+            if daily_limit > 0 and equity_usd <= 0:
+                # niente equity = niente denominatore: il limite giornaliero
+                # resta scoperto, e deve vedersi nei log invece di sparire.
+                logger.warning(
+                    "circuit breaker: equity %.2f USD non utilizzabile, drawdown "
+                    "giornaliero NON verificato su questo trade", equity_usd,
+                )
             if streak_limit > 0 and self.state.consecutive_losses >= streak_limit:
                 self._trip(f"{self.state.consecutive_losses} perdite consecutive")
             elif (

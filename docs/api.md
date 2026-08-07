@@ -150,3 +150,12 @@ ratio, curve SPY) risulta semplicemente `null`.
 - Il `Repository` è memoizzato con `lru_cache` (una sola sessione factory per
   processo); il `CircuitBreaker` è un'istanza condivisa per file di stato.
 - Lo scheduler parte nel `lifespan` dell'app, salvo `DISABLE_SCHEDULER=1`.
+- Le route che portano denaro (`/portfolio`, `/executions`, `/trades`,
+  `/trade-history`, `/backtest/*`, `/arena*`) dichiarano un `response_model`
+  definito in `backend/etoro_bot/api/schemas.py`: la forma finisce in OpenAPI
+  (`/openapi.json`) ed è il contratto con `frontend/lib/types.ts`, che resta
+  scritto a mano. Cambiando un payload si aggiornano ENTRAMBI; il test
+  `test_typed_routes_serve_exactly_the_declared_contract` fallisce se il
+  payload reale e il modello divergono. Per rigenerare i tipi TS dallo schema:
+  `npx openapi-typescript http://localhost:8000/openapi.json -o lib/api-types.ts`
+  (non è in CI: la CI non esiste ancora in questo repo).

@@ -119,6 +119,7 @@ export interface BacktestSummary {
   n_days: number;
   insufficient_sample: boolean;
   annualization_available: boolean;
+  risk_free_rate_pct: number | null;
 }
 
 export interface EquityPoint {
@@ -141,8 +142,9 @@ export interface ClosedTrade {
   close_price: number | null;
   realized_pnl_usd: number | null;
   opened_at: string;
-  closed_at: string;
+  closed_at: string | null;
   close_reason: string | null;
+  sector: string | null;
 }
 
 export interface TradesResponse {
