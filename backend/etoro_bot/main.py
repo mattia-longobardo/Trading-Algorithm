@@ -14,10 +14,11 @@ import sys
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    from etoro_bot.api.server import _arena_deps
     from etoro_bot.arena.engine import bootstrap_if_needed, run_training_cycle
+    from etoro_bot.db.repo import Repository, make_engine, make_session_factory
+    from etoro_bot.services.deps import build_arena_deps
 
-    deps = _arena_deps()
+    deps = build_arena_deps(Repository(make_session_factory(make_engine())))
     bootstrap_if_needed(deps)
     summary = run_training_cycle(deps)
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))

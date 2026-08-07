@@ -125,7 +125,7 @@ Variabili richieste in `.env` (lette da `docker-compose.yml`):
 | `AUTHENTIK_HOST`, `AUTH_AUTHENTIK_ID`, `AUTH_AUTHENTIK_SECRET` | frontend | applicazione OIDC «trading» su Authentik |
 | `AUTH_SECRET` | frontend, backend | segreto di sessione Auth.js; ripiego per la cifratura credenziali |
 | `TRADING_CREDENTIALS_SECRET` | backend | segreto **dedicato** alla cifratura delle chiavi personali (PBKDF2). Vuoto ⇒ `AUTH_SECRET` |
-| `TRADING_INTERNAL_TOKEN` | frontend, backend | segreto condiviso: senza, il backend risponde 401 a tutto tranne `/health`. Vuoto = controllo disattivato (solo sviluppo locale) |
+| `TRADING_INTERNAL_TOKEN` | frontend, backend | **obbligatoria**: segreto condiviso, senza il backend risponde 401 a tutto tranne `/health`. Se è vuota il backend **non parte**; unica eccezione `TRADING_DEV_MODE=1` (sviluppo locale, avvio loggato come warning) |
 
 Genera i segreti con `openssl rand -base64 32`.
 

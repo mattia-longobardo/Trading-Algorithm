@@ -9,7 +9,9 @@ import {
   AgentStatusStamp,
   DirectionStamp,
   DnaGrid,
+  LabelValueGrid,
   orDash,
+  SimTradesTable,
 } from "@/components/arena";
 import { PageHeader } from "@/components/page-header";
 import { CardSkeleton, ErrorState, TableSkeleton } from "@/components/query-states";
@@ -97,22 +99,7 @@ function SummaryStrip({ metrics }: { metrics: AgentMetrics }) {
 
 /** Coppie etichetta/valore in stile DNA, per gli indicatori di performance. */
 function StatGrid({ items }: { items: { label: string; value: string; tone?: string }[] }) {
-  return (
-    <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
-      {items.map((item) => (
-        <div key={item.label}>
-          <p className="text-muted-foreground font-mono text-[10px] tracking-[0.1em] uppercase">
-            {item.label}
-          </p>
-          <p
-            className={`font-mono text-[13px] font-medium tabular-nums ${item.tone ?? ""}`}
-          >
-            {item.value}
-          </p>
-        </div>
-      ))}
-    </div>
-  );
+  return <LabelValueGrid className="gap-y-3" items={items} />;
 }
 
 function PerformanceCard({ metrics }: { metrics: AgentMetrics }) {
@@ -299,7 +286,6 @@ function PositionsCard({ detail }: { detail: AgentDetail }) {
 }
 
 function TradesCard({ detail }: { detail: AgentDetail }) {
-  const d = useDisplay();
   const trades = detail.trades;
   // Il registro tiene tutto: qui arriva solo la coda più recente, quindi il
   // conteggio va detto per intero quando la lista è troncata.
@@ -317,61 +303,7 @@ function TradesCard({ detail }: { detail: AgentDetail }) {
             Ancora nessun trade chiuso
           </p>
         ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Simbolo</TableHead>
-                <TableHead>Direzione</TableHead>
-                <TableHead className="text-right">Importo</TableHead>
-                <TableHead className="text-right">Ingresso → Uscita</TableHead>
-                <TableHead className="text-right">PnL</TableHead>
-                <TableHead className="text-right">Durata</TableHead>
-                <TableHead>Chiusura</TableHead>
-                <TableHead>Motivo chiusura</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {trades.map((t) => (
-                <TableRow key={t.id}>
-                  {/* la motivazione di apertura sta nel tooltip: la riga è già larga */}
-                  <TableCell className="font-mono font-medium" title={t.open_reason}>
-                    {t.symbol}
-                  </TableCell>
-                  <TableCell>
-                    <DirectionStamp direction={t.direction} />
-                  </TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {d.money(t.amount_usd)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-xs whitespace-nowrap tabular-nums">
-                    {d.money(t.entry_price)} → {d.money(t.close_price)}
-                  </TableCell>
-                  <TableCell
-                    className={`text-right font-mono tabular-nums ${pnlClass(t.pnl_usd)}`}
-                  >
-                    {d.moneySigned(t.pnl_usd)}
-                    {t.return_pct != null && (
-                      <span className="ml-1.5 text-xs">
-                        ({fmtPctSigned(t.return_pct)})
-                      </span>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {fmtNum(t.holding_hours, 1)} h
-                  </TableCell>
-                  <TableCell className="font-mono text-xs whitespace-nowrap">
-                    {d.dateTime(t.closed_at)}
-                  </TableCell>
-                  <TableCell
-                    className="text-muted-foreground max-w-64 truncate text-xs"
-                    title={t.close_reason}
-                  >
-                    {t.close_reason}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <SimTradesTable trades={trades} />
         )}
       </CardContent>
     </Card>

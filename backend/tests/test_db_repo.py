@@ -2,16 +2,16 @@
 
 from datetime import date, datetime, timezone
 
-from etoro_bot.domain import DecisionStage, ExecutionResult, ExecutionStatus, Side
+from etoro_bot.domain import ExecutionResult, ExecutionStatus, Side
 
 NOW = datetime(2026, 7, 20, 8, 30, tzinfo=timezone.utc)
 
 
 def test_run_lifecycle_and_journal(repo):
     repo.create_run("run-1", environment="demo")
-    repo.add_decision("run-1", "AAPL", DecisionStage.TRADER,
+    repo.add_decision("run-1", "AAPL", "trader",
                       {"score": 0.4, "summary": "ok"})
-    repo.add_decision("run-1", "AAPL", DecisionStage.TRADER,
+    repo.add_decision("run-1", "AAPL", "trader",
                       {"approved": False, "reasons": ["oltre limite"]})
     repo.add_execution("run-1", ExecutionResult(
         symbol="AAPL", side=Side.BUY, amount_usd=100.0,
@@ -23,12 +23,11 @@ def test_run_lifecycle_and_journal(repo):
     assert len(runs) == 1 and runs[0].summary_json["executed"] == 1
     decisions = repo.get_run_decisions("run-1")
     assert [d.stage for d in decisions] == ["trader", "trader"]
-    assert repo.count_filled_today() == 1
 
 
 def test_delete_run_removes_everything_that_points_at_it(repo):
     repo.create_run("run-del", environment="demo")
-    repo.add_decision("run-del", "AAPL", DecisionStage.TRADER, {"score": 0.1})
+    repo.add_decision("run-del", "AAPL", "trader", {"score": 0.1})
     repo.add_execution("run-del", ExecutionResult(
         symbol="AAPL", side=Side.BUY, amount_usd=100.0,
         status=ExecutionStatus.FILLED, execution_price=200.0, etoro_position_id=42,
@@ -39,7 +38,7 @@ def test_delete_run_removes_everything_that_points_at_it(repo):
     )
     # Una seconda run non deve essere toccata.
     repo.create_run("run-keep", environment="demo")
-    repo.add_decision("run-keep", "MSFT", DecisionStage.TRADER, {"score": 0.2})
+    repo.add_decision("run-keep", "MSFT", "trader", {"score": 0.2})
 
     assert repo.delete_run("run-del") is True
     assert repo.get_run("run-del") is None
@@ -70,6 +69,30 @@ def test_bot_positions_registry(repo):
     # una seconda chiusura non sovrascrive
     repo.close_position(123, close_price=1.0, realized_pnl_usd=-99.0, close_reason="dup")
     assert repo.closed_positions()[0].realized_pnl_usd == 10.0
+
+
+def test_bounded_history_keeps_the_most_recent_rows_in_order(repo):
+    """`limit` taglia le righe VECCHIE, non le nuove, e l'ordine resta
+    cronologico: le pagine in polling non devono leggere tutto lo storico."""
+    from datetime import timedelta
+
+    repo.create_run("run-lim", environment="demo")
+    for index in range(5):
+        position_id = 500 + index
+        repo.register_open_position(
+            etoro_position_id=position_id, run_id="run-lim", symbol=f"SYM{index}",
+            instrument_id=index, amount_usd=100.0, entry_price=10.0,
+            opened_at=NOW + timedelta(minutes=index),
+        )
+        repo.close_position(position_id, close_price=11.0, realized_pnl_usd=float(index),
+                            close_reason="test", closed_at=NOW + timedelta(hours=index))
+
+    assert [p.realized_pnl_usd for p in repo.closed_positions(limit=2)] == [3.0, 4.0]
+    assert len(repo.closed_positions(limit=None)) == 5
+
+    for index in range(3):
+        repo.record_equity_snapshot(date(2026, 7, 20 + index), 100.0 + index, 50.0, 50.0)
+    assert [s.equity_usd for s in repo.equity_series(limit=2)] == [101.0, 102.0]
 
 
 def test_equity_snapshot_upsert(repo):

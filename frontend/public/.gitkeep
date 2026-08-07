@@ -1,0 +1,3 @@
+# La cartella deve esistere: il Dockerfile del frontend fa COPY di /app/public
+# (build standalone di Next). Git non traccia le directory vuote, quindi senza
+# questo file la cartella sparisce al primo clone e la build fallisce.

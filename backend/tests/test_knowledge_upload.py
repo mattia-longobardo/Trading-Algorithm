@@ -169,6 +169,79 @@ def test_ingest_endpoint_rejects_unsupported_extension(client):
     assert resp.status_code == 415
 
 
+def test_ingest_endpoint_rejects_declared_oversized_body(client):
+    """Con un `Content-Length` oltre il limite la richiesta muore subito: 413,
+    senza che il parser multipart tocchi il corpo."""
+    resp = client.post(
+        "/knowledge/ingest",
+        files={"file": ("grande.txt", b"x" * (MAX_UPLOAD_BYTES + 1), "text/plain")},
+    )
+    assert resp.status_code == 413
+
+
+def test_ingest_endpoint_rejects_streamed_oversized_body(client):
+    """Upload senza `Content-Length` (chunked): la soglia scatta comunque, sul
+    conteggio dei chunk, e resta un 413 — non il 400 generico di parsing."""
+    boundary = "confine"
+    preambolo = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="grande.txt"\r\n'
+        "Content-Type: text/plain\r\n\r\n"
+    ).encode("ascii")
+
+    def corpo():
+        yield preambolo
+        for _ in range(30):
+            yield b"x" * 1_000_000
+
+    resp = client.post(
+        "/knowledge/ingest",
+        content=corpo(),
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert resp.status_code == 413
+
+
+def test_limit_request_body_stops_reading_past_the_threshold():
+    """La prova che il corpo non viene letto per intero: il TestClient
+    materializza sempre la richiesta, quindi il middleware va esercitato a
+    livello ASGI, contando quanti chunk vengono davvero tirati su."""
+    import asyncio
+
+    from etoro_bot.api.server import LimitRequestBody
+
+    chunk = b"x" * 1_000_000
+    chunk_totali = 100  # 100 MB se nessuno interrompe
+    letti = 0
+
+    async def receive():
+        nonlocal letti
+        letti += 1
+        return {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": letti < chunk_totali,
+        }
+
+    async def app(scope, receive, send):  # un parser qualunque che drena il corpo
+        while (await receive()).get("more_body"):
+            pass
+
+    risposta = []
+
+    async def send(message):
+        risposta.append(message)
+
+    asyncio.run(
+        LimitRequestBody(app)({"type": "http", "headers": []}, receive, send)
+    )
+
+    assert risposta[0]["status"] == 413
+    # fermato appena oltre la soglia, non dopo aver ingoiato i 100 MB
+    assert letti <= MAX_UPLOAD_BYTES // len(chunk) + 1
+    assert letti < chunk_totali
+
+
 def test_ingest_endpoint_degraded_kb_returns_zero(client):
     # Nessun mock: KnowledgeBase è degradata (niente Qdrant) → add_news ritorna 0,
     # ma l'endpoint non deve crashare.

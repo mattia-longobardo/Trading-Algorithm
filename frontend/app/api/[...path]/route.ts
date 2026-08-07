@@ -5,6 +5,8 @@ const BACKEND_URL = process.env.BACKEND_URL ?? "http://trading-backend:8000";
 // (e quindi da una sessione Authentik verificata). Resta lato server — niente
 // prefisso NEXT_PUBLIC, non finisce mai nel bundle del browser.
 const INTERNAL_TOKEN = process.env.TRADING_INTERNAL_TOKEN ?? "";
+// Stesso limite di MAX_UPLOAD_BYTES del backend.
+const MAX_BODY_BYTES = 20_000_000;
 
 async function forward(request: Request, context: { params: Promise<{ path: string[] }> }) {
   const session = await auth();
@@ -31,6 +33,16 @@ async function forward(request: Request, context: { params: Promise<{ path: stri
   if (user.name) headers.set("x-trading-user-name", user.name);
 
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
+  // arrayBuffer() bufferizza tutto in RAM: rifiuta subito i corpi dichiarati
+  // troppo grandi, altrimenti cade prima il frontend del backend.
+  const declared = Number(request.headers.get("content-length"));
+  if (hasBody && declared > MAX_BODY_BYTES) {
+    return Response.json(
+      { detail: `corpo della richiesta oltre il limite di ${MAX_BODY_BYTES} byte` },
+      { status: 413 },
+    );
+  }
+
   const upstream = await fetch(target, {
     method: request.method,
     headers,

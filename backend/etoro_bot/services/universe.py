@@ -56,6 +56,8 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, Field, ValidationError
 
+from etoro_bot.domain import EXPLICIT_SYMBOL_PATTERNS
+
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "discovered_universe.json"
@@ -89,11 +91,7 @@ _LEGAL_SUFFIX_RE = re.compile(
 )
 
 # Citazioni esplicite di simbolo: $AAPL | (AAPL) | NASDAQ: AAPL …
-_EXPLICIT_SYMBOL_RES = (
-    re.compile(r"\$(?P<sym>[A-Z]{1,6})\b"),
-    re.compile(r"\((?P<sym>[A-Z]{1,6})\)"),
-    re.compile(r"\b(?:NASDAQ|NYSE|AMEX|ARCA|BATS|TICKER|SYMBOL)\s*[:\-]\s*(?P<sym>[A-Z]{1,6})\b"),
-)
+_EXPLICIT_SYMBOL_RES = tuple(re.compile(p) for p in EXPLICIT_SYMBOL_PATTERNS)
 
 
 def _state_dir() -> Path:

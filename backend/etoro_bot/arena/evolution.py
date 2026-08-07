@@ -20,6 +20,8 @@ from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna, mutate, survival_creed
 from etoro_bot.arena.engine import (
     ArenaDeps,
     agent_equity,
+    bootstrap_if_needed,
+    cycle_lock,
     effective_price,
     starting_capital_usd,
     survival_floor_pct,
@@ -34,7 +36,17 @@ def current_month(now: datetime | None = None) -> str:
 
 
 def maybe_evolve(deps: ArenaDeps, now: datetime | None = None) -> dict[str, Any] | None:
-    """Valuta il mese chiuso e genera la nuova generazione. None se non è ora."""
+    """Valuta il mese chiuso e genera la nuova generazione. None se non è ora.
+
+    Attende il ciclo di allenamento in corso (stesso `cycle_lock`): liquidazione
+    e verdetto devono vedere conti fermi, non a metà di un'operazione.
+    """
+    with cycle_lock:
+        return _maybe_evolve_locked(deps, now)
+
+
+def _maybe_evolve_locked(deps: ArenaDeps, now: datetime | None) -> dict[str, Any] | None:
+    bootstrap_if_needed(deps, now=now)  # sotto lock: mai due generazioni in parallelo
     arena = deps.repo.get_setting("arena")
     alive = deps.repo.alive_agents()
     if not arena or not alive:

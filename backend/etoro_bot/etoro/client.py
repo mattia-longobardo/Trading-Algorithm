@@ -31,6 +31,11 @@ _BACKOFF_BASE_S = 1.0
 _ORDER_POLL_TIMEOUT_S = 30.0
 _ORDER_POLL_INTERVAL_S = 1.0
 
+# I budget eToro sono per chiave, non per oggetto client: un limiter per
+# istanza moltiplicherebbe il pool `execution` (20/60s) per ogni chiamante che
+# si costruisce il proprio client. Uno solo per processo, condiviso di default.
+_SHARED_RATE_LIMITER = RateLimiter()
+
 ORDER_STATUS_FILLED = 3
 # 4 Rejected, 7 Canceled, 8 Expired, 9 CanceledPartiallyFilled, 10 RejectedPartiallyFilled
 _ORDER_STATUS_TERMINAL_KO = {4, 7, 8, 9, 10}
@@ -115,17 +120,12 @@ class EtoroClient:
         self._api_key = api_key
         self._user_key = user_key
         self._session = session or requests.Session()
-        self._rate_limiter = rate_limiter or RateLimiter()
+        self._rate_limiter = rate_limiter or _SHARED_RATE_LIMITER
         self._timeout = timeout_s
         self._sleep = time.sleep  # iniettabile nei test
         self._clock = time.monotonic
         self._instrument_types: dict[int, str] | None = None
         self._stocks_industries: dict[int, str] | None = None
-
-    @property
-    def _trading_segment(self) -> str:
-        """Rotte trading senza segmento: esiste solo il conto reale (niente demo)."""
-        return ""
 
     # ------------------------------------------------------------------ HTTP
 
@@ -330,7 +330,7 @@ class EtoroClient:
     def get_portfolio(self) -> dict:
         """Portafoglio del conto: positions[] + credit (docs §4.1). Fonte reconcile."""
         data = self._request(
-            "GET", f"/api/v1/trading/info/{self._trading_segment}portfolio",
+            "GET", "/api/v1/trading/info/portfolio",
             pool="trading-info",
         )
         return data.get("clientPortfolio") or {}
@@ -345,7 +345,7 @@ class EtoroClient:
         while True:
             params = {"minDate": start, "page": page, "pageSize": page_size}
             data = self._request(
-                "GET", f"/api/v1/trading/info/trade/{self._trading_segment}history",
+                "GET", "/api/v1/trading/info/trade/history",
                 pool="default", params=params,
             )
             batch = _as_list(data)
@@ -370,7 +370,7 @@ class EtoroClient:
             {"orderId": order_id} if order_id is not None else {"referenceId": reference_id}
         )
         return self._request(
-            "GET", f"/api/v2/trading/info/{self._trading_segment}orders:lookup",
+            "GET", "/api/v2/trading/info/orders:lookup",
             pool="trading-info", params=params,
         )
 
@@ -403,7 +403,7 @@ class EtoroClient:
             "orderCurrency": "usd",
         }
         data = self._request(
-            "POST", f"/api/v2/trading/execution/{self._trading_segment}orders",
+            "POST", "/api/v2/trading/execution/orders",
             pool="execution", json_body=body, request_id=request_id,
         )
         order_id = data.get("orderId")
@@ -436,18 +436,22 @@ class EtoroClient:
                 )
             self._sleep(_ORDER_POLL_INTERVAL_S)
 
-    def close_position(self, position_id: int, instrument_id: int) -> dict:
+    def close_position(
+        self, position_id: int, instrument_id: int, request_id: str | None = None
+    ) -> dict:
         """Chiude totalmente una posizione a mercato (docs §5.2).
 
-        UnitsToDeduct null = chiusura totale. Ritorna l'orderID di chiusura,
-        da verificare (§4.3) e poi matchare in trade history per il netProfit.
+        UnitsToDeduct null = chiusura totale. `request_id` (x-request-id) è la
+        chiave di idempotenza: un ciclo ritentato dopo un crash non manda un
+        secondo ordine di chiusura sulla stessa posizione. Ritorna l'orderID di
+        chiusura, da verificare (§4.3) e poi matchare in trade history per il
+        netProfit.
         """
         body = {"InstrumentID": instrument_id, "UnitsToDeduct": None}
         data = self._request(
             "POST",
-            f"/api/v1/trading/execution/{self._trading_segment}"
-            f"market-close-orders/positions/{position_id}",
-            pool="execution", json_body=body,
+            f"/api/v1/trading/execution/market-close-orders/positions/{position_id}",
+            pool="execution", json_body=body, request_id=request_id,
         )
         order = data.get("orderForClose") or {}
         return {

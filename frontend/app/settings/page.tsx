@@ -15,21 +15,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  MobileField,
-  MobileFields,
-  MobileItem,
-  MobileItemHeader,
-  MobileList,
-} from "@/components/mobile-list";
+import { ResponsiveTable, type ResponsiveColumn } from "@/components/responsive-table";
 import { CardSkeleton, ErrorState, TableSkeleton } from "@/components/query-states";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import type { SearchableOption } from "@/components/ui/searchable-select";
@@ -45,7 +31,7 @@ import {
 import { fmtNum } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
 import { timeZoneOptions } from "@/lib/timezones";
-import type { AppSettings } from "@/lib/types";
+import type { AppSettings, AuditEntry } from "@/lib/types";
 
 function fmtAuditValue(v: unknown): string {
   if (v == null) return "—";
@@ -296,6 +282,58 @@ function AuditCard() {
   const { data, isLoading, error } = useSettingsAudit();
   const display = useDisplay();
 
+  const columns: ResponsiveColumn<AuditEntry>[] = [
+    {
+      key: "changed_at",
+      header: "Data",
+      className: "font-mono text-[13px] whitespace-nowrap tabular-nums",
+      cell: (e) => display.dateTime(e.changed_at),
+      mobile: {
+        label: "Data",
+        wide: true,
+        order: 3,
+        render: (e) => (
+          <span className="font-mono text-xs tabular-nums">{display.dateTime(e.changed_at)}</span>
+        ),
+      },
+    },
+    { key: "key", header: "Chiave", className: "font-mono text-xs", cell: (e) => e.key },
+    {
+      key: "old",
+      header: "Da",
+      className: "text-muted-foreground max-w-48 truncate font-mono text-xs",
+      cell: (e) => fmtAuditValue(e.old_value),
+      mobile: {
+        label: "Da",
+        order: 1,
+        render: (e) => (
+          <span className="text-muted-foreground font-mono text-xs break-all">
+            {fmtAuditValue(e.old_value)}
+          </span>
+        ),
+      },
+    },
+    {
+      key: "new",
+      header: "A",
+      className: "max-w-48 truncate font-mono text-xs",
+      cell: (e) => fmtAuditValue(e.new_value),
+      mobile: {
+        label: "A",
+        order: 2,
+        render: (e) => (
+          <span className="font-mono text-xs break-all">{fmtAuditValue(e.new_value)}</span>
+        ),
+      },
+    },
+    {
+      key: "source",
+      header: "Origine",
+      className: "text-muted-foreground text-xs",
+      cell: (e) => e.source,
+    },
+  ];
+
   return (
     <Card>
       <CardHeader>
@@ -314,67 +352,17 @@ function AuditCard() {
             Nessuna modifica registrata
           </p>
         ) : (
-          <>
-          <div className="max-md:hidden">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Data</TableHead>
-                <TableHead>Chiave</TableHead>
-                <TableHead>Da</TableHead>
-                <TableHead>A</TableHead>
-                <TableHead>Origine</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {data.entries.map((e) => (
-                <TableRow key={String(e.id)}>
-                  <TableCell className="font-mono text-[13px] whitespace-nowrap tabular-nums">
-                    {display.dateTime(e.changed_at)}
-                  </TableCell>
-                  <TableCell className="font-mono text-xs">{e.key}</TableCell>
-                  <TableCell className="text-muted-foreground max-w-48 truncate font-mono text-xs">
-                    {fmtAuditValue(e.old_value)}
-                  </TableCell>
-                  <TableCell className="max-w-48 truncate font-mono text-xs">
-                    {fmtAuditValue(e.new_value)}
-                  </TableCell>
-                  <TableCell className="text-muted-foreground text-xs">
-                    {e.source}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          </div>
-          <MobileList>
-            {data.entries.map((e) => (
-              <MobileItem key={String(e.id)}>
-                <MobileItemHeader>
-                  <span className="font-mono text-xs font-medium">{e.key}</span>
-                  <span className="text-muted-foreground text-xs">{e.source}</span>
-                </MobileItemHeader>
-                <MobileFields>
-                  <MobileField label="Da">
-                    <span className="text-muted-foreground font-mono text-xs break-all">
-                      {fmtAuditValue(e.old_value)}
-                    </span>
-                  </MobileField>
-                  <MobileField label="A">
-                    <span className="font-mono text-xs break-all">
-                      {fmtAuditValue(e.new_value)}
-                    </span>
-                  </MobileField>
-                  <MobileField label="Data" wide>
-                    <span className="font-mono text-xs tabular-nums">
-                      {display.dateTime(e.changed_at)}
-                    </span>
-                  </MobileField>
-                </MobileFields>
-              </MobileItem>
-            ))}
-          </MobileList>
-          </>
+          <ResponsiveTable
+            rows={data.entries}
+            rowKey={(e) => String(e.id)}
+            columns={columns}
+            mobileHeader={(e) => (
+              <>
+                <span className="font-mono text-xs font-medium">{e.key}</span>
+                <span className="text-muted-foreground text-xs">{e.source}</span>
+              </>
+            )}
+          />
         )}
       </CardContent>
     </Card>

@@ -10,15 +10,17 @@ soggette al token interno).
 - **Token interno obbligatorio.** Ogni richiesta deve portare
   `X-Trading-Internal-Token` uguale a `TRADING_INTERNAL_TOKEN`, altrimenti
   **401**. Unica rotta esente: `GET /health`. Se la variabile è vuota il
-  controllo è disattivato (solo sviluppo locale).
+  backend non parte, salvo `TRADING_DEV_MODE=1` (sviluppo locale: controllo
+  disattivato, warning nei log).
 - **Identità.** Arriva dagli header `X-Trading-User-Id`,
   `X-Trading-User-Email`, `X-Trading-User-Name`, iniettati lato server dal proxy
   Next dopo aver verificato la sessione Authentik. In assenza,
-  `X-Trading-User-Id` vale `system`.
+  `X-Trading-User-Id` vale `anonimo` (nessun privilegio). Il valore letterale
+  `system` è riservato ai job interni: via HTTP dà **403**.
 - **Proprietario.** Nella colonna «Auth», *proprietario* significa che
   l'endpoint chiama `require_owner`: passa solo l'identità che ha configurato le
-  chiavi eToro (o `system`), altrimenti **403**. Finché nessuno ha configurato le
-  chiavi il controllo è un no-op.
+  chiavi eToro, altrimenti **403**. Finché nessuno ha configurato le chiavi il
+  controllo è un no-op; se il proprietario non è verificabile (DB giù) è **503**.
 - **Codici ricorrenti.** `202` per i job avviati in background, `403` per il
   controllo di proprietà, `404` risorsa inesistente, `409` conflitto di stato,
   `415` estensione non supportata, `422` validazione/guardrail, `502` API eToro
@@ -148,3 +150,12 @@ ratio, curve SPY) risulta semplicemente `null`.
 - Il `Repository` è memoizzato con `lru_cache` (una sola sessione factory per
   processo); il `CircuitBreaker` è un'istanza condivisa per file di stato.
 - Lo scheduler parte nel `lifespan` dell'app, salvo `DISABLE_SCHEDULER=1`.
+- Le route che portano denaro (`/portfolio`, `/executions`, `/trades`,
+  `/trade-history`, `/backtest/*`, `/arena*`) dichiarano un `response_model`
+  definito in `backend/etoro_bot/api/schemas.py`: la forma finisce in OpenAPI
+  (`/openapi.json`) ed è il contratto con `frontend/lib/types.ts`, che resta
+  scritto a mano. Cambiando un payload si aggiornano ENTRAMBI; il test
+  `test_typed_routes_serve_exactly_the_declared_contract` fallisce se il
+  payload reale e il modello divergono. Per rigenerare i tipi TS dallo schema:
+  `npx openapi-typescript http://localhost:8000/openapi.json -o lib/api-types.ts`
+  (non è in CI: la CI non esiste ancora in questo repo).

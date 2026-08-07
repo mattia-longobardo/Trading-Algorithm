@@ -367,6 +367,14 @@ def test_search_instruments_paginates_and_requires_fields():
     assert session.calls[1]["params"]["pageNumber"] == 2
 
 
+def test_clients_share_the_default_rate_limiter():
+    """Il budget per pool è della chiave API, non del singolo oggetto client:
+    due client costruiti dalle stesse chiavi devono consumare lo stesso pool."""
+    a = EtoroClient("test-api-key", "test-user-key")
+    b = EtoroClient("test-api-key", "test-user-key")
+    assert a._rate_limiter is b._rate_limiter
+
+
 def test_rate_limiter_uses_safety_margin():
     now = {"t": 0.0}
     waits: list[float] = []
@@ -386,3 +394,12 @@ def test_rate_limiter_uses_safety_margin():
     assert waits == [60.0]
 
 
+
+
+def test_close_position_sends_the_idempotency_key():
+    """x-request-id sulla chiusura: un ciclo ritentato non chiude due volte."""
+    client, session, _ = make_client(
+        [FakeResponse(payload={"orderForClose": {"orderID": 5, "statusID": 1}})]
+    )
+    client.close_position(position_id=42, instrument_id=7, request_id="close-key-1")
+    assert session.calls[0]["headers"]["x-request-id"] == "close-key-1"

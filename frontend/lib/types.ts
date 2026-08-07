@@ -31,7 +31,13 @@ export interface Status {
   equity_change_day_pct: number | null;
 }
 
-export type ExecutionStatus = "filled" | "failed" | "skipped" | "rejected";
+export type ExecutionStatus =
+  | "pending"
+  | "filled"
+  | "failed"
+  | "skipped"
+  | "rejected"
+  | "cancelled";
 
 export interface Execution {
   id: string;
@@ -55,6 +61,7 @@ export interface Position {
   symbol: string;
   instrument_id: number;
   amount_usd: number;
+  direction: TradeDirection;
   entry_price: number;
   current_price: number | null;
   unrealized_pnl_usd: number | null;
@@ -112,6 +119,7 @@ export interface BacktestSummary {
   n_days: number;
   insufficient_sample: boolean;
   annualization_available: boolean;
+  risk_free_rate_pct: number | null;
 }
 
 export interface EquityPoint {
@@ -134,8 +142,9 @@ export interface ClosedTrade {
   close_price: number | null;
   realized_pnl_usd: number | null;
   opened_at: string;
-  closed_at: string;
+  closed_at: string | null;
   close_reason: string | null;
+  sector: string | null;
 }
 
 export interface TradesResponse {

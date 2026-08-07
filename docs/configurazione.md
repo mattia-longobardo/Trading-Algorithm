@@ -151,7 +151,8 @@ noti della dataclass).
 | `AUTH_AUTHENTIK_SECRET` | frontend | sì | client secret OIDC |
 | `AUTH_SECRET` | frontend, backend | sì | segreto di sessione Auth.js; ripiego per la cifratura credenziali |
 | `TRADING_CREDENTIALS_SECRET` | backend | consigliata | segreto dedicato alla cifratura (PBKDF2). Se vuoto vale `AUTH_SECRET` |
-| `TRADING_INTERNAL_TOKEN` | frontend, backend | consigliata | vuoto = controllo disattivato (solo sviluppo locale) |
+| `TRADING_INTERNAL_TOKEN` | frontend, backend | sì | se vuoto il backend rifiuta l'avvio; deroga solo con `TRADING_DEV_MODE=1` |
+| `TRADING_DEV_MODE` | backend | no | `1` = avvio consentito senza token interno (solo sviluppo locale, warning nei log). Mai in produzione |
 
 ### Impostate dal compose nel container backend
 

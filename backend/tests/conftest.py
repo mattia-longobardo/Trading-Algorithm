@@ -10,6 +10,10 @@ import uuid
 
 import pytest
 
+# L'app rifiuta l'avvio senza TRADING_INTERNAL_TOKEN: la suite gira in modalità
+# sviluppo (i test che verificano l'abort tolgono il flag da sé).
+os.environ.setdefault("TRADING_DEV_MODE", "1")
+
 PG_IMAGE = "postgres:18-alpine"
 PG_PORT = 55433
 

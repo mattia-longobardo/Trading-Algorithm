@@ -13,17 +13,20 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Stamp } from "@/components/stamp";
+import { safeCallbackUrl } from "@/lib/safe-callback-url.mjs";
 
 const SIGNIN_ERROR_URL = "/login";
 
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ callbackUrl?: string; error?: string }>;
+  // callbackUrl è string[] quando il parametro è ripetuto in query string
+  searchParams: Promise<{ callbackUrl?: string | string[]; error?: string }>;
 }) {
   const { callbackUrl, error } = await searchParams;
+  const safeCallback = safeCallbackUrl(callbackUrl);
   const session = await auth();
-  if (session) redirect(callbackUrl ?? "/");
+  if (session) redirect(safeCallback);
 
   return (
     <main className="bg-background grid min-h-svh lg:grid-cols-[minmax(0,1.15fr)_minmax(420px,0.85fr)]">
@@ -102,7 +105,7 @@ export default async function LoginPage({
                 action={async () => {
                   "use server";
                   try {
-                    await signIn("authentik", { redirectTo: callbackUrl ?? "/" });
+                    await signIn("authentik", { redirectTo: safeCallback });
                   } catch (err) {
                     if (err instanceof AuthError) {
                       redirect(`${SIGNIN_ERROR_URL}?error=${err.type}`);

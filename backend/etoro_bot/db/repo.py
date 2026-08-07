@@ -6,8 +6,9 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy import Connection, Engine, create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from etoro_bot.config import database_url
 from etoro_bot.db.models import (
@@ -25,7 +26,7 @@ from etoro_bot.db.models import (
     SimTrade,
     UserCredential,
 )
-from etoro_bot.domain import DecisionStage, ExecutionResult, ExecutionStatus
+from etoro_bot.domain import ExecutionResult, ExecutionStatus
 
 
 def make_engine(url: str | None = None) -> Engine:
@@ -34,6 +35,37 @@ def make_engine(url: str | None = None) -> Engine:
 
 def make_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(engine, expire_on_commit=False)
+
+
+# Chiave arbitraria ma fissa dell'advisory lock: identifica "lo scheduler di
+# questo bot" su questo database.
+SCHEDULER_LOCK_KEY = 8_421_337
+
+
+def try_scheduler_lock(url: str | None = None) -> Connection | None:
+    """Prende l'advisory lock dello scheduler; None se un'altra istanza ce l'ha.
+
+    Tutta la sicurezza concorrente (lock in-process, breaker singleton) presume
+    UN SOLO processo: due repliche o `--workers 2` moltiplicherebbero gli
+    scheduler e quindi gli ordini. Il lock Postgres è per-sessione, quindi la
+    connessione restituita va tenuta viva per tutta la vita del processo:
+    chiuderla libera il lock. `NullPool` perché il pooling rimetterebbe in circolo
+    una connessione che detiene ancora il lock.
+    """
+    engine = create_engine(url or database_url(), poolclass=NullPool)
+    conn = engine.connect()
+    try:
+        acquired = bool(
+            conn.execute(select(func.pg_try_advisory_lock(SCHEDULER_LOCK_KEY))).scalar()
+        )
+        conn.commit()  # niente transazione aperta a vita: il lock è di sessione
+    except Exception:
+        conn.close()
+        raise
+    if acquired:
+        return conn
+    conn.close()
+    return None
 
 
 class Repository:
@@ -81,11 +113,10 @@ class Repository:
 
     # --- decisions / executions -------------------------------------------
     def add_decision(
-        self, run_id: str, symbol: str, stage: DecisionStage | str, payload: dict[str, Any]
+        self, run_id: str, symbol: str, stage: str, payload: dict[str, Any]
     ) -> None:
-        stage_value = stage.value if isinstance(stage, DecisionStage) else stage
         with self._sf.begin() as s:
-            s.add(Decision(run_id=run_id, symbol=symbol, stage=stage_value, payload=payload))
+            s.add(Decision(run_id=run_id, symbol=symbol, stage=stage, payload=payload))
 
     def get_run_decisions(self, run_id: str) -> list[Decision]:
         with self._sf() as s:
@@ -97,20 +128,43 @@ class Repository:
                 )
             )
 
-    def add_execution(self, run_id: str, result: ExecutionResult) -> None:
+    def add_execution(self, run_id: str, result: ExecutionResult) -> uuid.UUID:
+        """Scrive la riga a giornale e ne ritorna l'id, per poterla aggiornare."""
         with self._sf.begin() as s:
-            s.add(
-                Execution(
-                    run_id=run_id,
-                    symbol=result.symbol,
-                    side=result.side.value,
-                    amount_usd=result.amount_usd,
-                    status=result.status.value,
-                    detail=result.detail,
-                    execution_price=result.execution_price,
-                    etoro_position_id=result.etoro_position_id,
-                )
+            row = Execution(
+                run_id=run_id,
+                symbol=result.symbol,
+                side=result.side.value,
+                amount_usd=result.amount_usd,
+                status=result.status.value,
+                detail=result.detail,
+                execution_price=result.execution_price,
+                etoro_position_id=result.etoro_position_id,
             )
+            s.add(row)
+            s.flush()
+            return row.id
+
+    def update_execution(
+        self,
+        execution_id: uuid.UUID,
+        status: ExecutionStatus,
+        detail: str | None = None,
+        execution_price: float | None = None,
+        etoro_position_id: int | None = None,
+    ) -> None:
+        """Porta a esito una riga già scritta (write-ahead): nessuna riga nuova."""
+        with self._sf.begin() as s:
+            row = s.get(Execution, execution_id)
+            if row is None:
+                return
+            row.status = status.value
+            if detail is not None:
+                row.detail = detail
+            if execution_price is not None:
+                row.execution_price = execution_price
+            if etoro_position_id is not None:
+                row.etoro_position_id = etoro_position_id
 
     def list_executions(self, limit: int = 50) -> list[Execution]:
         with self._sf() as s:
@@ -118,29 +172,37 @@ class Repository:
                 s.scalars(select(Execution).order_by(Execution.created_at.desc()).limit(limit))
             )
 
+    def executions_by_status(
+        self, statuses: tuple[str, ...], since: datetime
+    ) -> list[Execution]:
+        """Esecuzioni in quegli stati dalla data indicata, senza tetto di righe.
+
+        Il reconcile deve vedere TUTTI i non-conclusi delle ultime ore: una
+        finestra a numero di righe, in giornate attive, li taglierebbe fuori.
+        """
+        with self._sf() as s:
+            return list(
+                s.scalars(
+                    select(Execution)
+                    .where(
+                        Execution.status.in_(list(statuses)),
+                        Execution.created_at >= since,
+                    )
+                    .order_by(Execution.created_at)
+                )
+            )
+
     def cancel_pending_execution(self, execution_id: uuid.UUID) -> bool:
         with self._sf.begin() as s:
             row = s.get(Execution, execution_id)
-            if row is None or row.status != "pending":
+            if row is None or row.status != ExecutionStatus.PENDING.value:
                 return False
-            row.status = "cancelled"
-            row.detail = "annullato manualmente"
+            row.status = ExecutionStatus.CANCELLED.value
+            # il reference id resta nel dettaglio: annullare qui non annulla
+            # nulla sul broker, e se l'ordine era passato il reconcile deve
+            # poter ancora adottare la posizione.
+            row.detail = f"annullato manualmente {row.detail or ''}".strip()
             return True
-
-    def count_filled_today(self) -> int:
-        today = datetime.now(timezone.utc).date()
-        with self._sf() as s:
-            return int(
-                s.scalar(
-                    select(func.count())
-                    .select_from(Execution)
-                    .where(
-                        Execution.status == ExecutionStatus.FILLED.value,
-                        func.date(Execution.created_at) == today,
-                    )
-                )
-                or 0
-            )
 
     # --- bot positions registry (§7) ---------------------------------------
     def register_open_position(
@@ -153,6 +215,7 @@ class Repository:
         entry_price: float,
         opened_at: datetime,
         sector: str = "unknown",
+        direction: str = "long",
     ) -> None:
         with self._sf.begin() as s:
             s.merge(
@@ -161,6 +224,7 @@ class Repository:
                     run_id=run_id,
                     symbol=symbol,
                     instrument_id=instrument_id,
+                    direction=direction,
                     amount_usd=amount_usd,
                     entry_price=entry_price,
                     opened_at=opened_at,
@@ -240,15 +304,21 @@ class Repository:
                 )
             )
 
-    def closed_positions(self) -> list[BotPosition]:
+    def closed_positions(self, limit: int | None = 1000) -> list[BotPosition]:
+        """Posizioni chiuse in ordine cronologico; `limit` tiene le PIÙ RECENTI.
+
+        Le route in polling non hanno bisogno dello storico intero a ogni giro;
+        il track record (`services/backtest.py`) sì, e passa `limit=None`.
+        """
         with self._sf() as s:
-            return list(
-                s.scalars(
-                    select(BotPosition)
-                    .where(BotPosition.closed_at.is_not(None))
-                    .order_by(BotPosition.closed_at)
-                )
+            stmt = (
+                select(BotPosition)
+                .where(BotPosition.closed_at.is_not(None))
+                .order_by(BotPosition.closed_at.desc())
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return list(reversed(list(s.scalars(stmt))))
 
     # --- equity -------------------------------------------------------------
     def record_equity_snapshot(
@@ -261,9 +331,25 @@ class Repository:
                 )
             )
 
-    def equity_series(self) -> list[EquitySnapshot]:
+    def equity_series(self, limit: int | None = None) -> list[EquitySnapshot]:
+        """Snapshot equity in ordine di data; `limit` tiene i PIÙ RECENTI.
+
+        Uno snapshot al giorno: la serie intera resta piccola e il track record
+        la vuole tutta. `limit` serve a chi guarda solo la coda (`/status`).
+        """
         with self._sf() as s:
-            return list(s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.date)))
+            if limit is None:
+                return list(
+                    s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.date))
+                )
+            rows = list(
+                s.scalars(
+                    select(EquitySnapshot)
+                    .order_by(EquitySnapshot.date.desc())
+                    .limit(limit)
+                )
+            )
+            return list(reversed(rows))
 
     # --- app settings (§10) -------------------------------------------------
     def get_setting(self, key: str) -> Any | None:
@@ -390,12 +476,15 @@ class Repository:
         entry_price: float,
         open_reason: str,
         opened_at: datetime | None = None,
+        direction: str = "long",
     ) -> bool:
         """Apre una posizione simulata scalando il cash; False se cash insufficiente."""
         if amount_usd <= 0 or entry_price <= 0:
             return False
         with self._sf.begin() as s:
-            agent = s.get(Agent, agent_id)
+            # FOR UPDATE: il cash è read-modify-write, senza lock di riga due
+            # operazioni concorrenti sullo stesso agente si sovrascrivono.
+            agent = s.get(Agent, agent_id, with_for_update=True)
             if agent is None or agent.status != "alive" or agent.cash_usd < amount_usd:
                 return False
             agent.cash_usd = agent.cash_usd - amount_usd
@@ -404,6 +493,7 @@ class Repository:
                     agent_id=agent_id,
                     symbol=symbol,
                     instrument_id=instrument_id,
+                    direction=direction,
                     amount_usd=amount_usd,
                     units=amount_usd / entry_price,
                     entry_price=entry_price,
@@ -421,18 +511,21 @@ class Repository:
         Ritorna il PnL realizzato, None se la posizione non esiste.
         """
         with self._sf.begin() as s:
-            pos = s.get(SimPosition, position_id)
+            # FOR UPDATE sulla posizione (una sola chiusura vince: la seconda
+            # non la trova più) e poi sull'agente, prima di toccarne il cash.
+            pos = s.get(SimPosition, position_id, with_for_update=True)
             if pos is None:
                 return None
             proceeds = pos.units * close_price
             pnl = proceeds - pos.amount_usd
-            agent = s.get(Agent, pos.agent_id)
+            agent = s.get(Agent, pos.agent_id, with_for_update=True)
             if agent is not None:
                 agent.cash_usd = agent.cash_usd + proceeds
             s.add(
                 SimTrade(
                     agent_id=pos.agent_id,
                     symbol=pos.symbol,
+                    direction=pos.direction,
                     amount_usd=pos.amount_usd,
                     entry_price=pos.entry_price,
                     close_price=close_price,
@@ -455,6 +548,27 @@ class Repository:
                 )
             )
 
+    def sim_positions_by_agent(
+        self, agent_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, list[SimPosition]]:
+        """Posizioni aperte di più agenti in una query sola.
+
+        La pagina arena serve agenti + campione + lineage: una query per agente
+        era un N+1 servito in polling.
+        """
+        if not agent_ids:
+            return {}
+        out: dict[uuid.UUID, list[SimPosition]] = {}
+        with self._sf() as s:
+            rows = s.scalars(
+                select(SimPosition)
+                .where(SimPosition.agent_id.in_(agent_ids))
+                .order_by(SimPosition.opened_at)
+            )
+            for row in rows:
+                out.setdefault(row.agent_id, []).append(row)
+        return out
+
     def sim_trades(
         self, agent_id: uuid.UUID, limit: int | None = 200
     ) -> list[SimTrade]:
@@ -476,15 +590,52 @@ class Repository:
         with self._sf.begin() as s:
             s.add(SimEquityPoint(agent_id=agent_id, ts=ts, equity_usd=equity_usd))
 
-    def sim_equity_series(self, agent_id: uuid.UUID) -> list[SimEquityPoint]:
+    def sim_equity_series(
+        self, agent_id: uuid.UUID, limit: int | None = 3000
+    ) -> list[SimEquityPoint]:
+        """Serie equity simulata in ordine di tempo; `limit` tiene i PIÙ RECENTI.
+
+        Un punto per ciclo: circa 26 al giorno di mercato, cioè ~570 al mese.
+        3000 coprono l'intera vita di un agente (un mese) con margine, e
+        mettono un tetto alla route servita in polling a 15s.
+        """
         with self._sf() as s:
-            return list(
-                s.scalars(
-                    select(SimEquityPoint)
-                    .where(SimEquityPoint.agent_id == agent_id)
-                    .order_by(SimEquityPoint.ts)
-                )
+            stmt = (
+                select(SimEquityPoint)
+                .where(SimEquityPoint.agent_id == agent_id)
+                .order_by(SimEquityPoint.ts.desc())
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return list(reversed(list(s.scalars(stmt))))
+
+    def last_sim_equity(self, agent_ids: list[uuid.UUID]) -> dict[uuid.UUID, float]:
+        """Ultimo punto equity per agente, in una query sola.
+
+        Serve alle route arena, che mostrano l'equity di N agenti: il valore è
+        già mark-to-market (lo scrive il ciclo di training), mentre ricalcolarlo
+        lì richiederebbe i prezzi correnti di tutti i simboli.
+        """
+        if not agent_ids:
+            return {}
+        with self._sf() as s:
+            latest = (
+                select(
+                    SimEquityPoint.agent_id.label("agent_id"),
+                    func.max(SimEquityPoint.ts).label("ts"),
+                )
+                .where(SimEquityPoint.agent_id.in_(agent_ids))
+                .group_by(SimEquityPoint.agent_id)
+                .subquery()
+            )
+            rows = s.execute(
+                select(SimEquityPoint.agent_id, SimEquityPoint.equity_usd).join(
+                    latest,
+                    (SimEquityPoint.agent_id == latest.c.agent_id)
+                    & (SimEquityPoint.ts == latest.c.ts),
+                )
+            ).all()
+        return {row[0]: float(row[1]) for row in rows}
 
     def add_arena_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
         with self._sf.begin() as s:

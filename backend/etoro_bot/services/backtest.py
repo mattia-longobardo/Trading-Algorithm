@@ -2,8 +2,10 @@
 
 Non è un backtest storico di una strategia meccanica: è l'analisi dei trade
 realmente eseguiti (demo o reale), letti SOLO dal registry bot (§7).
-Rendimenti calcolati con Time-Weighted Return (TWR, standard GIPS): ogni
-variazione di bot_capital_usd chiude un sub-periodo.
+Rendimenti calcolati con Time-Weighted Return (TWR, standard GIPS) sulla serie
+equity giornaliera. I flussi di capitale (depositi/prelievi sul conto eToro)
+non sono osservabili dal bot e quindi NON vengono depurati: `daily_returns`
+accetta il dict dei flussi, ma oggi nessuno è in grado di riempirlo.
 
 Le metriche sono funzioni pure (definizioni standard, quantstats-like,
 252 giorni/anno) e ritornano None quando indefinite. I prezzi del benchmark
@@ -21,6 +23,7 @@ import numpy as np
 
 from etoro_bot.config import load_settings
 from etoro_bot.db.repo import Repository
+from etoro_bot.services import stats
 
 TRADING_DAYS_PER_YEAR = 252
 MIN_TRADES_FOR_STATS = 30    # §11.2: sotto, campione insufficiente
@@ -73,9 +76,7 @@ def cagr(returns: list[float], periods_per_year: int = TRADING_DAYS_PER_YEAR) ->
 def annualized_volatility(
     returns: list[float], periods_per_year: int = TRADING_DAYS_PER_YEAR
 ) -> float | None:
-    if len(returns) < 2:
-        return None
-    return float(np.std(returns, ddof=1) * np.sqrt(periods_per_year))
+    return stats.annualized_volatility(returns, periods_per_year)
 
 
 def sharpe(returns: list[float], risk_free_rate: float = 0.0) -> float | None:
@@ -100,12 +101,15 @@ def sortino(returns: list[float], risk_free_rate: float = 0.0) -> float | None:
 
 
 def max_drawdown(returns: list[float]) -> float | None:
-    """Massima perdita peak-to-trough sulla curva cumulata (valore ≤ 0)."""
+    """Massima perdita peak-to-trough sulla curva cumulata (valore ≤ 0).
+
+    In frazione, non in percentuale: qui i rendimenti sono frazionari e le
+    route moltiplicano per 100 in un punto solo.
+    """
     if not returns:
         return None
-    curve = np.cumprod(np.asarray(returns) + 1.0)
-    peaks = np.maximum.accumulate(curve)
-    return float(np.min(curve / peaks - 1.0))
+    worst = stats.max_drawdown_pct(stats.cumulative_levels(returns))
+    return 0.0 if worst is None else worst / 100.0
 
 
 def calmar(returns: list[float]) -> float | None:
@@ -208,19 +212,13 @@ class BacktestService:
             and (date_to is None or snap.date <= date_to)
         ]
 
-    def _capital_changes(self) -> dict[date, float]:
-        """Flussi di capitale dal log di audit di bot_capital_usd (delta per giorno)."""
-        flows: dict[date, float] = {}
-        for entry in self._repo.settings_audit(limit=1000):
-            if entry.key != "bot_capital_usd":
-                continue
-            old = (entry.old_value or {}).get("value")
-            new = (entry.new_value or {}).get("value")
-            if old is None or new is None:
-                continue  # primo set: capitale iniziale, non un flusso
-            day = entry.changed_at.date()
-            flows[day] = flows.get(day, 0.0) + float(new) - float(old)
-        return {d: f for d, f in flows.items() if f != 0.0}
+    # I flussi di capitale (depositi/prelievi) NON sono osservabili dal bot: il
+    # capitale non è più un'impostazione applicativa (`bot_capital_usd` non
+    # esiste più nei settings), e la cassa del broker si muove a ogni trade.
+    # Il TWR qui è quindi un rendimento sull'equity: un versamento sul conto
+    # eToro comparirebbe come performance. `daily_returns` sa già depurare i
+    # flussi — il giorno in cui esisterà una sorgente attendibile, le si passa
+    # quel dict. Prima leggeva l'audit di una chiave morta: sempre {}.
 
     def _benchmark_symbol(self) -> str:
         return str(self._settings.get("benchmark_symbol", "SPY"))
@@ -261,10 +259,10 @@ class BacktestService:
         self, date_from: date | None = None, date_to: date | None = None
     ) -> dict[str, Any]:
         points = self._equity_points(date_from, date_to)
-        returns = daily_returns(points, self._capital_changes())
+        returns = daily_returns(points)
         pnls = [
             p.realized_pnl_usd
-            for p in self._repo.closed_positions()
+            for p in self._repo.closed_positions(limit=None)  # track record: storico intero
             if p.realized_pnl_usd is not None
             and p.closed_at is not None
             and (date_from is None or p.closed_at.date() >= date_from)
@@ -347,7 +345,7 @@ class BacktestService:
 
         # Ogni apertura bot replicata come acquisto benchmark di pari importo.
         openings: list[tuple[date, float]] = []
-        for pos in [*self._repo.open_positions(), *self._repo.closed_positions()]:
+        for pos in [*self._repo.open_positions(), *self._repo.closed_positions(limit=None)]:
             open_day = pos.opened_at.date()
             open_price = self._price_on(prices, open_day) if prices else None
             if open_price:
@@ -376,7 +374,7 @@ class BacktestService:
     def monthly_returns(self) -> list[dict[str, Any]]:
         """Rendimenti mensili (%) dalla serie TWR: righe {year, months[12]}."""
         points = self._equity_points()
-        returns = daily_returns(points, self._capital_changes())
+        returns = daily_returns(points)
         by_month: dict[tuple[int, int], float] = {}
         for (day, _), ret in zip(points[1:], returns):
             key = (day.year, day.month)
@@ -401,5 +399,5 @@ class BacktestService:
                 "close_reason": p.close_reason,
                 "sector": p.sector,
             }
-            for p in self._repo.closed_positions()
+            for p in self._repo.closed_positions(limit=None)  # track record: storico intero
         ]

@@ -103,8 +103,11 @@ function StatusCards() {
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
           <div className="flex max-h-52 flex-col gap-2 overflow-y-auto">
+            {/* Key sul solo indice: includere il valore del campo la renderebbe
+                instabile e React rimonterebbe l'input a ogni carattere,
+                facendogli perdere il focus. */}
             {feeds.map((feed, index) => (
-              <div key={`${index}-${feed}`} className="flex items-center gap-2">
+              <div key={index} className="flex items-center gap-2">
                 <Input value={feed} onChange={(event) => setFeeds((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} aria-label={`Feed RSS ${index + 1}`} />
                 <Button variant="ghost" size="icon" aria-label="Rimuovi feed" onClick={() => setFeeds((current) => current.filter((_, itemIndex) => itemIndex !== index))}><Trash2Icon aria-hidden="true" /></Button>
               </div>

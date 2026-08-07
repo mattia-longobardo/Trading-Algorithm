@@ -11,16 +11,29 @@ Tutto in UTC. Un solo job APScheduler al minuto (tick) che rilegge le settings:
 
 I job girano in thread dedicati: il tick non si blocca mai e lo stesso job
 non corre mai in due istanze sovrapposte.
+
+Lo stato del tick (ultimo slot eseguito, EOD fatti, giorno di evoluzione e
+news) è persistito su file JSON in `state/`: un riavvio a metà slot NON deve
+rilanciare il ciclo, perché sarebbe una nuova decisione LLM — cioè un possibile
+secondo trade nella stessa finestra. Lo stato si scrive PRIMA di lanciare il
+job, come marcatura: meglio un ciclo saltato che uno doppio. L'EOD è l'unica
+eccezione (si marca DOPO): chiude posizioni vere, rifarlo è un no-op, saltarlo
+lascerebbe esposizione aperta oltre la campanella.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 log = logging.getLogger("etoro_bot.scheduler")
+
+STATE_FILENAME = "scheduler_state.json"
 
 # Sessioni di default (UTC, orari estivi): Europa 09:00-17:30 CEST,
 # USA 9:30-16:00 ET. Configurabili da settings.yaml arena.markets.
@@ -152,6 +165,53 @@ def next_cycle_at(settings: dict[str, Any], now: datetime | None = None) -> str:
     ).isoformat()
 
 
+def state_path(state_dir: str | Path | None = None) -> Path:
+    base = Path(
+        state_dir
+        or os.environ.get("STATE_DIR", os.environ.get("KILL_SWITCH_DIR", "."))
+    )
+    return base / STATE_FILENAME
+
+
+def _empty_state() -> dict[str, Any]:
+    return {
+        "evolve_day": None,
+        "news_day": None,
+        "cycle_slot": None,
+        "eod_done": set(),  # {"YYYY-MM-DD#sessione"}
+    }
+
+
+def _load_state(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "evolve_day": raw.get("evolve_day"),
+            "news_day": raw.get("news_day"),
+            "cycle_slot": raw.get("cycle_slot"),
+            "eod_done": set(raw.get("eod_done") or ()),
+        }
+    except FileNotFoundError:
+        return _empty_state()  # primo avvio
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        # corrotto o di forma sbagliata (JSON valido ma non dict): si riparte da
+        # zero, al più un ciclo in più. Mai lasciare il processo senza scheduler.
+        log.warning("stato scheduler illeggibile (%s): si riparte da zero", path)
+        return _empty_state()
+
+
+def _save_state(path: Path, state: dict[str, Any]) -> None:
+    """Scrittura atomica tmp+replace, come il circuit breaker."""
+    payload = {**state, "eod_done": sorted(state["eod_done"])}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        log.exception("stato scheduler non salvato (%s)", path)
+
+
 def start_scheduler(
     get_settings: Callable[[], dict[str, Any]],
     *,
@@ -159,30 +219,43 @@ def start_scheduler(
     eod_job: Callable[[str, bool], None],
     evolve_job: Callable[[], None],
     news_job: Callable[[], None],
+    state_dir: str | Path | None = None,
 ):
     """Avvia APScheduler; eod_job riceve (mercato, ultima_sessione_del_giorno)."""
     from apscheduler.schedulers.background import BackgroundScheduler
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    state: dict[str, Any] = {
-        "evolve_day": None,
-        "news_day": None,
-        "cycle_slot": None,
-        "eod_done": set(),  # {"YYYY-MM-DD#sessione"}
-    }
+    path = state_path(state_dir)
+    state = _load_state(path)
     running: set[str] = set()  # job lunghi in thread: mai due istanze uguali
+    save_lock = threading.Lock()
 
-    def tick() -> None:
+    def _persist() -> None:
+        """Snapshot + scrittura nella STESSA sezione critica.
+
+        Il tick e i thread EOD salvano lo stesso dict: senza lock un EOD che
+        snapshota prima che il tick scriva `cycle_slot` e salva dopo
+        rimetterebbe su disco lo slot vecchio — al riavvio il ciclo ripartirebbe
+        nella stessa finestra, cioè il trade doppio che tutto questo evita. E
+        due `replace` sullo stesso .tmp lascerebbero un file troncato.
+        """
+        with save_lock:
+            _save_state(path, state)
+
+    def tick(now: datetime | None = None) -> None:
         try:
             settings = get_settings()
         except Exception:
             log.warning("settings non disponibili, tick saltato", exc_info=True)
             return
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
         today = now.date().isoformat()
 
         if state["evolve_day"] != today:
             state["evolve_day"] = today
+            # giorno nuovo: gli EOD dei giorni passati non servono più
+            state["eod_done"] = {k for k in state["eod_done"] if k.startswith(today)}
+            _persist()
             _safe(evolve_job, "evolve")
 
         if now.weekday() >= 5:
@@ -195,20 +268,30 @@ def start_scheduler(
         )
         if state["news_day"] != today and now >= news_at:
             state["news_day"] = today
+            _persist()
             _safe(news_job, "news")
 
         slot = cycle_slot(settings, now)
         slot_key = None if slot is None else f"{today}#{slot}"
         if slot_key is not None and state["cycle_slot"] != slot_key:
             state["cycle_slot"] = slot_key
+            _persist()
             _safe(cycle_job, "cycle")
 
         last = final_session(settings)
         for name, (_open_t, close_t) in _session_times(settings).items():
             key = f"{today}#{name}"
             if key not in state["eod_done"] and now.time() >= close_t:
-                state["eod_done"].add(key)
-                _safe(lambda n=name: eod_job(n, n == last), f"eod-{name}")
+                # L'EOD si marca DOPO: chiude posizioni vere, e un'esecuzione
+                # persa lascerebbe esposizione aperta oltre la campanella,
+                # mentre rifarlo è un no-op (itera sulle posizioni ancora
+                # aperte). Il doppio lancio in-process lo impedisce `running`.
+                def _eod(n=name, k=key) -> None:
+                    eod_job(n, n == last)
+                    state["eod_done"].add(k)
+                    _persist()
+
+                _safe(_eod, f"eod-{name}")
 
     def _safe(job: Callable[[], None], name: str) -> None:
         """Esegue il job in un thread: il tick non si blocca mai (news e cicli

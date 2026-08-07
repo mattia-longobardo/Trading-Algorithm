@@ -24,6 +24,10 @@ def _eq(days_ago, equity):
 
 
 def test_trade_direction():
+    # colonna persistita
+    assert trade_direction(SimpleNamespace(direction="short", open_reason="")) == "short"
+    assert trade_direction(SimpleNamespace(direction="long", open_reason="")) == "long"
+    # righe vecchie: la direzione stava solo nel testo
     assert trade_direction(_trade(1.0)) == "long"
     assert trade_direction(_trade(1.0, short=True)) == "short"
 

@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from etoro_bot.config import load_breaker_rules, load_settings
 from etoro_bot.db.repo import Repository
-from etoro_bot.safety import CircuitBreaker, kill_switch_active
+from etoro_bot.safety import kill_switch_active
+from etoro_bot.safety.circuit_breaker import get_breaker
 from etoro_bot.services.fx import SUPPORTED_CURRENCIES
 
 # Default hardcoded: ultimo fallback se anche settings.yaml manca.
@@ -72,8 +73,9 @@ def check_live_activation(repo: Repository, *, etoro_configured: bool | None) ->
         )
     if kill_switch_active():
         raise SettingsValidationError("kill switch attivo: impossibile andare live")
-    breaker = CircuitBreaker(load_breaker_rules())
-    if breaker.blocks_openings():
+    # Istanza condivisa: una copia effimera leggerebbe uno stato stantio e i
+    # suoi reset()/_save() sovrascriverebbero quello di scheduler e cicli live.
+    if get_breaker(load_breaker_rules()).blocks_openings():
         raise SettingsValidationError("circuit breaker scattato: impossibile andare live")
 
 
