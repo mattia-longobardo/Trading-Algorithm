@@ -25,8 +25,10 @@ ogni richiesta priva di `X-Trading-Internal-Token` uguale a
 `TRADING_INTERNAL_TOKEN`. Il confronto usa `hmac.compare_digest`. L'unica rotta
 esente è `/health` (sonda del container).
 
-Se `TRADING_INTERNAL_TOKEN` è vuoto il controllo è **disattivato**: è pensato
-solo per lo sviluppo in locale. In produzione va sempre valorizzato.
+Il token è **obbligatorio**: se `TRADING_INTERNAL_TOKEN` è vuoto il backend
+**rifiuta l'avvio**. L'unica deroga è `TRADING_DEV_MODE=1`, che consente
+l'avvio senza token (controllo disattivato, warning nei log) ed esiste solo per
+lo sviluppo in locale: mai in produzione.
 
 ### Catena di autenticazione
 
@@ -51,8 +53,12 @@ qualche ragione ce ne fosse più d'una).
 
 - Finché nessuno ha configurato le chiavi non esiste un proprietario e il
   controllo è un no-op: è il primo utente che si registra a diventarlo.
-- L'identità `system` (job schedulati) passa sempre.
+- Header `X-Trading-User-Id` assente ⇒ identità `anonimo`, senza privilegi.
+  L'identità `system` è riservata ai job schedulati, che non passano da
+  FastAPI: via HTTP quel valore è rifiutato con **403**.
 - Chiunque altro riceve **403**.
+- Se il proprietario non è verificabile (DB giù) la risposta è **503**: mai un
+  via libera per un guasto.
 
 Endpoint protetti: `POST /trades/{id}/close`, `POST /executions/{id}/cancel`,
 `PUT /settings`, `POST /arena/pause|resume|cycle`, `POST /live/disable`,

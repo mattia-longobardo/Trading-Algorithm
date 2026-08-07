@@ -223,8 +223,18 @@ def _ensure_run(deps: ArenaDeps, now: datetime) -> str:
 
 
 def _live_cash(deps: ArenaDeps) -> float:
-    portfolio = deps.client.get_portfolio()
-    return float(portfolio.get("credit") or 0.0)
+    """Liquidità reale del conto. Solleva se il broker non pubblica `credit`.
+
+    Un `credit` assente NON è zero: trattarlo come 0 azzererebbe il sizing,
+    falserebbe equity e circuit breaker e lo farebbe in silenzio. Sulla stessa
+    lettura il percorso `/portfolio` risponde 502 — qui la severità è la stessa,
+    chi chiama salta invece di operare su un capitale inventato.
+    """
+    portfolio = deps.client.get_portfolio() or {}
+    credit = portfolio.get("credit")
+    if credit is None:
+        raise ValueError("portfolio eToro senza campo credit")
+    return float(credit)
 
 
 def _slot_key(deps: ArenaDeps, now: datetime) -> str:
@@ -858,8 +868,9 @@ def _run_live_cycle_locked(
     champion = deps.repo.champion()
     if champion is None:
         return {"skipped": "no_champion"}
-    if deps.llm is None:
-        return {"skipped": "no_llm"}
+    # NIENTE uscita anticipata per LLM mancante: reconcile, liquidazione e
+    # sweep di stop loss / take profit devono girare comunque. Una chiave del
+    # modello scaduta non deve mai lasciare posizioni reali senza protezione.
     if market is None:
         from etoro_bot.arena.market import build_snapshot
 
@@ -885,8 +896,21 @@ def _run_live_cycle_locked(
 
     positions = deps.repo.open_positions()
     broker_directions = live_directions(deps)  # sola controprova del registro
-    cash = _live_cash(deps)
-    equity = cash + sum(p.amount_usd for p in positions)
+    # Capitale reale: se il broker non lo pubblica NON vale zero. Il ciclo non
+    # deciderà e non aprirà (sizing e breaker sarebbero calcolati sul nulla), ma
+    # le protezioni qui sotto girano lo stesso: una chiusura non si nega mai.
+    cash: float | None
+    try:
+        cash = _live_cash(deps)
+    except (TypeError, ValueError) as exc:  # credit assente o non numerico
+        logger.error(
+            "live: capitale eToro non disponibile (%s): stop loss e take profit "
+            "girano comunque, decisione e aperture SALTATE", exc,
+        )
+        cash = None
+    # senza credit certo l'equity resta la sola esposizione nota: sottostimata,
+    # quindi il breaker è più prudente, mai più permissivo.
+    equity = (cash or 0.0) + sum(p.amount_usd for p in positions)
 
     # stop loss / take profit del DNA (0 = disattivati: decide solo il campione).
     # Girano PRIMA della chiamata all'LLM: un modello lento non deve poter
@@ -922,8 +946,38 @@ def _run_live_cycle_locked(
             # una chiusura fallita non deve impedire le altre: sono stop loss
             logger.warning("live: chiusura automatica %s fallita: %s", pos.symbol, exc)
 
+    slot = _slot_key(deps, now)
+    protections = {
+        "adopted": reconciled.get("adopted", 0),
+        "closed_externally": reconciled.get("closed_externally", 0),
+        "settled": settled.get("settled", 0),
+    }
+    # Da qui in giù si DECIDE e si APRE: serve capitale certo e serve l'LLM. Le
+    # protezioni sopra sono già girate, quindi mancare l'uno o l'altro degrada
+    # il ciclo a sola sorveglianza invece di lasciare le posizioni scoperte.
     positions = deps.repo.open_positions()
-    cash = _live_cash(deps)
+    if cash is not None:
+        # rilettura: le chiusure automatiche qui sopra hanno mosso la cassa
+        try:
+            cash = _live_cash(deps)
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "live: capitale eToro non disponibile alla rilettura (%s): "
+                "nessuna decisione e nessuna apertura", exc,
+            )
+            cash = None
+    skipped = "no_cash" if cash is None else "no_llm" if deps.llm is None else None
+    if skipped is not None:
+        if skipped == "no_llm":
+            logger.warning(
+                "live: nessun LLM configurato: protezioni eseguite, nessuna "
+                "nuova decisione e nessuna apertura"
+            )
+        summary = {"opened": 0, "closed": 0, "blocked": 0, "skipped": skipped,
+                   **protections}
+        deps.repo.finish_run(run_id, {"cycle": slot, **summary})
+        return summary
+
     equity = cash + sum(p.amount_usd for p in positions)
     prompt = build_prompt(
         name=f"{champion.name} (CAMPIONE LIVE)",
@@ -972,7 +1026,6 @@ def _run_live_cycle_locked(
                 logger.warning("live: chiusura %s fallita: %s", close["symbol"], exc)
 
     blocks_openings = breaker is not None and breaker.blocks_openings()
-    slot = _slot_key(deps, now)
     # Ordini che il broker non ha né confermato né smentito: quel simbolo
     # potrebbe già essere a mercato senza comparire nel registry. Con
     # allow_pyramiding attivo held_symbols non basta a fermare il doppione.
@@ -1017,12 +1070,7 @@ def _run_live_cycle_locked(
     for item in closes + [dict(o, action="open") for o in opens]:
         deps.repo.add_decision(run_id, item.get("symbol", "?"), "trader",
                                {k: v for k, v in item.items() if k != "instrument_id"})
-    summary = {
-        **executed,
-        "adopted": reconciled.get("adopted", 0),
-        "closed_externally": reconciled.get("closed_externally", 0),
-        "settled": settled.get("settled", 0),
-    }
+    summary = {**executed, **protections}
     deps.repo.finish_run(run_id, {"cycle": slot, **summary})
     return summary
 
