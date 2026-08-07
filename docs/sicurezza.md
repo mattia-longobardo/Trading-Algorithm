@@ -215,9 +215,18 @@ marcatore che le lega al bot:
 2. posizioni del portafoglio il cui `positionId` compare già nel giornale delle
    esecuzioni.
 
-**Le posizioni che il bot non ha aperto non vengono mai toccate**: qui si adotta
-soltanto, non si chiude nulla. Una posizione reale non registrata sarebbe una
-posizione che nessuno chiuderà mai.
+**Le posizioni che il bot non ha aperto non vengono mai toccate.** Una posizione
+reale non registrata sarebbe una posizione che nessuno chiuderà mai.
+
+Lo stesso reconcile adotta anche le CHIUSURE avvenute fuori dal bot (chiusura
+manuale su eToro, margin call, o ordine di chiusura eseguito con la scrittura a
+registro fallita): una posizione nostra assente dal portafoglio viene chiusa a
+registro col `netProfit` della trade history. Solo con prove, però — chiudere a
+registro una posizione ancora viva la renderebbe orfana per sempre, senza stop
+loss e col simbolo di nuovo libero. Servono tutte queste condizioni: lettura del
+portafoglio riuscita e non vuota, posizione aperta da più di 15 minuti, e prova
+positiva della chiusura (riga in trade history, oppure due letture consecutive
+senza quella posizione). Se la lettura del portafoglio fallisce, ci si astiene.
 
 ### Prezzo d'ingresso mai zero
 

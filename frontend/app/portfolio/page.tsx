@@ -17,6 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { DirectionStamp } from "@/components/arena";
 import { SectorDonut } from "@/components/charts/sector-donut";
 import {
   MobileField,
@@ -147,6 +148,7 @@ export default function PortfolioPage() {
                     <TableHeader>
                       <TableRow>
                         <TableHead>Simbolo</TableHead>
+                        <TableHead>Direzione</TableHead>
                         <TableHead>Settore</TableHead>
                         <TableHead className="text-right">Importo</TableHead>
                         <TableHead className="text-right">Entry</TableHead>
@@ -161,6 +163,9 @@ export default function PortfolioPage() {
                         <TableRow key={String(p.etoro_position_id)}>
                           <TableCell className="font-mono font-medium">
                             {p.symbol}
+                          </TableCell>
+                          <TableCell>
+                            <DirectionStamp direction={p.direction} />
                           </TableCell>
                           <TableCell className="text-muted-foreground">
                             {p.sector ?? "n/d"}
@@ -198,6 +203,7 @@ export default function PortfolioPage() {
                         <MobileItemHeader>
                           <span className="flex min-w-0 items-baseline gap-2">
                             <span className="font-mono text-sm font-medium">{p.symbol}</span>
+                            <DirectionStamp direction={p.direction} />
                             <span className="text-muted-foreground truncate text-xs">{p.sector ?? "n/d"}</span>
                           </span>
                           <span className={`font-mono text-sm font-medium tabular-nums ${pnlClass(p.unrealized_pnl_usd)}`}>

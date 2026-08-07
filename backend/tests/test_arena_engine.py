@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timezone
+
+import pytest
 
 from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna, survival_creed
 from etoro_bot.arena.engine import (
@@ -117,6 +121,31 @@ def test_training_cycle_applies_llm_actions(repo):
         assert len(series) == 1
         # l'equity al mark-to-market resta il capitale iniziale (prezzo invariato)
         assert abs(series[0].equity_usd - agent.starting_capital_usd) < 0.01
+
+
+def test_short_direction_is_persisted_not_written_into_the_reason(repo):
+    """La direzione simulata sta in colonna e sopravvive alla chiusura; la
+    open_reason torna a essere solo il testo dell'agente."""
+    from etoro_bot.arena.engine import effective_price, position_direction
+
+    def llm(system_blocks, user_prompt, model, max_tokens):
+        return json.dumps([{"action": "open", "symbol": "AAPL",
+                            "direction": "short", "size_pct": 50.0,
+                            "reason": "rottura al ribasso"}])
+
+    deps = make_deps(repo, llm=llm)
+    bootstrap_if_needed(deps, now=NOW)
+    agent = repo.alive_agents()[0]
+    run_training_cycle(deps, market=MARKET, now=NOW)
+
+    pos = repo.sim_positions(agent.id)[0]
+    assert pos.direction == "short"
+    assert pos.open_reason == "rottura al ribasso"
+    assert position_direction(pos) == "short"
+
+    repo.close_sim_position(pos.id, effective_price(pos, 180.0), "chiusura")
+    trade = repo.sim_trades(agent.id)[0]
+    assert trade.direction == "short" and trade.pnl_usd > 0
 
 
 def test_training_cycle_skips_when_paused(repo):
@@ -239,6 +268,13 @@ def test_evolution_liquidates_open_positions_before_judgement(repo):
     assert result["results"][0]["pnl_usd"] == 100.0
 
 
+def test_evolution_bootstraps_an_empty_arena(repo):
+    """Su DB vergine l'evoluzione crea la generazione 1 (sotto lock) e si ferma."""
+    deps = make_deps(repo)
+    assert maybe_evolve(deps, now=NOW) is None
+    assert len(repo.alive_agents()) == 2
+
+
 def test_evolution_noop_within_same_month(repo):
     _finished_month(repo, 100.0, 50.0)
     repo.set_setting("arena", {"month": current_month(NOW), "paused": False,
@@ -246,6 +282,76 @@ def test_evolution_noop_within_same_month(repo):
     deps = make_deps(repo)
     assert maybe_evolve(deps, now=NOW) is None
     assert len(repo.alive_agents()) == 2  # nessuno tocca gli agenti
+
+
+# ---------------------------------------------------------------- concorrenza
+
+
+def test_evolution_waits_for_the_running_training_cycle(repo):
+    """Evoluzione e ciclo non si sovrappongono: il verdetto vede conti fermi.
+
+    Senza lock condiviso l'evoluzione liquiderebbe mentre il ciclo apre, e il
+    cash finale dipenderebbe da chi scrive per ultimo.
+    """
+    a, _b = _finished_month(repo, pnl_a=350.0, pnl_b=80.0)
+    order: list[str] = []
+    llm_running = threading.Event()
+
+    def slow_llm(system_blocks, user_prompt, model, max_tokens):
+        order.append("llm-in")
+        llm_running.set()
+        time.sleep(0.4)  # finestra in cui l'evoluzione proverebbe a intromettersi
+        order.append("llm-out")
+        return json.dumps(
+            [{"action": "open", "symbol": "AAPL", "size_pct": 50.0, "reason": "test"}]
+        )
+
+    deps = make_deps(repo, llm=slow_llm)
+    cycle = threading.Thread(
+        target=lambda: run_training_cycle(deps, market=MARKET, now=NOW)
+    )
+    cycle.start()
+    assert llm_running.wait(5), "il ciclo non è partito"
+
+    def _evolve() -> None:
+        maybe_evolve(make_deps(repo), now=NOW)
+        order.append("evolve-done")
+
+    evolve = threading.Thread(target=_evolve)
+    evolve.start()
+    for t in (cycle, evolve):
+        t.join(30)
+        assert not t.is_alive()
+
+    # l'evoluzione ha atteso la fine del ciclo, non si è infilata nel mezzo
+    assert order.index("evolve-done") > order.index("llm-out")
+    # cash deterministico: aperto e poi liquidato al prezzo d'ingresso
+    assert repo.get_agent(a).cash_usd == pytest.approx(10_350.0, abs=0.01)
+    assert repo.sim_positions(a) == []
+
+
+def test_concurrent_closes_do_not_lose_cash_updates(repo):
+    """Chiusure simultanee sullo stesso agente: nessun accredito perso."""
+    agent_id = repo.create_agent("T-lock", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    for i in range(8):
+        assert repo.open_sim_position(agent_id, f"S{i}", i, 1_000.0, 100.0, "setup")
+    positions = repo.sim_positions(agent_id)
+    barrier = threading.Barrier(len(positions))
+
+    def _close(pos) -> None:
+        barrier.wait(10)  # tutti leggono il cash nello stesso istante
+        repo.close_sim_position(pos.id, 110.0, "chiusura concorrente")
+
+    threads = [threading.Thread(target=_close, args=(p,)) for p in positions]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+        assert not t.is_alive()
+
+    # 2.000 residui + 8 × 1.100 di ricavato
+    assert repo.get_agent(agent_id).cash_usd == pytest.approx(10_800.0, abs=0.01)
+    assert repo.sim_positions(agent_id) == []
 
 
 # --------------------------------------------------------------------- equity

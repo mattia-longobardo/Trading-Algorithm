@@ -18,7 +18,7 @@ MIN_DAILY_POINTS = 3
 
 
 def trade_direction(trade: Any) -> str:
-    """Direzione di un trade/posizione dal marcatore [SHORT] in open_reason."""
+    """Direzione di un trade/posizione dalla colonna persistita."""
     return position_direction(trade)
 
 

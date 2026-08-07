@@ -14,10 +14,14 @@ class Side(str, enum.Enum):
 
 
 class ExecutionStatus(str, enum.Enum):
+    # write-ahead: l'intento è a giornale PRIMA che l'ordine parta, così un
+    # fill seguito da crash lascia comunque una traccia con il reference id.
+    PENDING = "pending"
     FILLED = "filled"
     FAILED = "failed"
     SKIPPED = "skipped"
     REJECTED = "rejected"
+    CANCELLED = "cancelled"
 
 
 class DecisionStage(str, enum.Enum):

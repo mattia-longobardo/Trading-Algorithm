@@ -394,3 +394,12 @@ def test_rate_limiter_uses_safety_margin():
     assert waits == [60.0]
 
 
+
+
+def test_close_position_sends_the_idempotency_key():
+    """x-request-id sulla chiusura: un ciclo ritentato non chiude due volte."""
+    client, session, _ = make_client(
+        [FakeResponse(payload={"orderForClose": {"orderID": 5, "statusID": 1}})]
+    )
+    client.close_position(position_id=42, instrument_id=7, request_id="close-key-1")
+    assert session.calls[0]["headers"]["x-request-id"] == "close-key-1"

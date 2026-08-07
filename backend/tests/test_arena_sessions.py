@@ -89,7 +89,7 @@ class FakeLiveClient:
     def get_trade_history(self, min_date=None, page_size=100):
         return []
 
-    def close_position(self, position_id, instrument_id):
+    def close_position(self, position_id, instrument_id, request_id=None):
         self.close_calls.append((position_id, instrument_id))
 
 
