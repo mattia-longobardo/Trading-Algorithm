@@ -441,18 +441,23 @@ class EtoroClient:
                 )
             self._sleep(_ORDER_POLL_INTERVAL_S)
 
-    def close_position(self, position_id: int, instrument_id: int) -> dict:
+    def close_position(
+        self, position_id: int, instrument_id: int, request_id: str | None = None
+    ) -> dict:
         """Chiude totalmente una posizione a mercato (docs §5.2).
 
-        UnitsToDeduct null = chiusura totale. Ritorna l'orderID di chiusura,
-        da verificare (§4.3) e poi matchare in trade history per il netProfit.
+        UnitsToDeduct null = chiusura totale. `request_id` (x-request-id) è la
+        chiave di idempotenza: un ciclo ritentato dopo un crash non manda un
+        secondo ordine di chiusura sulla stessa posizione. Ritorna l'orderID di
+        chiusura, da verificare (§4.3) e poi matchare in trade history per il
+        netProfit.
         """
         body = {"InstrumentID": instrument_id, "UnitsToDeduct": None}
         data = self._request(
             "POST",
             f"/api/v1/trading/execution/{self._trading_segment}"
             f"market-close-orders/positions/{position_id}",
-            pool="execution", json_body=body,
+            pool="execution", json_body=body, request_id=request_id,
         )
         order = data.get("orderForClose") or {}
         return {

@@ -37,6 +37,40 @@ def test_status_shape(client):
     assert body["champion"] is None
     assert "market_open" in body
     assert body["next_cycle_at"]
+    assert body["scheduler_active"] is False  # DISABLE_SCHEDULER=1
+
+
+def test_status_says_scheduler_inactive_when_lock_is_taken(
+    repo, pg_url, tmp_path, monkeypatch, caplog
+):
+    """Seconda istanza: API su, scheduler no — e /status lo dice."""
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    from etoro_bot.db.repo import try_scheduler_lock
+
+    held = try_scheduler_lock(pg_url)  # "prima istanza"
+    assert held is not None
+    try:
+        monkeypatch.setenv("DATABASE_URL", pg_url)
+        monkeypatch.setenv("KILL_SWITCH_DIR", str(tmp_path))
+        monkeypatch.setenv("STATE_DIR", str(tmp_path))
+        monkeypatch.setenv("KNOWLEDGE_BASE_DIR", str(tmp_path / "knowledge_base"))
+        monkeypatch.delenv("DISABLE_SCHEDULER", raising=False)
+        monkeypatch.delenv("ETORO_BOT_KILL", raising=False)
+
+        from etoro_bot.api import server
+
+        importlib.reload(server)
+        server.get_repo.cache_clear()
+        with caplog.at_level("CRITICAL"), TestClient(server.app) as tc:
+            body = tc.get("/status").json()
+        assert body["scheduler_active"] is False
+        assert server._scheduler_lock is None
+        assert "advisory lock non acquisito" in caplog.text
+    finally:
+        held.close()
 
 
 def test_settings_get_and_update(client):
@@ -120,7 +154,8 @@ def _seed_arena_agent(repo):
         opened_at=now - timedelta(hours=5),
     )
     repo.close_sim_position(repo.sim_positions(agent_id)[0].id, 110.0, "tp")
-    # trade short perdente: il marcatore [SHORT] è nella open_reason
+    # trade short perdente scritto alla vecchia maniera: la direzione sta solo
+    # nel marcatore [SHORT] della open_reason (parsing legacy)
     repo.open_sim_position(
         agent_id, "TSLA", 2, 1_000.0, 100.0, "[SHORT] short ko",
         opened_at=now - timedelta(hours=2),
@@ -250,3 +285,55 @@ def test_mutating_endpoints_require_the_owner(client, repo, monkeypatch):
     # il proprietario passa
     owner = {"x-trading-user-id": "proprietario"}
     assert client.post("/live/disable", headers=owner).status_code == 200
+
+
+def test_close_trade_returns_502_when_the_broker_fails(client, repo, monkeypatch):
+    """Broker giù: è un guasto a monte (502), non un errore del backend (500).
+    La posizione resta aperta a registro: nessun ordine è mai partito."""
+    from datetime import UTC, datetime
+
+    from etoro_bot.api import server
+
+    class FakeEtoro:
+        def close_position(self, position_id, instrument_id, request_id=None):
+            raise RuntimeError("eToro irraggiungibile")
+
+    repo.create_run("live-close-502", environment="live")
+    repo.register_open_position(
+        4242, "live-close-502", "AAPL", 1, 100.0, 10.0, datetime.now(UTC)
+    )
+    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+
+    resp = client.post("/trades/4242/close", json={"confirmation": "CHIUDI"})
+    assert resp.status_code == 502
+    assert repo.get_open_position(4242) is not None
+
+
+def test_close_trade_does_not_500_when_the_registry_write_fails(client, repo, monkeypatch):
+    """Posizione chiusa al broker ma scrittura a registro KO: un 500 inviterebbe
+    l'utente a ripetere l'ordine. Si risponde chiuso, con il registry in attesa
+    del reconcile."""
+    from datetime import UTC, datetime
+
+    from etoro_bot.api import server
+
+    class FakeEtoro:
+        def close_position(self, position_id, instrument_id, request_id=None):
+            return {"order_id": 7, "position_id": position_id}
+
+        def get_trade_history(self, min_date=None, page_size=100):
+            return []
+
+    repo.create_run("live-close-db", environment="live")
+    repo.register_open_position(
+        4343, "live-close-db", "AAPL", 1, 100.0, 10.0, datetime.now(UTC)
+    )
+    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+    monkeypatch.setattr(
+        server.get_repo(), "close_position",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("DB KO")),
+    )
+
+    resp = client.post("/trades/4343/close", json={"confirmation": "CHIUDI"})
+    assert resp.status_code == 200
+    assert resp.json()["registry"] == "pending_reconcile"

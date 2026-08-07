@@ -7,10 +7,12 @@ const EXECUTION_STATUS_META: Record<
   ExecutionStatus,
   { label: string; tone: "approved" | "rejected" | "neutral" | "caution" }
 > = {
+  pending: { label: "Da aprire", tone: "caution" },
   filled: { label: "Eseguito", tone: "approved" },
   failed: { label: "Fallito", tone: "rejected" },
   skipped: { label: "Skipped", tone: "neutral" },
   rejected: { label: "Respinto", tone: "caution" },
+  cancelled: { label: "Annullato", tone: "neutral" },
 };
 
 export function ExecutionStatusBadge({ status }: { status: ExecutionStatus }) {

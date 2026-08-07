@@ -135,11 +135,32 @@ def _arena_deps():
     )
 
 
+# Connessione che detiene l'advisory lock dello scheduler: il lock è di
+# sessione, quindi questo riferimento deve vivere quanto il processo.
+_scheduler_lock: Any = None
+# Uno scheduler morto è invisibile: /status prometterebbe un next_cycle_at che
+# non arriva mai. Questo flag lo dice a chi guarda.
+_scheduler_running = False
+
+
 def _start_scheduler() -> None:
+    global _scheduler_lock, _scheduler_running
+
     if os.environ.get("DISABLE_SCHEDULER") == "1":
         return
     try:
+        from etoro_bot.db.repo import try_scheduler_lock
         from etoro_bot.services.scheduler import start_scheduler
+
+        _scheduler_lock = try_scheduler_lock()
+        if _scheduler_lock is None:
+            log.critical(
+                "advisory lock non acquisito: un'altra istanza dello scheduler è già "
+                "attiva su questo database. Scheduler DISATTIVATO in questo processo "
+                "(API attiva). Il bot deve girare in un solo processo: mai "
+                "--workers > 1, mai due repliche."
+            )
+            return
 
         def _cycle_job() -> None:
             from etoro_bot.arena.engine import run_training_cycle
@@ -188,12 +209,10 @@ def _start_scheduler() -> None:
                              run_live_eod(deps, breaker=get_breaker()))
 
         def _evolve_job() -> None:
-            from etoro_bot.arena.engine import bootstrap_if_needed
             from etoro_bot.arena.evolution import maybe_evolve
 
             deps = _arena_deps()
-            bootstrap_if_needed(deps)
-            outcome = maybe_evolve(deps)
+            outcome = maybe_evolve(deps)  # bootstrap incluso, sotto cycle_lock
             if outcome:
                 log.info("arena: evoluzione %s", outcome)
 
@@ -215,6 +234,7 @@ def _start_scheduler() -> None:
             evolve_job=_evolve_job,
             news_job=_news_job,
         )
+        _scheduler_running = True
     except Exception:
         log.exception("scheduler non avviato")
 
@@ -298,6 +318,9 @@ def status() -> dict[str, Any]:
         "market_open": market_is_open(settings, datetime.now(timezone.utc)),
         "open_sessions": open_sessions(settings, datetime.now(timezone.utc)),
         "next_cycle_at": next_cycle_at(settings),
+        # False = in questo processo nessuno eseguirà quel next_cycle_at (lock
+        # non acquisito, avvio fallito o scheduler disabilitato).
+        "scheduler_active": _scheduler_running,
         "equity_usd": equity_usd,
         "equity_change_day_pct": equity_change_day_pct,
     }
@@ -337,21 +360,11 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     positions = repo.open_positions()
 
     rates: dict[int, float] = {}
-    directions: dict[int, str] = {}
     try:
         client = _make_client(identity)
         account_portfolio = client.get_portfolio()
         if account_portfolio.get("credit") is None:
             raise ValueError("portfolio eToro senza campo credit")
-        for row in account_portfolio.get("positions") or []:
-            if not isinstance(row, dict):
-                continue
-            try:
-                pid = int(row.get("positionId"))
-            except (TypeError, ValueError):
-                continue
-            is_buy = row.get("isBuy")
-            directions[pid] = "long" if is_buy is None or is_buy else "short"
         cash_usd = max(float(account_portfolio["credit"]), 0.0)
         raw = client.get_rates([p.instrument_id for p in positions]) if positions else {}
         for iid, r in raw.items():
@@ -369,7 +382,8 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     out = []
     for p in positions:
         cur = rates.get(p.instrument_id)
-        direction = directions.get(p.etoro_position_id, "long")
+        # direzione dal registry, non riderivata dal portafoglio del broker
+        direction = p.direction or "long"
         pnl = None
         pnl_pct = None
         if cur is not None and p.entry_price > 0:
@@ -726,6 +740,13 @@ async def knowledge_ingest(
 # --- trade operativi e storico --------------------------------------------
 
 
+def _position_side(position, closing: bool = False) -> str:
+    """Lato dell'ordine di una posizione del registry: aprire un long è un buy
+    e chiuderlo un sell; sullo short i due lati si invertono."""
+    short = (position.direction or "long") == "short"
+    return "buy" if short == closing else "sell"
+
+
 @app.get("/trades")
 def trades(
     statuses: str | None = None,
@@ -741,7 +762,7 @@ def trades(
                 "position_id": position.etoro_position_id,
                 "execution_id": None,
                 "symbol": position.symbol,
-                "side": "buy",
+                "side": _position_side(position),
                 "status": "open",
                 "amount_usd": position.amount_usd,
                 "entry_price": position.entry_price,
@@ -803,8 +824,16 @@ def close_trade(
     position = repo.get_open_position(position_id)
     if position is None:
         raise HTTPException(404, "Posizione aperta non trovata")
+    from etoro_bot.arena.live import record_close
+
     client = _make_client(identity)
-    client.close_position(position_id, position.instrument_id)
+    try:
+        client.close_position(position_id, position.instrument_id)
+    except Exception as exc:
+        # broker irraggiungibile o ordine rifiutato: è un guasto a monte, non
+        # un errore del backend (stesso trattamento di /portfolio).
+        log.warning("chiusura eToro della posizione %s fallita", position_id, exc_info=True)
+        raise HTTPException(502, f"Chiusura eToro non riuscita: {exc}") from exc
     close_price = None
     pnl = None
     try:
@@ -818,7 +847,8 @@ def close_trade(
                 break
     except Exception:
         log.warning("chiusura %s eseguita, dettaglio PnL non ancora disponibile", position_id)
-    repo.close_position(
+    written = record_close(
+        repo,
         position_id,
         close_price=float(close_price) if close_price is not None else None,
         realized_pnl_usd=float(pnl) if pnl is not None else None,
@@ -827,7 +857,13 @@ def close_trade(
         # la liquidazione del prossimo ciclo live la completerà
         pnl_settled=pnl is not None,
     )
-    return {"status": "closed", "position_id": position_id}
+    # La posizione al broker è chiusa: un 500 qui inviterebbe l'utente a
+    # ripetere l'ordine. Il reconcile del prossimo ciclo la chiude a registro.
+    return {
+        "status": "closed",
+        "position_id": position_id,
+        "registry": "closed" if written else "pending_reconcile",
+    }
 
 
 @app.post("/executions/{execution_id}/cancel")
@@ -855,7 +891,7 @@ def trade_history(
             {
                 "id": f"position:{position.etoro_position_id}",
                 "symbol": position.symbol,
-                "side": "buy",
+                "side": _position_side(position),
                 "status": "open",
                 "amount_usd": position.amount_usd,
                 "price": position.entry_price,
@@ -870,7 +906,7 @@ def trade_history(
             {
                 "id": f"position:{position.etoro_position_id}",
                 "symbol": position.symbol,
-                "side": "sell",
+                "side": _position_side(position, closing=True),
                 "status": "closed",
                 "amount_usd": position.amount_usd,
                 "price": position.close_price,

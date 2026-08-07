@@ -71,7 +71,8 @@ class Execution(Base):
     symbol: Mapped[str] = mapped_column(String(32))
     side: Mapped[str] = mapped_column(String(8))             # buy | sell
     amount_usd: Mapped[float] = mapped_column(Float)
-    status: Mapped[str] = mapped_column(String(16))          # filled|failed|skipped|rejected
+    # pending = write-ahead: l'intento è scritto PRIMA che l'ordine parta
+    status: Mapped[str] = mapped_column(String(16))  # pending|filled|failed|skipped|rejected|cancelled
     detail: Mapped[str] = mapped_column(Text, default="")
     execution_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     etoro_position_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -91,6 +92,12 @@ class BotPosition(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id"))
     symbol: Mapped[str] = mapped_column(String(32))
     instrument_id: Mapped[int] = mapped_column(Integer)
+    # Direzione dell'ordine, scritta all'apertura e mai riderivata dal
+    # portafoglio del broker: su uno short letto per sbaglio come long lo stop
+    # loss scatterebbe in guadagno e il take profit in perdita.
+    direction: Mapped[str] = mapped_column(
+        String(8), default="long", server_default=text("'long'")
+    )
     amount_usd: Mapped[float] = mapped_column(Float)
     entry_price: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -183,6 +190,11 @@ class SimPosition(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"))
     symbol: Mapped[str] = mapped_column(String(32))
     instrument_id: Mapped[int] = mapped_column(Integer)
+    # long | short: prima stava nel prefisso [SHORT] della open_reason, testo
+    # libero scritto dall'LLM.
+    direction: Mapped[str] = mapped_column(
+        String(8), default="long", server_default=text("'long'")
+    )
     amount_usd: Mapped[float] = mapped_column(Float)
     units: Mapped[float] = mapped_column(Float)
     entry_price: Mapped[float] = mapped_column(Float)
@@ -203,6 +215,9 @@ class SimTrade(Base):
     )
     agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"))
     symbol: Mapped[str] = mapped_column(String(32))
+    direction: Mapped[str] = mapped_column(
+        String(8), default="long", server_default=text("'long'")
+    )
     amount_usd: Mapped[float] = mapped_column(Float)
     entry_price: Mapped[float] = mapped_column(Float)
     close_price: Mapped[float] = mapped_column(Float)

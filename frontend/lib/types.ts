@@ -31,7 +31,13 @@ export interface Status {
   equity_change_day_pct: number | null;
 }
 
-export type ExecutionStatus = "filled" | "failed" | "skipped" | "rejected";
+export type ExecutionStatus =
+  | "pending"
+  | "filled"
+  | "failed"
+  | "skipped"
+  | "rejected"
+  | "cancelled";
 
 export interface Execution {
   id: string;
@@ -55,6 +61,7 @@ export interface Position {
   symbol: string;
   instrument_id: number;
   amount_usd: number;
+  direction: TradeDirection;
   entry_price: number;
   current_price: number | null;
   unrealized_pnl_usd: number | null;

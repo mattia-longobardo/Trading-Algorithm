@@ -6,10 +6,10 @@ entrambi ammessi; l'orizzonte (intraday o swing su più sedute) è un gene, non
 una regola di sistema. L'unico freno di sistema è il pavimento di bancarotta:
 sotto quella soglia l'agente muore all'istante.
 
-Il libro mastro simulato (repo) conosce solo posizioni "lunghe": lo short è
-rappresentato marcando la open_reason e specchiando il prezzo in valutazione e
-chiusura (uno short entrato a E e chiuso a P vale come un long chiuso a 2E-P,
-stesso PnL units*(E-P)).
+Il libro mastro simulato (repo) conosce solo posizioni "lunghe": la direzione
+sta nella colonna `direction` di sim_positions/sim_trades e lo short si
+rappresenta specchiando il prezzo in valutazione e chiusura (uno short entrato
+a E e chiuso a P vale come un long chiuso a 2E-P, stesso PnL units*(E-P)).
 """
 
 from __future__ import annotations
@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 
 MEMORY_MAX_CHARS = 8000  # la memoria non cresce senza limite
 
-SHORT_TAG = "[SHORT]"  # marcatore di direzione dentro open_reason
+# Marcatore legacy: prima della colonna `direction` la direzione stava qui,
+# dentro il testo libero della open_reason. Si legge ancora, non si scrive più.
+SHORT_TAG = "[SHORT]"
 
 
 @dataclass
@@ -72,17 +74,17 @@ def survival_floor_pct(settings: dict[str, Any]) -> float:
 
 
 def position_direction(pos) -> str:
-    """Direzione di una posizione simulata, letta dal marcatore in open_reason."""
-    return (
-        SHORT
-        if str(getattr(pos, "open_reason", "") or "").startswith(SHORT_TAG)
-        else LONG
-    )
+    """Direzione di una posizione o di un trade simulato, dalla colonna.
 
-
-def tag_reason(direction: str, reason: str) -> str:
-    """Marca la open_reason con la direzione (il DB non ha una colonna dedicata)."""
-    return f"{SHORT_TAG} {reason}".strip() if direction == SHORT else reason
+    Il marcatore legacy nella open_reason resta letto per le righe scritte
+    prima della colonna che il backfill non avesse raggiunto: meglio un long
+    dichiarato short che uno short valutato come long.
+    """
+    if str(getattr(pos, "direction", "") or "").lower() == SHORT:
+        return SHORT
+    if str(getattr(pos, "open_reason", "") or "").startswith(SHORT_TAG):
+        return SHORT
+    return LONG
 
 
 def effective_price(pos, price: float) -> float:
@@ -242,8 +244,10 @@ def _survival_context(agent, equity: float, now: datetime, floor_pct: float) -> 
     return " ".join(lines)
 
 
-# Un solo ciclo di allenamento alla volta (scheduler + trigger manuale).
-_cycle_lock = threading.Lock()
+# Un solo ciclo di allenamento alla volta (scheduler + trigger manuale). Lo
+# condivide anche l'evoluzione mensile: liquidare e valutare i conti mentre un
+# ciclo opera sugli stessi agenti falserebbe l'equity che elegge il campione.
+cycle_lock = threading.Lock()
 
 
 def run_training_cycle(
@@ -255,12 +259,12 @@ def run_training_cycle(
     arena = deps.repo.get_setting("arena") or {}
     if arena.get("paused"):
         return {"skipped": "paused"}
-    if not _cycle_lock.acquire(blocking=False):
+    if not cycle_lock.acquire(blocking=False):
         return {"skipped": "cycle_in_progress"}
     try:
         return _run_training_cycle_locked(deps, market, now)
     finally:
-        _cycle_lock.release()
+        cycle_lock.release()
 
 
 def _run_training_cycle_locked(
@@ -343,9 +347,9 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             if price:
                 deps.repo.open_sim_position(
                     agent.id, order["symbol"], order["instrument_id"],
-                    order["amount_usd"], price,
-                    tag_reason(order["direction"], order["reason"]),
+                    order["amount_usd"], price, order["reason"],
                     opened_at=now,
+                    direction=order["direction"],
                 )
 
     agent = deps.repo.get_agent(agent.id)
