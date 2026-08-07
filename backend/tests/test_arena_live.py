@@ -145,6 +145,62 @@ def test_live_cycle_stop_loss_closes_real_position(repo):
     assert repo.open_positions() == []
 
 
+def test_live_cycle_protects_positions_without_llm(repo):
+    """Chiave del modello scaduta = nessuna decisione, MAI posizioni scoperte:
+    reconcile, liquidazione e sweep stop loss / take profit girano lo stesso."""
+    _with_champion(repo)
+    client = FakeLiveClient()
+    deps = make_deps(repo, client, llm=None)
+    run_id = f"live-{NOW:%Y%m%d}"
+    repo.create_run(run_id, environment="live")
+    repo.register_open_position(900, run_id, "AAPL", 1, 500.0, 300.0, NOW)
+
+    summary = run_live_cycle(deps, market=MARKET, now=NOW)  # AAPL a 200: -33%
+
+    assert summary["skipped"] == "no_llm"
+    assert client.close_calls == [(900, 1)]  # stop loss eseguito comunque
+    assert repo.open_positions() == []
+    assert client.open_calls == []  # senza LLM non si apre nulla
+
+
+def test_live_cycle_skips_when_the_broker_publishes_no_credit(repo):
+    """`credit` assente non è liquidità zero: il ciclo si ferma prima di
+    decidere invece di dimensionare gli ordini su un capitale inventato."""
+    _with_champion(repo)
+    client = FakeLiveClient()
+    client.get_portfolio = lambda: {"positions": []}  # nessun campo credit
+    deps = make_deps(repo, client, llm=open_llm("AAPL", 20.0))
+
+    summary = run_live_cycle(deps, market=MARKET, now=NOW)
+
+    assert summary["skipped"] == "no_cash"
+    assert summary["opened"] == 0
+    assert client.open_calls == []
+    assert repo.open_positions() == []
+
+
+def test_live_cycle_skips_when_credit_vanishes_between_reads(repo):
+    """La cassa viene riletta dopo le chiusure automatiche: se il broker smette
+    di pubblicarla il ciclo salta, non solleva a metà lasciando il run aperto."""
+    _with_champion(repo)
+    client = FakeLiveClient()
+    letture = []
+
+    def portfolio_intermittente():
+        letture.append(1)
+        if len(letture) == 1:
+            return {"positions": [], "credit": 10_000.0}
+        return {"positions": []}  # credit sparito dalla seconda lettura
+
+    client.get_portfolio = portfolio_intermittente
+    deps = make_deps(repo, client, llm=open_llm("AAPL", 20.0))
+
+    summary = run_live_cycle(deps, market=MARKET, now=NOW)
+
+    assert summary["skipped"] == "no_cash"
+    assert client.open_calls == []
+
+
 def test_live_cycle_breaker_blocks_openings(repo):
     _with_champion(repo)
     client = FakeLiveClient()

@@ -2,11 +2,14 @@
 
 L'identità arriva dagli header del proxy Next (`X-Trading-User-Id`), che a sua
 volta la ricava dalla sessione Authentik. Quegli header sono fidati solo se la
-richiesta viene davvero dal proxy: con `TRADING_INTERNAL_TOKEN` configurato,
-ogni richiesta (tranne /health) deve portare `X-Trading-Internal-Token` uguale
-al segreto, altrimenti è 401 — senza, chiunque raggiunga la rete interna
-potrebbe dichiararsi "system" e comandare denaro reale. Variabile assente =
-comportamento storico (sviluppo in locale).
+richiesta viene davvero dal proxy: ogni richiesta (tranne /health) deve portare
+`X-Trading-Internal-Token` uguale a `TRADING_INTERNAL_TOKEN`, altrimenti è 401 —
+senza, chiunque raggiunga la rete interna potrebbe comandare denaro reale.
+Il token è **obbligatorio**: se manca, il processo rifiuta l'avvio, a meno di
+`TRADING_DEV_MODE=1` (sviluppo in locale, mai in produzione).
+
+L'identità "system" è riservata alle chiamate interne dello scheduler, che non
+passano da FastAPI: via HTTP quel valore è rifiutato con 403.
 
 Le chiavi API non sono mai esposte (solo configured sì/no).
 """
@@ -32,6 +35,7 @@ from pydantic import BaseModel
 
 from etoro_bot.config import load_breaker_rules, load_settings
 from etoro_bot.db.repo import Repository, make_engine, make_session_factory
+from etoro_bot.knowledge.ingest import MAX_UPLOAD_BYTES
 from etoro_bot.safety.circuit_breaker import CircuitBreaker
 from etoro_bot.safety.circuit_breaker import get_breaker as shared_breaker
 from etoro_bot.safety.kill_switch import (
@@ -53,6 +57,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    _require_internal_token_configured()
     _start_scheduler()
     yield
 
@@ -66,6 +71,122 @@ _TOKEN_EXEMPT_PATHS = frozenset({"/health"})
 
 def internal_token() -> str:
     return os.environ.get("TRADING_INTERNAL_TOKEN", "").strip()
+
+
+def _require_internal_token_configured() -> None:
+    """Senza segreto condiviso gli header di identità sono falsificabili: il
+    backend non parte. `TRADING_DEV_MODE=1` è l'unica deroga, per il locale."""
+    if internal_token():
+        return
+    if os.environ.get("TRADING_DEV_MODE") == "1":
+        log.warning(
+            "TRADING_DEV_MODE=1: token interno disattivato. Solo sviluppo locale."
+        )
+        return
+    raise RuntimeError(
+        "TRADING_INTERNAL_TOKEN non configurato: avvio rifiutato. Genera un "
+        "segreto (openssl rand -base64 32) oppure imposta TRADING_DEV_MODE=1 "
+        "per lo sviluppo in locale."
+    )
+
+
+class _BodyTooLarge(HTTPException):
+    """413 sollevata *mentre* si legge il corpo, non dopo averlo bufferizzato.
+
+    Deve essere una `HTTPException`: quando il parsing del body fallisce
+    FastAPI riscrive qualunque altra eccezione in un 400 generico, e solo le
+    `HTTPException` vengono rilanciate intatte.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(
+            413, f"corpo della richiesta oltre il limite di {max_bytes} byte"
+        )
+
+
+class LimitRequestBody:
+    """Rifiuta i corpi oltre `max_bytes` PRIMA che vengano bufferizzati.
+
+    Un controllo dentro l'endpoint arriverebbe troppo tardi: FastAPI risolve
+    `UploadFile` (quindi legge tutto il multipart) prima di eseguire il corpo
+    della funzione, e `await file.read()` porta l'upload in RAM. Un POST da
+    1 GB basterebbe a far fuori il container da 2g, che ospita anche scheduler
+    e circuit breaker.
+
+    Qui si guarda prima il `Content-Length` dichiarato — se c'è, la richiesta
+    muore senza leggere un byte — e comunque si contano i chunk ASGI mano a
+    mano, così anche un `Transfer-Encoding: chunked` senza lunghezza dichiarata
+    viene interrotto appena supera la soglia.
+    """
+
+    def __init__(self, app, max_bytes: int = MAX_UPLOAD_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope["headers"]:
+            if name != b"content-length":
+                continue
+            try:
+                declared = int(value)
+            except ValueError:
+                break  # header malformato: decide il conteggio a chunk
+            if declared > self.max_bytes:
+                await self._reject(send)
+                return
+            break
+
+        received = 0
+        started = False
+
+        async def counted_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    log.warning(
+                        "corpo oltre %d byte: lettura interrotta", self.max_bytes
+                    )
+                    raise _BodyTooLarge(self.max_bytes)
+            return message
+
+        async def watched_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counted_receive, watched_send)
+        except _BodyTooLarge:
+            # Rete di sicurezza: se nessuno a valle ha tradotto la 413 in
+            # risposta (rotta non FastAPI), la scriviamo qui.
+            if not started:
+                await self._reject(send)
+
+    async def _reject(self, send) -> None:
+        body = json.dumps(
+            {"detail": f"corpo della richiesta oltre il limite di {self.max_bytes} byte"}
+        ).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+# Registrato prima del controllo del token: l'ultimo middleware aggiunto sta
+# più all'esterno, quindi una richiesta senza token viene respinta per prima.
+app.add_middleware(LimitRequestBody)
 
 
 @app.middleware("http")
@@ -87,29 +208,41 @@ class UserIdentity:
     name: str | None = None
 
 
+SYSTEM_USER_ID = "system"
+# Identità di chi arriva senza header: non è nessuno, quindi non è il
+# proprietario. Mai "system", che è riservato alle chiamate interne.
+ANONYMOUS_USER_ID = "anonimo"
+
+
 def current_user(
-    x_trading_user_id: str = Header("system"),
+    x_trading_user_id: str | None = Header(None),
     x_trading_user_email: str | None = Header(None),
     x_trading_user_name: str | None = Header(None),
 ) -> UserIdentity:
+    user_id = (x_trading_user_id or "").strip()
+    if user_id == SYSTEM_USER_ID:
+        raise HTTPException(403, "identità 'system' riservata alle chiamate interne")
     return UserIdentity(
-        user_id=x_trading_user_id.strip() or "system",
+        user_id=user_id or ANONYMOUS_USER_ID,
         email=x_trading_user_email,
         name=x_trading_user_name,
     )
 
 
 def require_owner(identity: UserIdentity, action: str) -> None:
-    """Solo il proprietario delle chiavi eToro (o i job di sistema) può mutare.
+    """Solo il proprietario delle chiavi eToro può mutare.
 
     Finché nessuno ha configurato le chiavi non c'è un proprietario e il
     controllo è un no-op: è il primo utente che si registra a diventarlo.
+    Se il proprietario non è *verificabile* (DB giù) si risponde 503: mai
+    lasciar passare l'azione per un guasto.
     """
     try:
         owner = get_repo().owner_user_id()
-    except Exception:
-        owner = None
-    if owner and identity.user_id not in ("system", owner):
+    except Exception as exc:
+        log.warning("proprietario non verificabile: %s negata", action, exc_info=True)
+        raise HTTPException(503, "proprietario non verificabile: riprova") from exc
+    if owner and identity.user_id != owner:
         raise HTTPException(403, f"solo il proprietario può {action}")
 
 
@@ -635,6 +768,7 @@ def update_rss_feeds(
 ) -> dict[str, Any]:
     from etoro_bot.knowledge.safe_fetch import UnsafeUrlError, assert_public_url
 
+    require_owner(identity, "cambiare i feed RSS")
     feeds: list[str] = []
     for raw in body.feeds:
         value = raw.strip()
@@ -675,6 +809,10 @@ def latest_news(identity: UserIdentity = Depends(current_user)) -> dict[str, Any
 
 @app.post("/knowledge/fetch-news", status_code=202)
 def knowledge_fetch_news(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
+    # La pipeline indicizza nella knowledge base *globale*, quella che alimenta
+    # i prompt del trader: non è uno stato personale dell'utente.
+    require_owner(identity, "aggiornare le news")
+
     def _job() -> None:
         try:
             from etoro_bot.knowledge.fetch_news import fetch_all
@@ -712,6 +850,7 @@ async def knowledge_ingest(
     from etoro_bot.knowledge.ingest import ingest_upload
     from etoro_bot.knowledge.parsers import UnsupportedFileTypeError
 
+    require_owner(identity, "caricare documenti nella knowledge base")
     filename = file.filename or ""
     if not filename.lower().endswith(_UPLOAD_SUFFIXES):
         raise HTTPException(
@@ -986,6 +1125,13 @@ def put_account_credentials(
 ) -> dict[str, Any]:
     from etoro_bot.services.user_credentials import update_user_keys
 
+    # Le credenziali sono per-utente, ma `Repository.owner_user_id()` elegge
+    # proprietario l'ultimo account che ha salvato entrambe le chiavi eToro:
+    # senza questo controllo un estraneo si autoproclama proprietario con una
+    # PUT e aggira ogni altro `require_owner` (oltre a scippare l'accesso al
+    # legittimo proprietario). Finché nessuno ha configurato le chiavi il
+    # controllo è un no-op, quindi il primo utente si registra normalmente.
+    require_owner(identity, "cambiare le credenziali")
     keys = update_user_keys(
         get_repo(),
         identity.user_id,

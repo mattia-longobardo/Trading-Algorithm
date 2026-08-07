@@ -282,9 +282,67 @@ def test_mutating_endpoints_require_the_owner(client, repo, monkeypatch):
     assert client.post(
         "/executions/00000000-0000-0000-0000-000000000000/cancel", headers=intruder
     ).status_code == 403
+    # la knowledge base è globale e alimenta i prompt del trader: un estraneo
+    # non può avvelenarla
+    assert client.put(
+        "/knowledge/rss-feeds", json={"feeds": []}, headers=intruder
+    ).status_code == 403
+    assert client.post("/knowledge/fetch-news", headers=intruder).status_code == 403
+    assert client.post(
+        "/knowledge/ingest", files={"file": ("nota.txt", b"testo")}, headers=intruder
+    ).status_code == 403
+    # salvare le proprie chiavi eToro significa diventare proprietario
+    # (`owner_user_id()` prende l'ultimo che le ha salvate): è una mutazione
+    # dello stato condiviso, non un dato personale
+    assert client.put(
+        "/account/credentials", json={"etoro_api_key": "x", "etoro_user_key": "y"},
+        headers=intruder,
+    ).status_code == 403
     # il proprietario passa
     owner = {"x-trading-user-id": "proprietario"}
     assert client.post("/live/disable", headers=owner).status_code == 200
+
+
+def test_owner_check_returns_503_when_the_database_is_unreadable(client, monkeypatch):
+    """DB giù: il proprietario non è verificabile. Fail-closed (503), non
+    un via libera a chiunque sul kill switch."""
+    from etoro_bot.api import server
+
+    def boom():
+        raise RuntimeError("Postgres irraggiungibile")
+
+    monkeypatch.setattr(server.get_repo(), "owner_user_id", boom)
+
+    assert client.post("/kill-switch").status_code == 503
+    assert client.put("/settings", json={"timezone": "UTC"}).status_code == 503
+
+
+def test_system_identity_is_rejected_over_http(client):
+    """«system» è l'identità dei job interni, che non passano da FastAPI:
+    via HTTP nessuno può indossarla."""
+    system = {"x-trading-user-id": "system"}
+
+    assert client.get("/settings", headers=system).status_code == 403
+    assert client.post("/kill-switch", headers=system).status_code == 403
+    assert client.post("/live/disable", headers=system).status_code == 403
+
+
+def test_startup_aborts_without_internal_token_and_without_dev_flag(monkeypatch):
+    """Nessun token e nessun flag di sviluppo: il processo non deve partire."""
+    from fastapi.testclient import TestClient
+
+    from etoro_bot.api import server
+
+    monkeypatch.delenv("TRADING_INTERNAL_TOKEN", raising=False)
+    monkeypatch.delenv("TRADING_DEV_MODE", raising=False)
+    importlib.reload(server)
+
+    with pytest.raises(RuntimeError, match="TRADING_INTERNAL_TOKEN"), TestClient(server.app):
+        pass
+
+    # col flag esplicito di sviluppo l'avvio è consentito
+    monkeypatch.setenv("TRADING_DEV_MODE", "1")
+    server._require_internal_token_configured()
 
 
 def test_close_trade_returns_502_when_the_broker_fails(client, repo, monkeypatch):
