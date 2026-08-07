@@ -29,6 +29,7 @@ import {
   MobileItemHeader,
   MobileList,
 } from "@/components/mobile-list";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useCancelExecution, useCloseTrade, useTrades } from "@/lib/queries";
 import { useDisplay } from "@/lib/money";
 import type { TradeItem } from "@/lib/types";
@@ -79,7 +80,8 @@ function TradeAction({
 export default function TradesPage() {
   const [statuses, setStatuses] = React.useState<string[]>([]);
   const [search, setSearch] = React.useState("");
-  const trades = useTrades(statuses, search);
+  // la ricerca entra nella query key: senza pausa sarebbe una fetch per tasto
+  const trades = useTrades(statuses, useDebouncedValue(search));
   const closeTrade = useCloseTrade();
   const cancelExecution = useCancelExecution();
   const d = useDisplay();

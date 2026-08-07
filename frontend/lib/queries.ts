@@ -54,11 +54,17 @@ export function useArena() {
   });
 }
 
-export function useArenaAgent(agentId: string | null) {
+/**
+ * `poll: false` per le card della panoramica: lì il dettaglio di ogni agente
+ * accompagna una lista già in polling, e un intervallo per card moltiplicava
+ * le richieste (N+1 di rete). La pagina di dettaglio del singolo agente resta
+ * in polling.
+ */
+export function useArenaAgent(agentId: string | null, poll = true) {
   return useQuery<AgentDetail>({
     queryKey: ["arena", "agents", agentId],
     queryFn: () => api.get<AgentDetail>(`/arena/agents/${agentId}`),
-    refetchInterval: POLL_MS,
+    refetchInterval: poll ? POLL_MS : false,
     enabled: Boolean(agentId),
   });
 }

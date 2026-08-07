@@ -45,7 +45,7 @@ import type { ArenaAgent, EquityPoint } from "@/lib/types";
 
 function AgentCard({ agent }: { agent: ArenaAgent }) {
   const d = useDisplay();
-  const { data: detail } = useArenaAgent(agent.id);
+  const { data: detail } = useArenaAgent(agent.id, false);
   const equityPoints: EquityPoint[] = (detail?.equity ?? []).map((p) => ({
     date: p.ts,
     equity_usd: p.equity_usd,

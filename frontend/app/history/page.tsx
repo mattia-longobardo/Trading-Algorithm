@@ -17,6 +17,7 @@ import {
   MobileItemHeader,
   MobileList,
 } from "@/components/mobile-list";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useTradeHistory } from "@/lib/queries";
 import { pnlClass } from "@/lib/format";
 import { useDisplay } from "@/lib/money";
@@ -32,7 +33,8 @@ export default function HistoryPage() {
   const [range, setRange] = React.useState(() => lastDaysRange(90));
   const [statuses, setStatuses] = React.useState<string[]>([]);
   const [search, setSearch] = React.useState("");
-  const history = useTradeHistory(statuses, range, search);
+  // la ricerca entra nella query key: senza pausa sarebbe una fetch per tasto
+  const history = useTradeHistory(statuses, range, useDebouncedValue(search));
   const rows = history.data?.items ?? [];
   const d = useDisplay();
 
