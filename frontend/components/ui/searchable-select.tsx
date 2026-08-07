@@ -55,6 +55,13 @@ export function SearchableSelect({
 }) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
+  // Il pattern combobox ARIA vuole id stabili: il trigger deve poter puntare
+  // alla listbox (aria-controls) e l'input all'opzione evidenziata
+  // (aria-activedescendant), che il lettore di schermo annuncia mentre si
+  // scorre con le frecce senza che il focus lasci mai il campo di ricerca.
+  const reactId = React.useId();
+  const listboxId = `${reactId}-listbox`;
+  const optionId = (index: number) => `${reactId}-option-${index}`;
   const [highlight, setHighlight] = React.useState(0);
   const listRef = React.useRef<HTMLDivElement>(null);
 
@@ -122,6 +129,8 @@ export function SearchableSelect({
           variant="outline"
           role="combobox"
           aria-expanded={open}
+          aria-controls={open ? listboxId : undefined}
+          aria-haspopup="listbox"
           disabled={disabled}
           className={cn("w-full justify-between font-normal", className)}
         >
@@ -149,10 +158,14 @@ export function SearchableSelect({
             onChange={(event) => changeQuery(event.target.value)}
             placeholder={searchPlaceholder}
             aria-label={searchPlaceholder}
+            role="combobox"
+            aria-expanded
+            aria-controls={listboxId}
+            aria-activedescendant={filtered.length ? optionId(highlight) : undefined}
             className="h-9 rounded-none border-0 pl-8 shadow-none focus-visible:ring-0"
           />
         </div>
-        <div ref={listRef} role="listbox" className="max-h-64 overflow-y-auto p-1">
+        <div id={listboxId} ref={listRef} role="listbox" className="max-h-64 overflow-y-auto p-1">
           {filtered.length === 0 ? (
             <p className="text-muted-foreground px-3 py-6 text-center text-xs">{emptyText}</p>
           ) : (
@@ -161,6 +174,7 @@ export function SearchableSelect({
               return (
                 <button
                   key={option.value}
+                  id={optionId(index)}
                   type="button"
                   role="option"
                   aria-selected={active}
