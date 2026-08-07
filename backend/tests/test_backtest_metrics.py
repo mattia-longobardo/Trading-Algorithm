@@ -35,11 +35,11 @@ class FakeRepo:
         self._audit = list(audit)
         self._settings = settings or {}
 
-    def equity_series(self):
-        return list(self._snaps)
+    def equity_series(self, limit=None):
+        return list(self._snaps)[-limit:] if limit else list(self._snaps)
 
-    def closed_positions(self):
-        return list(self._closed)
+    def closed_positions(self, limit=1000):
+        return list(self._closed)[-limit:] if limit else list(self._closed)
 
     def open_positions(self):
         return list(self._open)

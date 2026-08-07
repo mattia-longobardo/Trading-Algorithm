@@ -33,6 +33,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Upload
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from etoro_bot.api import schemas
 from etoro_bot.config import load_breaker_rules, load_settings
 from etoro_bot.db.repo import Repository, make_engine, make_session_factory
 from etoro_bot.knowledge.ingest import MAX_UPLOAD_BYTES
@@ -253,19 +254,11 @@ def _user_keys(identity: UserIdentity):
 
 
 def _arena_deps():
-    """ArenaDeps di sistema: chiavi del proprietario, settings completi."""
-    from etoro_bot.arena.engine import ArenaDeps
+    """ArenaDeps di sistema (la logica vive in services/deps.py: la usa anche
+    la CLI, che non deve dipendere dal layer API)."""
+    from etoro_bot.services.deps import build_arena_deps
 
-    settings = _full_settings()
-    llm_cfg = settings.get("llm") or {}
-    return ArenaDeps(
-        repo=get_repo(),
-        client=_system_etoro_client(),
-        settings=settings,
-        llm=_system_llm(),
-        model=str(llm_cfg.get("model", "gpt-5.6-terra")),
-        max_tokens=int(llm_cfg.get("max_tokens", 2048)),
-    )
+    return build_arena_deps(get_repo(), _full_settings())
 
 
 # Connessione che detiene l'advisory lock dello scheduler: il lock è di
@@ -339,7 +332,7 @@ def _start_scheduler() -> None:
                 log.info("arena: EOD training %s", run_eod(deps, market=market))
                 if live_on:
                     log.info("arena: EOD live %s",
-                             run_live_eod(deps, breaker=get_breaker()))
+                             run_live_eod(deps, breaker=get_breaker(), market=market))
 
         def _evolve_job() -> None:
             from etoro_bot.arena.evolution import maybe_evolve
@@ -389,13 +382,10 @@ def get_settings_service():
 
 
 def _full_settings() -> dict[str, Any]:
-    """Settings completi: default yaml + override runtime (DB > yaml).
+    """Settings completi: default yaml + override runtime (DB > yaml)."""
+    from etoro_bot.services.deps import effective_settings
 
-    get_effective() restituisce SOLO le chiavi runtime gestite dal DB
-    (valuta, timezone, stato arena): per watchlist, news_feeds,
-    universe_discovery, knowledge e llm serve la base yaml.
-    """
-    return {**load_settings(), **get_settings_service().get_effective()}
+    return effective_settings(get_repo())
 
 
 # --- health & status --------------------------------------------------------
@@ -423,7 +413,7 @@ def status() -> dict[str, Any]:
     equity_change_day_pct = None
     champion = None
     try:
-        series = repo.equity_series()
+        series = repo.equity_series(limit=2)  # serve solo la variazione del giorno
         if series:
             equity_usd = series[-1].equity_usd
             if len(series) >= 2 and series[-2].equity_usd:
@@ -462,7 +452,7 @@ def status() -> dict[str, Any]:
 # --- executions -------------------------------------------------------------
 
 
-@app.get("/executions")
+@app.get("/executions", response_model=schemas.ExecutionsResponse)
 def list_executions(limit: int = Query(50, le=500)) -> dict[str, Any]:
     rows = get_repo().list_executions(limit=limit)
     return {
@@ -487,7 +477,7 @@ def list_executions(limit: int = Query(50, le=500)) -> dict[str, Any]:
 # --- portfolio (solo posizioni bot, §7) -------------------------------------
 
 
-@app.get("/portfolio")
+@app.get("/portfolio", response_model=schemas.PortfolioResponse)
 def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     repo = get_repo()
     positions = repo.open_positions()
@@ -510,7 +500,15 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
         log.warning("portafoglio eToro non disponibile", exc_info=True)
         raise HTTPException(502, f"Capitale eToro non disponibile: {exc}") from exc
 
-    invested = sum(p.amount_usd for p in positions)
+    # stessa definizione di equity del ciclo live e del circuit breaker: a costo
+    # storico /portfolio, sizing e drawdown raccontavano tre numeri diversi.
+    from etoro_bot.arena.live import live_equity, live_position_value
+
+    prices = {
+        p.symbol: rates[p.instrument_id] for p in positions if p.instrument_id in rates
+    }
+    invested = sum(live_position_value(p, prices.get(p.symbol)) for p in positions)
+    equity_usd = live_equity(positions, prices, cash_usd)
 
     out = []
     for p in positions:
@@ -549,9 +547,9 @@ def portfolio(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     return {
         "positions": out,
         "cash_usd": cash_usd,
-        "equity_usd": cash_usd + invested,
+        "equity_usd": equity_usd,
         "exposure_usd": invested,
-        "max_trade_amount_usd": (cash_usd + invested) * dna["max_position_pct"] / 100.0,
+        "max_trade_amount_usd": equity_usd * dna["max_position_pct"] / 100.0,
         "capital_source": "etoro",
         "anomalies": [],
     }
@@ -598,7 +596,7 @@ def _pct(value: float | None) -> float | None:
     return None if value is None else value * 100.0
 
 
-@app.get("/backtest/summary")
+@app.get("/backtest/summary", response_model=schemas.BacktestSummaryResponse)
 def backtest_summary(
     date_from: date | None = None,
     date_to: date | None = None,
@@ -641,7 +639,7 @@ SPY_DIVIDEND_NOTE = (
 )
 
 
-@app.get("/backtest/equity-curve")
+@app.get("/backtest/equity-curve", response_model=schemas.EquityCurveResponse)
 def backtest_equity_curve(
     benchmark: str = "spy",
     date_from: date | None = None,
@@ -656,12 +654,12 @@ def backtest_equity_curve(
     }
 
 
-@app.get("/backtest/trades")
+@app.get("/backtest/trades", response_model=schemas.BacktestTradesResponse)
 def backtest_trades(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     return {"trades": _backtest_service(identity).trades()}
 
 
-@app.get("/backtest/monthly-returns")
+@app.get("/backtest/monthly-returns", response_model=schemas.MonthlyReturnsResponse)
 def backtest_monthly_returns(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     return {"rows": _backtest_service(identity).monthly_returns()}
 
@@ -676,43 +674,17 @@ def _kb():
 
 
 def _system_etoro_client():
-    """Client eToro con le chiavi dell'account proprietario, per i job di
-    sistema (discovery universo). None se le chiavi non sono configurate:
-    la pipeline news degrada senza refresh dell'universo."""
-    try:
-        from etoro_bot.etoro.client import EtoroClient
-        from etoro_bot.services.user_credentials import get_user_keys
+    """Client eToro con le chiavi del proprietario, per i job di sistema."""
+    from etoro_bot.services.deps import system_etoro_client
 
-        repo = get_repo()
-        user_id = repo.owner_user_id() or "system"
-        keys = get_user_keys(repo, user_id)
-        if not keys.etoro_api_key or not keys.etoro_user_key:
-            return None
-        return EtoroClient(api_key=keys.etoro_api_key, user_key=keys.etoro_user_key)
-    except Exception:
-        log.warning("client eToro di sistema non disponibile", exc_info=True)
-        return None
+    return system_etoro_client(get_repo())
 
 
 def _system_llm():
-    """call_llm con la chiave OpenAI del proprietario, per i job di sistema
-    (scout universo, sintesi memorie ticker). None se non configurata: i
-    consumatori degradano da soli (fallback regex/headline)."""
-    try:
-        from functools import partial
+    """LLM con la chiave del proprietario, per i job di sistema."""
+    from etoro_bot.services.deps import system_llm
 
-        from etoro_bot.services.user_credentials import get_user_keys
-
-        repo = get_repo()
-        keys = get_user_keys(repo, repo.owner_user_id() or "system")
-        if not keys.openai_api_key:
-            return None
-        from etoro_bot.llm import call_llm, make_openai_client
-
-        return partial(call_llm, client=make_openai_client(keys.openai_api_key))
-    except Exception:
-        log.warning("LLM di sistema non disponibile", exc_info=True)
-        return None
+    return system_llm(get_repo())
 
 
 def _user_setting_key(prefix: str, user_id: str) -> str:
@@ -886,7 +858,7 @@ def _position_side(position, closing: bool = False) -> str:
     return "buy" if short == closing else "sell"
 
 
-@app.get("/trades")
+@app.get("/trades", response_model=schemas.TradesResponse)
 def trades(
     statuses: str | None = None,
     symbol: str | None = None,
@@ -1015,7 +987,7 @@ def cancel_execution(
     return {"status": "cancelled", "execution_id": str(execution_id)}
 
 
-@app.get("/trade-history")
+@app.get("/trade-history", response_model=schemas.TradeHistoryResponse)
 def trade_history(
     statuses: str | None = None,
     date_from: date | None = None,
@@ -1222,12 +1194,23 @@ def settings_audit() -> dict[str, Any]:
 ARENA_TRADES_SHOWN = 200
 
 
-def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[str, Any]:
-    from etoro_bot.arena.engine import position_direction
+def _agent_payload(
+    repo: Repository, agent, with_memory: bool = True,
+    equity_usd: float | None = None, positions=None,
+) -> dict[str, Any]:
+    """`equity_usd` è l'ultimo punto della serie sim (mark-to-market, scritto dal
+    ciclo di training): senza prezzi correnti in questa route è l'unica
+    definizione coerente con `agent_equity`. Senza serie si ripiega sul costo.
 
-    positions = repo.sim_positions(agent.id)
+    `positions` già lette dal chiamante evitano una query per agente (la pagina
+    arena ne mostra tre liste: agenti vivi, campione, lineage)."""
+    from etoro_bot.arena.dna import position_direction
+
+    positions = repo.sim_positions(agent.id) if positions is None else positions
     invested = sum(p.amount_usd for p in positions)
-    pnl_month = agent.cash_usd + invested - agent.starting_capital_usd
+    if equity_usd is None:
+        equity_usd = agent.cash_usd + invested
+    pnl_month = equity_usd - agent.starting_capital_usd
     payload = {
         "id": str(agent.id),
         "name": agent.name,
@@ -1243,7 +1226,7 @@ def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[st
         "starting_capital_usd": agent.starting_capital_usd,
         "cash_usd": agent.cash_usd,
         "invested_usd": round(invested, 2),
-        "equity_usd": round(agent.cash_usd + invested, 2),
+        "equity_usd": round(equity_usd, 2),
         "pnl_month_usd": round(pnl_month, 2),
         "open_positions": [
             {
@@ -1263,7 +1246,8 @@ def _agent_payload(repo: Repository, agent, with_memory: bool = True) -> dict[st
     return payload
 
 
-@app.get("/arena")
+@app.get("/arena", response_model=schemas.ArenaOverviewResponse,
+         response_model_exclude_unset=True)
 def arena_overview() -> dict[str, Any]:
     from etoro_bot.services.app_settings import arena_state
     from etoro_bot.services.scheduler import (
@@ -1278,6 +1262,9 @@ def arena_overview() -> dict[str, Any]:
     agents = repo.all_agents()
     alive = [a for a in agents if a.status == "alive"]
     champ = repo.champion()
+    # due query aggregate al posto di due per agente: la pagina è in polling
+    equities = repo.last_sim_equity([a.id for a in agents])
+    by_agent = repo.sim_positions_by_agent([a.id for a in agents])
     now = datetime.now(timezone.utc)
     from calendar import monthrange
 
@@ -1294,13 +1281,26 @@ def arena_overview() -> dict[str, Any]:
         "next_cycle_at": next_cycle_at(settings),
         "days_to_evaluation": days_left,
         "generation": max((a.generation for a in alive), default=0),
-        "agents": [_agent_payload(repo, a) for a in alive],
-        "champion": _agent_payload(repo, champ) if champ else None,
-        "lineage": [_agent_payload(repo, a, with_memory=False) for a in agents],
+        "agents": [
+            _agent_payload(repo, a, equity_usd=equities.get(a.id),
+                           positions=by_agent.get(a.id, []))
+            for a in alive
+        ],
+        "champion": (
+            _agent_payload(repo, champ, equity_usd=equities.get(champ.id),
+                           positions=by_agent.get(champ.id, []))
+            if champ else None
+        ),
+        "lineage": [
+            _agent_payload(repo, a, with_memory=False, equity_usd=equities.get(a.id),
+                           positions=by_agent.get(a.id, []))
+            for a in agents
+        ],
     }
 
 
-@app.get("/arena/agents/{agent_id}")
+@app.get("/arena/agents/{agent_id}", response_model=schemas.ArenaAgentDetailResponse,
+         response_model_exclude_unset=True)
 def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
     from etoro_bot.arena.metrics import compute_agent_metrics, trade_direction
 
@@ -1308,10 +1308,12 @@ def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
     agent = repo.get_agent(agent_id)
     if agent is None:
         raise HTTPException(404, "agente non trovato")
-    payload = _agent_payload(repo, agent)
     all_trades = repo.sim_trades(agent_id, limit=None)  # metriche su tutto lo storico
     trades = all_trades[:ARENA_TRADES_SHOWN]
     equity_points = repo.sim_equity_series(agent_id)
+    payload = _agent_payload(
+        repo, agent, equity_usd=equity_points[-1].equity_usd if equity_points else None
+    )
     return {
         "agent": payload,
         "equity": [
@@ -1352,7 +1354,7 @@ def arena_agent_detail(agent_id: uuid.UUID) -> dict[str, Any]:
     }
 
 
-@app.get("/arena/events")
+@app.get("/arena/events", response_model=schemas.ArenaEventsResponse)
 def arena_events(limit: int = Query(100, le=500)) -> dict[str, Any]:
     rows = get_repo().arena_events(limit=limit)
     return {

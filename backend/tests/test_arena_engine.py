@@ -126,7 +126,8 @@ def test_training_cycle_applies_llm_actions(repo):
 def test_short_direction_is_persisted_not_written_into_the_reason(repo):
     """La direzione simulata sta in colonna e sopravvive alla chiusura; la
     open_reason torna a essere solo il testo dell'agente."""
-    from etoro_bot.arena.engine import effective_price, position_direction
+    from etoro_bot.arena.dna import position_direction
+    from etoro_bot.arena.engine import effective_price
 
     def llm(system_blocks, user_prompt, model, max_tokens):
         return json.dumps([{"action": "open", "symbol": "AAPL",

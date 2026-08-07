@@ -179,26 +179,54 @@ def test_live_cycle_skips_when_the_broker_publishes_no_credit(repo):
     assert repo.open_positions() == []
 
 
-def test_live_cycle_skips_when_credit_vanishes_between_reads(repo):
-    """La cassa viene riletta dopo le chiusure automatiche: se il broker smette
-    di pubblicarla il ciclo salta, non solleva a metà lasciando il run aperto."""
+def test_duplicate_closes_hit_the_broker_once(repo):
+    """Due `close` sullo stesso simbolo (output plausibile del modello): un solo
+    ordine al broker e una sola perdita nel drawdown del circuit breaker."""
+    _with_champion(repo)
+    client = FakeLiveClient()
+    breaker = CircuitBreaker(CircuitBreakerRules(), state_dir=None)
+
+    def doppio_close(system_blocks, user_prompt, model, max_tokens):
+        return json.dumps([
+            {"action": "close", "symbol": "AAPL", "reason": "prima"},
+            {"action": "close", "symbol": "AAPL", "direction": "long",
+             "reason": "e ancora"},
+        ])
+
+    deps = make_deps(repo, client, llm=doppio_close)
+    run_id = f"live-{NOW:%Y%m%d}"
+    repo.create_run(run_id, environment="live")
+    # AAPL a 204 quotata 200: -1.96%, dentro stop loss (6%) e take profit (12%),
+    # quindi a chiudere è il modello e non lo sweep automatico
+    repo.register_open_position(900, run_id, "AAPL", 1, 500.0, 204.0, NOW)
+
+    run_live_cycle(deps, breaker=breaker, market=MARKET, now=NOW)
+
+    assert client.close_calls == [(900, 1)]
+    assert breaker.state.daily_pnl_usd == pytest.approx(-9.80, abs=0.01)
+
+
+def test_live_cycle_reads_the_portfolio_once(repo):
+    """Una sola lettura del portafoglio per ciclo: reconcile, direzioni, cassa e
+    liquidazione lavorano sulla stessa fotografia (e non sprecano rate limit)."""
     _with_champion(repo)
     client = FakeLiveClient()
     letture = []
+    vera = client.get_portfolio
 
-    def portfolio_intermittente():
+    def portfolio_contato():
         letture.append(1)
-        if len(letture) == 1:
-            return {"positions": [], "credit": 10_000.0}
-        return {"positions": []}  # credit sparito dalla seconda lettura
+        return vera()
 
-    client.get_portfolio = portfolio_intermittente
+    client.get_portfolio = portfolio_contato
     deps = make_deps(repo, client, llm=open_llm("AAPL", 20.0))
+    run_id = f"live-{NOW:%Y%m%d}"
+    repo.create_run(run_id, environment="live")
+    repo.register_open_position(900, run_id, "MSFT", 2, 500.0, 400.0, NOW)
 
-    summary = run_live_cycle(deps, market=MARKET, now=NOW)
+    run_live_cycle(deps, market=MARKET, now=NOW)
 
-    assert summary["skipped"] == "no_cash"
-    assert client.open_calls == []
+    assert len(letture) == 1
 
 
 def test_live_cycle_breaker_blocks_openings(repo):
@@ -725,6 +753,48 @@ def test_close_records_estimate_then_settles_real_pnl_into_the_breaker(repo):
     # già liquidata: una seconda passata non la conta di nuovo
     assert settle_pending_closes(deps, breaker=breaker, now=NOW)["settled"] == 0
     assert breaker.state.daily_pnl_usd == pytest.approx(-180.0, abs=0.01)
+
+
+def test_settle_does_not_touch_the_breaker_without_equity(repo, caplog):
+    """Equity non calcolabile: la rettifica del PnL NON entra nel breaker con un
+    denominatore inventato (con 0 il controllo sul drawdown sparirebbe muto)."""
+    from etoro_bot.arena.live import settle_pending_closes
+
+    _with_champion(repo)
+    client = FakeLiveClient()
+    deps = make_deps(repo, client, llm=lambda **kw: "[]")
+    breaker = CircuitBreaker(CircuitBreakerRules(), state_dir=None)
+    run_id = f"live-{NOW:%Y%m%d}"
+    repo.create_run(run_id, environment="live")
+    repo.register_open_position(900, run_id, "AAPL", 1, 500.0, 300.0, NOW)
+    run_live_cycle(deps, breaker=breaker, market=MARKET, now=NOW)
+    stima = breaker.state.daily_pnl_usd
+
+    client.history = [{"positionId": "900", "netProfit": -180.0, "closeRate": 198.0}]
+    client.get_portfolio = lambda: {"positions": []}  # niente credit: equity ignota
+    with caplog.at_level("WARNING"):
+        assert settle_pending_closes(deps, breaker=breaker, now=NOW)["settled"] == 1
+
+    assert repo.closed_positions()[0].realized_pnl_usd == -180.0  # liquidata lo stesso
+    assert breaker.state.daily_pnl_usd == pytest.approx(stima, abs=0.01)  # non toccato
+    assert "circuit breaker" in caplog.text
+
+
+def test_live_equity_is_marked_to_market(repo):
+    """L'equity che alimenta breaker e sizing segue il prezzo, non il costo."""
+    from etoro_bot.arena.live import live_equity
+
+    run_id = f"live-{NOW:%Y%m%d}"
+    repo.create_run(run_id, environment="live")
+    repo.register_open_position(900, run_id, "AAPL", 1, 500.0, 100.0, NOW,
+                                direction="long")
+    positions = repo.open_positions()
+
+    assert live_equity(positions, {"AAPL": 100.0}, 1_000.0) == pytest.approx(1_500.0)
+    # prezzo raddoppiato: la posizione vale il doppio del costo
+    assert live_equity(positions, {"AAPL": 200.0}, 1_000.0) == pytest.approx(2_000.0)
+    # senza prezzo resta il costo storico, non zero
+    assert live_equity(positions, {}, 1_000.0) == pytest.approx(1_500.0)
 
 
 def test_survival_breaker_trips_on_estimated_drawdown(repo):

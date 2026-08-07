@@ -26,18 +26,15 @@ from etoro_bot.arena.dna import (
     DEFAULT_SURVIVAL_FLOOR_PCT,
     clamp_dna,
     mutate,
+    position_direction,
     survival_creed,
 )
-from etoro_bot.arena.trader import LONG, SHORT, build_prompt, decide, enforce
+from etoro_bot.arena.trader import SHORT, build_prompt, decide, enforce
 from etoro_bot.db.repo import Repository
 
 logger = logging.getLogger(__name__)
 
 MEMORY_MAX_CHARS = 8000  # la memoria non cresce senza limite
-
-# Marcatore legacy: prima della colonna `direction` la direzione stava qui,
-# dentro il testo libero della open_reason. Si legge ancora, non si scrive più.
-SHORT_TAG = "[SHORT]"
 
 
 @dataclass
@@ -71,20 +68,9 @@ def survival_floor_pct(settings: dict[str, Any]) -> float:
 
 
 # ------------------------------------------------------------------ direzione
-
-
-def position_direction(pos) -> str:
-    """Direzione di una posizione o di un trade simulato, dalla colonna.
-
-    Il marcatore legacy nella open_reason resta letto per le righe scritte
-    prima della colonna che il backfill non avesse raggiunto: meglio un long
-    dichiarato short che uno short valutato come long.
-    """
-    if str(getattr(pos, "direction", "") or "").lower() == SHORT:
-        return SHORT
-    if str(getattr(pos, "open_reason", "") or "").startswith(SHORT_TAG):
-        return SHORT
-    return LONG
+# `position_direction` e `SHORT_TAG` vivono in arena/dna.py (modulo senza
+# dipendenze di dominio) e sono importati qui sopra: così le metriche possono
+# usarli senza tirarsi dietro il motore.
 
 
 def effective_price(pos, price: float) -> float:

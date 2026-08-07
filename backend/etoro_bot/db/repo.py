@@ -26,7 +26,7 @@ from etoro_bot.db.models import (
     SimTrade,
     UserCredential,
 )
-from etoro_bot.domain import DecisionStage, ExecutionResult, ExecutionStatus
+from etoro_bot.domain import ExecutionResult, ExecutionStatus
 
 
 def make_engine(url: str | None = None) -> Engine:
@@ -113,11 +113,10 @@ class Repository:
 
     # --- decisions / executions -------------------------------------------
     def add_decision(
-        self, run_id: str, symbol: str, stage: DecisionStage | str, payload: dict[str, Any]
+        self, run_id: str, symbol: str, stage: str, payload: dict[str, Any]
     ) -> None:
-        stage_value = stage.value if isinstance(stage, DecisionStage) else stage
         with self._sf.begin() as s:
-            s.add(Decision(run_id=run_id, symbol=symbol, stage=stage_value, payload=payload))
+            s.add(Decision(run_id=run_id, symbol=symbol, stage=stage, payload=payload))
 
     def get_run_decisions(self, run_id: str) -> list[Decision]:
         with self._sf() as s:
@@ -204,21 +203,6 @@ class Repository:
             # poter ancora adottare la posizione.
             row.detail = f"annullato manualmente {row.detail or ''}".strip()
             return True
-
-    def count_filled_today(self) -> int:
-        today = datetime.now(timezone.utc).date()
-        with self._sf() as s:
-            return int(
-                s.scalar(
-                    select(func.count())
-                    .select_from(Execution)
-                    .where(
-                        Execution.status == ExecutionStatus.FILLED.value,
-                        func.date(Execution.created_at) == today,
-                    )
-                )
-                or 0
-            )
 
     # --- bot positions registry (§7) ---------------------------------------
     def register_open_position(
@@ -320,15 +304,21 @@ class Repository:
                 )
             )
 
-    def closed_positions(self) -> list[BotPosition]:
+    def closed_positions(self, limit: int | None = 1000) -> list[BotPosition]:
+        """Posizioni chiuse in ordine cronologico; `limit` tiene le PIÙ RECENTI.
+
+        Le route in polling non hanno bisogno dello storico intero a ogni giro;
+        il track record (`services/backtest.py`) sì, e passa `limit=None`.
+        """
         with self._sf() as s:
-            return list(
-                s.scalars(
-                    select(BotPosition)
-                    .where(BotPosition.closed_at.is_not(None))
-                    .order_by(BotPosition.closed_at)
-                )
+            stmt = (
+                select(BotPosition)
+                .where(BotPosition.closed_at.is_not(None))
+                .order_by(BotPosition.closed_at.desc())
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return list(reversed(list(s.scalars(stmt))))
 
     # --- equity -------------------------------------------------------------
     def record_equity_snapshot(
@@ -341,9 +331,25 @@ class Repository:
                 )
             )
 
-    def equity_series(self) -> list[EquitySnapshot]:
+    def equity_series(self, limit: int | None = None) -> list[EquitySnapshot]:
+        """Snapshot equity in ordine di data; `limit` tiene i PIÙ RECENTI.
+
+        Uno snapshot al giorno: la serie intera resta piccola e il track record
+        la vuole tutta. `limit` serve a chi guarda solo la coda (`/status`).
+        """
         with self._sf() as s:
-            return list(s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.date)))
+            if limit is None:
+                return list(
+                    s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.date))
+                )
+            rows = list(
+                s.scalars(
+                    select(EquitySnapshot)
+                    .order_by(EquitySnapshot.date.desc())
+                    .limit(limit)
+                )
+            )
+            return list(reversed(rows))
 
     # --- app settings (§10) -------------------------------------------------
     def get_setting(self, key: str) -> Any | None:
@@ -542,6 +548,27 @@ class Repository:
                 )
             )
 
+    def sim_positions_by_agent(
+        self, agent_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, list[SimPosition]]:
+        """Posizioni aperte di più agenti in una query sola.
+
+        La pagina arena serve agenti + campione + lineage: una query per agente
+        era un N+1 servito in polling.
+        """
+        if not agent_ids:
+            return {}
+        out: dict[uuid.UUID, list[SimPosition]] = {}
+        with self._sf() as s:
+            rows = s.scalars(
+                select(SimPosition)
+                .where(SimPosition.agent_id.in_(agent_ids))
+                .order_by(SimPosition.opened_at)
+            )
+            for row in rows:
+                out.setdefault(row.agent_id, []).append(row)
+        return out
+
     def sim_trades(
         self, agent_id: uuid.UUID, limit: int | None = 200
     ) -> list[SimTrade]:
@@ -563,15 +590,52 @@ class Repository:
         with self._sf.begin() as s:
             s.add(SimEquityPoint(agent_id=agent_id, ts=ts, equity_usd=equity_usd))
 
-    def sim_equity_series(self, agent_id: uuid.UUID) -> list[SimEquityPoint]:
+    def sim_equity_series(
+        self, agent_id: uuid.UUID, limit: int | None = 3000
+    ) -> list[SimEquityPoint]:
+        """Serie equity simulata in ordine di tempo; `limit` tiene i PIÙ RECENTI.
+
+        Un punto per ciclo: circa 26 al giorno di mercato, cioè ~570 al mese.
+        3000 coprono l'intera vita di un agente (un mese) con margine, e
+        mettono un tetto alla route servita in polling a 15s.
+        """
         with self._sf() as s:
-            return list(
-                s.scalars(
-                    select(SimEquityPoint)
-                    .where(SimEquityPoint.agent_id == agent_id)
-                    .order_by(SimEquityPoint.ts)
-                )
+            stmt = (
+                select(SimEquityPoint)
+                .where(SimEquityPoint.agent_id == agent_id)
+                .order_by(SimEquityPoint.ts.desc())
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return list(reversed(list(s.scalars(stmt))))
+
+    def last_sim_equity(self, agent_ids: list[uuid.UUID]) -> dict[uuid.UUID, float]:
+        """Ultimo punto equity per agente, in una query sola.
+
+        Serve alle route arena, che mostrano l'equity di N agenti: il valore è
+        già mark-to-market (lo scrive il ciclo di training), mentre ricalcolarlo
+        lì richiederebbe i prezzi correnti di tutti i simboli.
+        """
+        if not agent_ids:
+            return {}
+        with self._sf() as s:
+            latest = (
+                select(
+                    SimEquityPoint.agent_id.label("agent_id"),
+                    func.max(SimEquityPoint.ts).label("ts"),
+                )
+                .where(SimEquityPoint.agent_id.in_(agent_ids))
+                .group_by(SimEquityPoint.agent_id)
+                .subquery()
+            )
+            rows = s.execute(
+                select(SimEquityPoint.agent_id, SimEquityPoint.equity_usd).join(
+                    latest,
+                    (SimEquityPoint.agent_id == latest.c.agent_id)
+                    & (SimEquityPoint.ts == latest.c.ts),
+                )
+            ).all()
+        return {row[0]: float(row[1]) for row in rows}
 
     def add_arena_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
         with self._sf.begin() as s:

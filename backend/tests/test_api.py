@@ -245,6 +245,103 @@ def test_portfolio_empty(client, monkeypatch):
     assert body["capital_source"] == "etoro"
 
 
+def test_portfolio_equity_is_marked_to_market(client, monkeypatch):
+    """Equity e size massima seguono il prezzo corrente: a costo storico
+    /portfolio mostrava un numero e il circuit breaker ne usava un altro."""
+    from datetime import datetime, timezone
+
+    from etoro_bot.api import server
+
+    class FakeEtoro:
+        def get_portfolio(self):
+            return {"credit": 1_000.0}
+
+        def get_rates(self, instrument_ids):
+            return {1: {"lastExecution": 200.0}}  # comprata a 100: +100%
+
+    repo = server.get_repo()
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
+    repo.create_run("live-test", environment="live")
+    repo.register_open_position(901, "live-test", "AAPL", 1, 500.0, 100.0, now)
+    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+
+    body = client.get("/portfolio").json()
+
+    assert body["exposure_usd"] == pytest.approx(1_000.0)  # 500 di costo, 1000 ora
+    assert body["equity_usd"] == pytest.approx(2_000.0)
+    assert body["max_trade_amount_usd"] == pytest.approx(2_000.0 * 0.35)
+
+
+def test_typed_routes_serve_exactly_the_declared_contract(client, repo, monkeypatch):
+    """Le route che portano denaro dichiarano un response_model: qui si verifica
+    che il payload REALE (con righe dentro) abbia esattamente quelle chiavi, non
+    una in meno. Senza dati le liste sarebbero vuote e non proverebbero nulla."""
+    from datetime import datetime, timezone
+
+    from etoro_bot.api import schemas, server
+    from etoro_bot.arena.dna import DEFAULT_DNA, clamp_dna
+    from etoro_bot.domain import ExecutionResult, ExecutionStatus, Side
+
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
+    repo.create_run("live-test", environment="live")
+    repo.register_open_position(901, "live-test", "AAPL", 1, 500.0, 100.0, now)
+    repo.register_open_position(902, "live-test", "MSFT", 2, 300.0, 400.0, now)
+    repo.close_position(902, close_price=380.0, realized_pnl_usd=-15.0,
+                        close_reason="stop loss")
+    repo.add_execution("live-test", ExecutionResult(
+        symbol="AAPL", side=Side.BUY, amount_usd=500.0,
+        status=ExecutionStatus.PENDING, detail="in attesa",
+    ))
+    agent_id = repo.create_agent("G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "memoria",
+                                 "2026-07", 10_000.0)
+    repo.record_sim_equity(agent_id, now, 10_500.0)
+    repo.open_sim_position(agent_id, "AAPL", 1, 500.0, 100.0, "apertura", now)
+    repo.open_sim_position(agent_id, "MSFT", 2, 300.0, 400.0, "seconda", now)
+    chiusa = repo.sim_positions(agent_id)[0]
+    repo.close_sim_position(chiusa.id, 120.0, "presa di profitto")
+
+    class FakeEtoro:
+        def get_portfolio(self):
+            return {"credit": 1_000.0}
+
+        def get_rates(self, instrument_ids):
+            return {1: {"lastExecution": 200.0}}
+
+    monkeypatch.setattr(server, "_make_client", lambda *_: FakeEtoro())
+
+    attese = {
+        "/portfolio": schemas.PortfolioResponse,
+        "/executions": schemas.ExecutionsResponse,
+        "/trades": schemas.TradesResponse,
+        "/trade-history": schemas.TradeHistoryResponse,
+        "/backtest/summary": schemas.BacktestSummaryResponse,
+        "/backtest/trades": schemas.BacktestTradesResponse,
+        "/backtest/monthly-returns": schemas.MonthlyReturnsResponse,
+        "/arena": schemas.ArenaOverviewResponse,
+        "/arena/events": schemas.ArenaEventsResponse,
+        f"/arena/agents/{agent_id}": schemas.ArenaAgentDetailResponse,
+    }
+    for path, model in attese.items():
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert set(response.json()) == set(model.model_fields), path
+
+    # le righe dentro le liste sono la parte che può derivare in silenzio
+    assert set(client.get("/portfolio").json()["positions"][0]) == set(
+        schemas.PortfolioPosition.model_fields
+    )
+    assert set(client.get("/trades").json()["trades"][0]) == set(
+        schemas.TradeRow.model_fields
+    )
+    assert set(client.get("/backtest/trades").json()["trades"][0]) == set(
+        schemas.BacktestTrade.model_fields
+    )
+    detail = client.get(f"/arena/agents/{agent_id}").json()
+    assert set(detail["trades"][0]) == set(schemas.SimTrade.model_fields)
+    # memoria assente nella lineage, come prima dei response_model
+    assert "memory" not in client.get("/arena").json()["lineage"][0]
+
+
 # --- token interno e controllo proprietario ---------------------------------
 
 
