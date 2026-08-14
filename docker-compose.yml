@@ -3,7 +3,7 @@ services:
 # Trading Postgres # --------------------------------------------------------------------------------------------------------------
 
   trading-postgres:
-    image: postgres:18-alpine
+    image: pgvector/pgvector:pg18
     container_name: trading-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
