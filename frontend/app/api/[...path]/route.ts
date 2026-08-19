@@ -1,6 +1,6 @@
 import { auth } from "@/auth";
 
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://trading-backend:8000";
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
 // Segreto condiviso col backend: prova che la richiesta arriva da questo proxy
 // (e quindi da una sessione Authentik verificata). Resta lato server — niente
 // prefisso NEXT_PUBLIC, non finisce mai nel bundle del browser.
