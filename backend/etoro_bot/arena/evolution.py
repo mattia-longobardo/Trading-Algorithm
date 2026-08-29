@@ -66,6 +66,9 @@ def _maybe_evolve_locked(deps: ArenaDeps, now: datetime | None) -> dict[str, Any
             prices = {s: float(r["price"]) for s, r in snapshot.items() if r.get("price")}
         except Exception as exc:
             logger.warning("evoluzione: prezzi di liquidazione non disponibili: %s", exc)
+    from etoro_bot.arena.engine import sim_costs
+
+    costs = sim_costs(deps.settings)
     for agent in alive:
         for pos in deps.repo.sim_positions(agent.id):
             price = prices.get(pos.symbol)
@@ -73,6 +76,7 @@ def _maybe_evolve_locked(deps: ArenaDeps, now: datetime | None) -> dict[str, Any
                 pos.id,
                 effective_price(pos, price) if price else float(pos.entry_price),
                 "liquidazione di fine mese (valutazione)",
+                costs=costs,
             )
 
     results = []

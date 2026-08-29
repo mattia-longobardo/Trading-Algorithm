@@ -4,8 +4,30 @@ from __future__ import annotations
 
 import enum
 import uuid
+from dataclasses import dataclass
 
 from pydantic import BaseModel
+
+
+@dataclass(frozen=True)
+class SimCosts:
+    """Costi di transazione del conto simulato.
+
+    Senza costi il PnL dell'arena — che decide quale DNA va live con denaro
+    reale — è sistematicamente ottimistico, e il bias cresce con la frequenza
+    di trading che la pressione evolutiva spinge in alto. Default a zero:
+    i valori di produzione vivono in settings.yaml::arena.costs.
+    """
+
+    spread_pct: float = 0.0                 # spread pieno; metà per lato
+    fee_usd: float = 0.0                    # fee fissa per lato
+    short_overnight_pct_per_day: float = 0.0  # costo notturno degli short sintetici
+
+    @classmethod
+    def from_settings(cls, arena: dict) -> SimCosts:
+        raw = (arena or {}).get("costs") or {}
+        known = {k: float(v) for k, v in raw.items() if k in cls.__dataclass_fields__}
+        return cls(**known)
 
 
 class Side(str, enum.Enum):

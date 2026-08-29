@@ -26,7 +26,7 @@ from etoro_bot.db.models import (
     SimTrade,
     UserCredential,
 )
-from etoro_bot.domain import ExecutionResult, ExecutionStatus
+from etoro_bot.domain import ExecutionResult, ExecutionStatus, SimCosts
 
 
 def make_engine(url: str | None = None) -> Engine:
@@ -477,10 +477,21 @@ class Repository:
         open_reason: str,
         opened_at: datetime | None = None,
         direction: str = "long",
+        costs: SimCosts | None = None,
     ) -> bool:
-        """Apre una posizione simulata scalando il cash; False se cash insufficiente."""
+        """Apre una posizione simulata scalando il cash; False se cash insufficiente.
+
+        Con `costs` l'entry è peggiorata di mezzo spread e la fee riduce
+        l'investito: nel libro mastro specchiato degli short il verso del
+        peggioramento è lo stesso (entry più alta = meno units = PnL peggiore).
+        """
         if amount_usd <= 0 or entry_price <= 0:
             return False
+        costs = costs or SimCosts()
+        invested = amount_usd - costs.fee_usd
+        if invested <= 0:
+            return False
+        effective_entry = entry_price * (1 + costs.spread_pct / 200.0)
         with self._sf.begin() as s:
             # FOR UPDATE: il cash è read-modify-write, senza lock di riga due
             # operazioni concorrenti sullo stesso agente si sovrascrivono.
@@ -495,7 +506,7 @@ class Repository:
                     instrument_id=instrument_id,
                     direction=direction,
                     amount_usd=amount_usd,
-                    units=amount_usd / entry_price,
+                    units=invested / effective_entry,
                     entry_price=entry_price,
                     open_reason=open_reason,
                     opened_at=opened_at or datetime.now(timezone.utc),
@@ -504,19 +515,39 @@ class Repository:
             return True
 
     def close_sim_position(
-        self, position_id: uuid.UUID, close_price: float, close_reason: str
+        self,
+        position_id: uuid.UUID,
+        close_price: float,
+        close_reason: str,
+        costs: SimCosts | None = None,
+        now: datetime | None = None,
     ) -> float | None:
         """Chiude una posizione simulata: accredita il ricavato, registra il trade.
 
-        Ritorna il PnL realizzato, None se la posizione non esiste.
+        Ritorna il PnL realizzato, None se la posizione non esiste. Con `costs`
+        il ricavato paga mezzo spread, la fee di chiusura e — per gli short
+        sintetici — il costo overnight per notte di detenzione.
         """
+        costs = costs or SimCosts()
         with self._sf.begin() as s:
             # FOR UPDATE sulla posizione (una sola chiusura vince: la seconda
             # non la trova più) e poi sull'agente, prima di toccarne il cash.
             pos = s.get(SimPosition, position_id, with_for_update=True)
             if pos is None:
                 return None
-            proceeds = pos.units * close_price
+            proceeds = pos.units * close_price * (1 - costs.spread_pct / 200.0)
+            proceeds -= costs.fee_usd
+            if pos.direction == "short" and costs.short_overnight_pct_per_day > 0:
+                opened = pos.opened_at
+                ref_now = now or datetime.now(timezone.utc)
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                nights = max((ref_now - opened).days, 0)
+                proceeds -= (
+                    float(pos.amount_usd)
+                    * costs.short_overnight_pct_per_day / 100.0
+                    * nights
+                )
             pnl = proceeds - pos.amount_usd
             agent = s.get(Agent, pos.agent_id, with_for_update=True)
             if agent is not None:

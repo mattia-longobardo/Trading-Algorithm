@@ -68,6 +68,76 @@ def test_sim_account_roundtrip(repo):
     assert trade.pnl_usd == 50.0 and trade.close_reason == "tp"
 
 
+def test_sim_costs_spread_and_fee_make_roundtrip_lossy(repo):
+    """Con spread e fee un round-trip a prezzo invariato deve perdere denaro:
+    il PnL dell'arena decide chi va live con soldi veri, e senza costi la
+    selezione evolutiva premia la sovra-operatività."""
+    from etoro_bot.domain import SimCosts
+
+    costs = SimCosts(spread_pct=1.0, fee_usd=2.0, short_overnight_pct_per_day=0.0)
+    agent_id = repo.create_agent("T-C", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    assert repo.open_sim_position(agent_id, "AAPL", 1, 1_000.0, 100.0, "t", costs=costs)
+    pos = repo.sim_positions(agent_id)[0]
+    # investito = 1000 - 2 di fee, entry peggiorata di mezzo spread (0.5%)
+    assert pos.units == pytest.approx(998.0 / (100.0 * 1.005))
+    pnl = repo.close_sim_position(pos.id, 100.0, "flat", costs=costs)
+    gross = pos.units * 100.0 * 0.995
+    assert pnl == pytest.approx(gross - 2.0 - 1_000.0)
+    assert pnl < 0
+
+
+def test_sim_costs_short_pays_overnight(repo):
+    from datetime import timedelta
+
+    from etoro_bot.domain import SimCosts
+
+    costs = SimCosts(spread_pct=0.0, fee_usd=0.0, short_overnight_pct_per_day=0.1)
+    agent_id = repo.create_agent("T-S", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    opened = NOW - timedelta(days=3)
+    assert repo.open_sim_position(
+        agent_id, "AAPL", 1, 1_000.0, 100.0, "t",
+        opened_at=opened, direction="short", costs=costs,
+    )
+    pos = repo.sim_positions(agent_id)[0]
+    # prezzo (specchiato) invariato: il PnL è solo il costo overnight, 3 notti
+    pnl = repo.close_sim_position(pos.id, 100.0, "flat", costs=costs, now=NOW)
+    assert pnl == pytest.approx(-1_000.0 * 0.001 * 3)
+
+
+def test_sim_costs_default_is_zero(repo):
+    """Senza costi espliciti la contabilità resta identica a prima (test legacy)."""
+    agent_id = repo.create_agent("T-Z", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 1_000.0)
+    assert repo.open_sim_position(agent_id, "AAPL", 1, 500.0, 100.0, "ok")
+    pos = repo.sim_positions(agent_id)[0]
+    assert pos.units == 5.0
+    assert repo.close_sim_position(pos.id, 100.0, "flat") == 0.0
+
+
+def test_training_cycle_applies_costs_from_settings(repo):
+    """Il ciclo di training deve passare arena.costs al conto simulato."""
+    deps = make_deps(
+        repo,
+        llm=open_llm("AAPL", size_pct=50.0),
+        settings={"arena": {"starting_capital_usd": 10_000, "costs": {"spread_pct": 1.0}}},
+    )
+    bootstrap_if_needed(deps, now=NOW)
+    run_training_cycle(deps, market=MARKET, now=NOW)
+    agent = repo.alive_agents()[0]
+    pos = repo.sim_positions(agent.id)[0]
+    # entry peggiorata di mezzo spread: units < amount/price
+    assert pos.units < pos.amount_usd / 200.0
+
+
+def test_sim_costs_from_settings():
+    from etoro_bot.domain import SimCosts
+
+    costs = SimCosts.from_settings({"costs": {"spread_pct": 0.3, "fee_usd": 1.5}})
+    assert costs.spread_pct == 0.3
+    assert costs.fee_usd == 1.5
+    assert costs.short_overnight_pct_per_day == 0.0
+    assert SimCosts.from_settings({}) == SimCosts()
+
+
 # ------------------------------------------------------------------ stop/take
 
 

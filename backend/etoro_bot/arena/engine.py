@@ -32,6 +32,7 @@ from etoro_bot.arena.dna import (
 )
 from etoro_bot.arena.trader import SHORT, build_prompt, decide, enforce
 from etoro_bot.db.repo import Repository
+from etoro_bot.domain import SimCosts
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,11 @@ def _utcnow() -> datetime:
 
 def arena_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return settings.get("arena") or {}
+
+
+def sim_costs(settings: dict[str, Any]) -> SimCosts:
+    """Costi di transazione del conto simulato da settings (arena.costs)."""
+    return SimCosts.from_settings(arena_settings(settings))
 
 
 def survival_floor_pct(settings: dict[str, Any]) -> float:
@@ -281,10 +287,12 @@ def _run_training_cycle_locked(
 
 def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
     dna = clamp_dna(agent.dna)
+    costs = sim_costs(deps.settings)
     positions = deps.repo.sim_positions(agent.id)
     for pos, reason in auto_risk_closes(dna, positions, prices):
         deps.repo.close_sim_position(
-            pos.id, effective_price(pos, prices[pos.symbol]), reason
+            pos.id, effective_price(pos, prices[pos.symbol]), reason,
+            costs=costs, now=now,
         )
 
     if deps.llm is not None:
@@ -327,7 +335,8 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
                 if wanted and position_direction(pos) != wanted:
                     continue
                 deps.repo.close_sim_position(
-                    pos.id, effective_price(pos, price), close["reason"] or "chiusura"
+                    pos.id, effective_price(pos, price), close["reason"] or "chiusura",
+                    costs=costs, now=now,
                 )
         for order in opens:
             price = prices.get(order["symbol"])
@@ -337,6 +346,7 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
                     order["amount_usd"], price, order["reason"],
                     opened_at=now,
                     direction=order["direction"],
+                    costs=costs,
                 )
 
     agent = deps.repo.get_agent(agent.id)
@@ -357,12 +367,14 @@ def _enforce_survival_floor(deps: ArenaDeps, agent, equity: float, prices) -> No
     floor = float(agent.starting_capital_usd) * floor_pct / 100.0
     if equity > floor:
         return
+    costs = sim_costs(deps.settings)
     for pos in deps.repo.sim_positions(agent.id):
         price = prices.get(pos.symbol)
         deps.repo.close_sim_position(
             pos.id,
             effective_price(pos, price) if price else float(pos.entry_price),
             "liquidazione per bancarotta",
+            costs=costs,
         )
     reason = (
         f"bancarotta: equity {equity:.2f} USD sotto il pavimento di "
@@ -418,6 +430,7 @@ def close_market_positions(
                 effective_price(pos, price) if price else float(pos.entry_price),
                 f"fine sessione {market_name}: holding massimo raggiunto "
                 f"({held}/{max_days} giorni)",
+                costs=sim_costs(deps.settings), now=now,
             )
             closed += 1
     return {"closed": closed, "market": market_name}

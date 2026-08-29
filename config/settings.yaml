@@ -14,6 +14,13 @@ arena:
   cycle_minutes: 15             # un ciclo di decisioni ogni 15 minuti di borsa (era 5)
   max_symbols: 80               # titoli mostrati ai trader per ciclo
   survival_floor_pct: 25        # equity sotto il 25% dell'iniziale = bancarotta immediata (0 = disattivo)
+  # Costi di transazione del conto simulato: senza, il PnL dell'arena (che
+  # decide quale DNA va live con denaro reale) è sistematicamente ottimistico.
+  # Valori prudenti allineati allo screening universo (max spread 1%).
+  costs:
+    spread_pct: 0.2                   # spread pieno; metà applicata per lato
+    fee_usd: 1.0                      # fee fissa per lato
+    short_overnight_pct_per_day: 0.03 # costo per notte degli short sintetici
   # Sessioni di borsa (UTC, orari estivi). A fine sessione si chiudono solo le
   # posizioni che hanno esaurito il max_holding_days del DNA: lo swing resta
   # aperto oltre la campanella.
