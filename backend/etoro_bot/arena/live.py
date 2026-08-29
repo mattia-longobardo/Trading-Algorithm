@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from etoro_bot.arena.dna import clamp_dna, risk_close_reason
-from etoro_bot.arena.engine import ArenaDeps
+from etoro_bot.arena.engine import ArenaDeps, active_mandate
 from etoro_bot.arena.trader import LONG, SHORT, build_prompt, decide, enforce
 from etoro_bot.domain import (
     ExecutionResult,
@@ -46,6 +46,7 @@ from etoro_bot.domain import (
     order_request_id,
 )
 from etoro_bot.safety.kill_switch import kill_switch_active
+from etoro_bot.safety.mandate import check_open
 
 logger = logging.getLogger(__name__)
 
@@ -1095,9 +1096,45 @@ def _run_live_cycle_locked(
     # potrebbe già essere a mercato senza comparire nel registry. Con
     # allow_pyramiding attivo held_symbols non basta a fermare il doppione.
     unresolved_symbols = set(reconciled.get("unresolved_symbols") or ())
+    # Mandate pre-trade: policy di sistema da risk_rules.yaml, fuori dalla
+    # portata dell'LLM. Rifiuto = riga REJECTED a giornale, mai un'eccezione.
+    mandate = active_mandate(deps)
+    total_exposure = sum(float(p.amount_usd) for p in positions)
+    symbol_exposure: dict[str, float] = {}
+    for p in positions:
+        symbol_exposure[p.symbol] = symbol_exposure.get(p.symbol, 0.0) + float(p.amount_usd)
+    # ponytail: aperture odierne contate dal registry (posizioni ancora aperte);
+    # le chiusure intraday non contano — basta finché il cap non è stretto.
+    opens_today = sum(
+        1 for p in positions
+        if p.opened_at is not None and p.opened_at.date() == now.date()
+    )
     for order in opens:
         if kill_switch_active() or blocks_openings:
             executed["blocked"] += 1
+            continue
+        denied = check_open(
+            mandate,
+            symbol=order["symbol"],
+            amount_usd=float(order["amount_usd"]),
+            equity_usd=equity,
+            total_exposure_usd=total_exposure,
+            symbol_exposure_usd=symbol_exposure.get(order["symbol"], 0.0),
+            opens_today=opens_today,
+            stop_loss_pct=float(dna["stop_loss_pct"]),
+        )
+        if denied is not None:
+            executed["blocked"] += 1
+            deps.repo.add_execution(
+                run_id,
+                ExecutionResult(
+                    symbol=order["symbol"],
+                    side=Side.SELL if order.get("direction") == SHORT else Side.BUY,
+                    amount_usd=order["amount_usd"],
+                    status=ExecutionStatus.REJECTED,
+                    detail=f"mandate:{denied}",
+                ),
+            )
             continue
         if order["symbol"] in unresolved_symbols:
             logger.error(
@@ -1113,6 +1150,11 @@ def _run_live_cycle_locked(
             _open_real_position(deps, run_id, order, slot, now,
                                 price=prices.get(order["symbol"]))
             executed["opened"] += 1
+            opens_today += 1
+            total_exposure += float(order["amount_usd"])
+            symbol_exposure[order["symbol"]] = (
+                symbol_exposure.get(order["symbol"], 0.0) + float(order["amount_usd"])
+            )
         except ShortNotSupported as exc:
             # niente conversione silenziosa in long: l'ordine non parte e resta
             # a giornale come saltato, così il limite è visibile.

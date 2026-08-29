@@ -73,10 +73,13 @@ class SlowLiveClient:
 
 
 def _deps(repo, client, llm):
+    from etoro_bot.safety.mandate import Mandate
+
     return ArenaDeps(
         repo=repo, client=client,
         settings={"arena": {"starting_capital_usd": 10_000}},
         llm=llm, model="test-model", max_tokens=512,
+        mandate=Mandate.unlimited(),
     )
 
 

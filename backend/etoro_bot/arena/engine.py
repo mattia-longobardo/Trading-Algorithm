@@ -33,6 +33,7 @@ from etoro_bot.arena.dna import (
 from etoro_bot.arena.trader import SHORT, build_prompt, decide, enforce
 from etoro_bot.db.repo import Repository
 from etoro_bot.domain import SimCosts
+from etoro_bot.safety.mandate import Mandate, check_open, load_mandate
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,12 @@ class ArenaDeps:
     llm: Callable[..., str] | None
     model: str
     max_tokens: int
+    # None = policy da config/risk_rules.yaml (fail-closed se assente).
+    mandate: Mandate | None = None
+
+
+def active_mandate(deps: ArenaDeps) -> Mandate:
+    return deps.mandate if deps.mandate is not None else load_mandate()
 
 
 def _utcnow() -> datetime:
@@ -338,15 +345,55 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
                     pos.id, effective_price(pos, price), close["reason"] or "chiusura",
                     costs=costs, now=now,
                 )
+        # Mandate pre-trade (policy di sistema, non negoziabile dall'agente):
+        # esposizioni ricalcolate DOPO le chiusure del ciclo.
+        mandate = active_mandate(deps)
+        open_positions = deps.repo.sim_positions(agent.id)
+        total_exposure = sum(float(p.amount_usd) for p in open_positions)
+        symbol_exposure: dict[str, float] = {}
+        for p in open_positions:
+            symbol_exposure[p.symbol] = symbol_exposure.get(p.symbol, 0.0) + float(p.amount_usd)
+        today = now.date()
+        # ponytail: conteggio aperture odierne = posizioni aperte oggi + trade
+        # aperti oggi tra gli ultimi 200; basta finché un agente non fa
+        # centinaia di trade al giorno.
+        opens_today = sum(1 for p in open_positions if p.opened_at.date() == today) + sum(
+            1
+            for t in deps.repo.sim_trades(agent.id, limit=200)
+            if t.opened_at is not None and t.opened_at.date() == today
+        )
         for order in opens:
             price = prices.get(order["symbol"])
-            if price:
-                deps.repo.open_sim_position(
-                    agent.id, order["symbol"], order["instrument_id"],
-                    order["amount_usd"], price, order["reason"],
-                    opened_at=now,
-                    direction=order["direction"],
-                    costs=costs,
+            if not price:
+                continue
+            denied = check_open(
+                mandate,
+                symbol=order["symbol"],
+                amount_usd=float(order["amount_usd"]),
+                equity_usd=equity,
+                total_exposure_usd=total_exposure,
+                symbol_exposure_usd=symbol_exposure.get(order["symbol"], 0.0),
+                opens_today=opens_today,
+                stop_loss_pct=float(dna["stop_loss_pct"]),
+            )
+            if denied is not None:
+                deps.repo.add_arena_event(
+                    "order_denied",
+                    {"agent": agent.name, "symbol": order["symbol"],
+                     "amount_usd": order["amount_usd"], "reason": denied},
+                )
+                continue
+            if deps.repo.open_sim_position(
+                agent.id, order["symbol"], order["instrument_id"],
+                order["amount_usd"], price, order["reason"],
+                opened_at=now,
+                direction=order["direction"],
+                costs=costs,
+            ):
+                opens_today += 1
+                total_exposure += float(order["amount_usd"])
+                symbol_exposure[order["symbol"]] = (
+                    symbol_exposure.get(order["symbol"], 0.0) + float(order["amount_usd"])
                 )
 
     agent = deps.repo.get_agent(agent.id)
