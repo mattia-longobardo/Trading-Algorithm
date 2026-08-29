@@ -24,6 +24,12 @@ arena:
   # Walk-forward: il DNA vincitore del mese viene rigiocato in replay storico
   # out-of-sample prima di diventare campione live. Se fallisce le soglie il
   # torneo prosegue ma il campione (e quindi il live) resta il precedente.
+  # Pipeline decisionale multi-stadio (TradingAgents): Analyst -> Bull/Bear ->
+  # Trader -> Risk judge. 5 chiamate LLM per agente per ciclo: i candidati
+  # sono pre-filtrati. Disattivata = singola chiamata trader come prima.
+  pipeline:
+    enabled: true
+    candidates: 12
   walk_forward:
     enabled: true
     days: 60                # finestra storica del replay
@@ -159,6 +165,12 @@ knowledge:
 
 llm:
   model: gpt-5.6-terra
+  # Due tier (pattern TradingAgents): quick per analista/dibattito, deep per
+  # trader e risk judge. Assenti = si usa `model` per tutto. Impostare un
+  # modello economico su model_quick è la leva di costo principale della
+  # pipeline (5 chiamate/ciclo/agente invece di 1).
+  # model_quick: <modello economico>
+  # model_deep: <modello di punta>
   max_tokens: 2048
 
 news_feeds:
