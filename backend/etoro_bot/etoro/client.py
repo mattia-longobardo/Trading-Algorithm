@@ -36,6 +36,19 @@ _ORDER_POLL_INTERVAL_S = 1.0
 # si costruisce il proprio client. Uno solo per processo, condiviso di default.
 _SHARED_RATE_LIMITER = RateLimiter()
 
+# Cache dei prezzi correnti, condivisa a livello di modulo come il limiter:
+# ~80 simboli per ciclo = ~80 GET su un pool 120/60s. Un TTL breve assorbe
+# snapshot ravvicinati (training+live nello stesso tick, EOD, retry) senza
+# rendere stantio il prezzo su cicli da 15 minuti.
+# ponytail: race sulla dict accettata — al peggio si rifà una GET.
+_RATES_CACHE_TTL_S = 45.0
+_RATES_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def clear_rates_cache() -> None:
+    """Svuota la cache dei rates (usata dai test e dai fetch forzati)."""
+    _RATES_CACHE.clear()
+
 ORDER_STATUS_FILLED = 3
 # 4 Rejected, 7 Canceled, 8 Expired, 9 CanceledPartiallyFilled, 10 RejectedPartiallyFilled
 _ORDER_STATUS_TERMINAL_KO = {4, 7, 8, 9, 10}
@@ -261,8 +274,16 @@ class EtoroClient:
         integer"). Gli id non quotati vengono semplicemente omessi dal
         risultato, così un simbolo senza prezzo non fa fallire l'intera run.
         """
+        now = time.monotonic()
         rates: dict[int, dict] = {}
+        missing: list[int] = []
         for instrument_id in instrument_ids:
+            hit = _RATES_CACHE.get(int(instrument_id))
+            if hit is not None and now - hit[0] < _RATES_CACHE_TTL_S:
+                rates[int(instrument_id)] = hit[1]
+            else:
+                missing.append(instrument_id)
+        for instrument_id in missing:
             try:
                 data = self._request(
                     "GET", "/api/v1/market-data/instruments/rates",
@@ -275,6 +296,7 @@ class EtoroClient:
                 rate_id = rate.get("instrumentID")
                 if rate_id is not None:
                     rates[int(rate_id)] = rate
+                    _RATES_CACHE[int(rate_id)] = (now, rate)
         return rates
 
     def get_candles(

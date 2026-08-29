@@ -81,10 +81,11 @@ function TimezoneCard({ settings }: { settings: AppSettings }) {
 
 function ArenaConfigCard({ settings }: { settings: AppSettings }) {
   const arena = settings.arena;
+  const d = useDisplay();
   const marketLabel = (name: string) =>
     name === "europe" ? "Borse europee" : name === "usa" ? "Borsa USA" : name;
   const rows: [string, string][] = [
-    ["Budget mensile per agente", `${arena.starting_capital_eur ?? 10000} €`],
+    ["Budget mensile per agente", d.money(arena.starting_capital_usd ?? 10000)],
     ["Ciclo di trading", `ogni ${arena.cycle_minutes ?? 60} min`],
     ...Object.entries(arena.markets ?? {}).map(
       ([name, w]): [string, string] => [

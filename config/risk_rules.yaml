@@ -1,8 +1,21 @@
-# Freni di SOPRAVVIVENZA del trading LIVE. Non moderano l'aggressività: esistono
-# solo per impedire l'azzeramento del conto. Tutta la gestione operativa (size,
-# stop loss, take profit, numero di posizioni, direzione, orizzonte) vive nel DNA
-# degli agenti e si evolve con la selezione mensile.
+# Regole di rischio di sistema. Questo file è la POLICY, separata dal DNA
+# degli agenti (che è solo rappresentabilità): l'LLM non ha alcun modo di
+# modificarla. Letto una volta al boot; file assente = trading HALTED.
+
+# Circuit breaker di sopravvivenza (vedi safety/circuit_breaker.py).
+# Prima di questo file i default vivevano solo nel codice.
 circuit_breaker:
-  max_daily_loss_pct: 25.0       # drawdown giornaliero da bancarotta: sotto si bloccano le APERTURE (mai le chiusure)
-  max_consecutive_losses: 0      # 0 = disattivato: una serie di stop non minaccia la sopravvivenza
-  cooloff_hours: 1               # pausa breve: il bot deve tornare a operare
+  max_daily_loss_pct: 25.0     # drawdown giornaliero da bancarotta
+  max_consecutive_losses: 0    # 0 = disattivo
+  cooloff_hours: 1
+
+# Mandate pre-trade: ogni APERTURA (sim e live) deve passare questi controlli
+# dopo l'enforce contabile e prima dell'esecuzione. Le chiusure passano sempre.
+mandate:
+  trading_state: ACTIVE        # ACTIVE | REDUCING (solo chiusure+riduzioni) | HALTED
+  max_notional_per_order_usd: 2500
+  max_total_exposure_pct: 100  # esposizione totale massima in % dell'equity
+  max_symbol_exposure_pct: 25  # esposizione massima per simbolo in % dell'equity
+  max_orders_per_day: 20       # aperture al giorno (per agente in sim, per conto in live)
+  min_stop_loss_pct: 0.5       # floor: un DNA con stop sotto questa soglia non apre
+  denylist: []                 # simboli vietati (es. [GME, AMC])

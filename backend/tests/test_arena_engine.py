@@ -29,14 +29,17 @@ MARKET = {
 }
 
 
-def make_deps(repo, llm=None, settings=None):
+def make_deps(repo, llm=None, settings=None, mandate=None):
+    from etoro_bot.safety.mandate import Mandate
+
     return ArenaDeps(
         repo=repo,
         client=None,
-        settings={"arena": {"starting_capital_eur": 10_000}, **(settings or {})},
+        settings={"arena": {"starting_capital_usd": 10_000}, **(settings or {})},
         llm=llm,
         model="test-model",
         max_tokens=512,
+        mandate=mandate or Mandate.unlimited(),
     )
 
 
@@ -66,6 +69,184 @@ def test_sim_account_roundtrip(repo):
     assert repo.sim_positions(agent_id) == []
     trade = repo.sim_trades(agent_id)[0]
     assert trade.pnl_usd == 50.0 and trade.close_reason == "tp"
+
+
+def test_sim_costs_spread_and_fee_make_roundtrip_lossy(repo):
+    """Con spread e fee un round-trip a prezzo invariato deve perdere denaro:
+    il PnL dell'arena decide chi va live con soldi veri, e senza costi la
+    selezione evolutiva premia la sovra-operatività."""
+    from etoro_bot.domain import SimCosts
+
+    costs = SimCosts(spread_pct=1.0, fee_usd=2.0, short_overnight_pct_per_day=0.0)
+    agent_id = repo.create_agent("T-C", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    assert repo.open_sim_position(agent_id, "AAPL", 1, 1_000.0, 100.0, "t", costs=costs)
+    pos = repo.sim_positions(agent_id)[0]
+    # investito = 1000 - 2 di fee, entry peggiorata di mezzo spread (0.5%)
+    assert pos.units == pytest.approx(998.0 / (100.0 * 1.005))
+    pnl = repo.close_sim_position(pos.id, 100.0, "flat", costs=costs)
+    gross = pos.units * 100.0 * 0.995
+    assert pnl == pytest.approx(gross - 2.0 - 1_000.0)
+    assert pnl < 0
+
+
+def test_sim_costs_short_pays_overnight(repo):
+    from datetime import timedelta
+
+    from etoro_bot.domain import SimCosts
+
+    costs = SimCosts(spread_pct=0.0, fee_usd=0.0, short_overnight_pct_per_day=0.1)
+    agent_id = repo.create_agent("T-S", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    opened = NOW - timedelta(days=3)
+    assert repo.open_sim_position(
+        agent_id, "AAPL", 1, 1_000.0, 100.0, "t",
+        opened_at=opened, direction="short", costs=costs,
+    )
+    pos = repo.sim_positions(agent_id)[0]
+    # prezzo (specchiato) invariato: il PnL è solo il costo overnight, 3 notti
+    pnl = repo.close_sim_position(pos.id, 100.0, "flat", costs=costs, now=NOW)
+    assert pnl == pytest.approx(-1_000.0 * 0.001 * 3)
+
+
+def test_sim_costs_default_is_zero(repo):
+    """Senza costi espliciti la contabilità resta identica a prima (test legacy)."""
+    agent_id = repo.create_agent("T-Z", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 1_000.0)
+    assert repo.open_sim_position(agent_id, "AAPL", 1, 500.0, 100.0, "ok")
+    pos = repo.sim_positions(agent_id)[0]
+    assert pos.units == 5.0
+    assert repo.close_sim_position(pos.id, 100.0, "flat") == 0.0
+
+
+def test_training_cycle_applies_costs_from_settings(repo):
+    """Il ciclo di training deve passare arena.costs al conto simulato."""
+    deps = make_deps(
+        repo,
+        llm=open_llm("AAPL", size_pct=50.0),
+        settings={"arena": {"starting_capital_usd": 10_000, "costs": {"spread_pct": 1.0}}},
+    )
+    bootstrap_if_needed(deps, now=NOW)
+    run_training_cycle(deps, market=MARKET, now=NOW)
+    agent = repo.alive_agents()[0]
+    pos = repo.sim_positions(agent.id)[0]
+    # entry peggiorata di mezzo spread: units < amount/price
+    assert pos.units < pos.amount_usd / 200.0
+
+
+def test_mandate_denies_oversized_open_and_journals_it(repo):
+    from etoro_bot.safety.mandate import Mandate
+
+    deps = make_deps(
+        repo,
+        llm=open_llm("AAPL", size_pct=50.0),  # 5000 USD > cap 2500
+        mandate=Mandate(
+            trading_state="ACTIVE",
+            max_notional_per_order_usd=2_500.0,
+            max_total_exposure_pct=100.0,
+            max_symbol_exposure_pct=100.0,
+            max_orders_per_day=20,
+            min_stop_loss_pct=0.0,
+        ),
+    )
+    bootstrap_if_needed(deps, now=NOW)
+    run_training_cycle(deps, market=MARKET, now=NOW)
+    for agent in repo.alive_agents():
+        assert repo.sim_positions(agent.id) == []
+    events = [e for e in repo.arena_events(limit=50) if e.event == "order_denied"]
+    assert events and events[0].payload["reason"] == "max_notional"
+
+
+def test_sim_costs_from_settings():
+    from etoro_bot.domain import SimCosts
+
+    costs = SimCosts.from_settings({"costs": {"spread_pct": 0.3, "fee_usd": 1.5}})
+    assert costs.spread_pct == 0.3
+    assert costs.fee_usd == 1.5
+    assert costs.short_overnight_pct_per_day == 0.0
+    assert SimCosts.from_settings({}) == SimCosts()
+
+
+def test_walk_forward_failure_blocks_champion_promotion(repo, monkeypatch):
+    """Il vincitore del mese senza walk-forward valido non tocca il campione live."""
+    from etoro_bot.arena import replay as replay_module
+
+    monkeypatch.setattr(
+        replay_module, "run_replay",
+        lambda *a, **k: {"return_pct": -5.0, "max_drawdown_pct": 50.0,
+                         "trades": 3, "final_equity": 9_500.0,
+                         "max_dd": None, "bars": 10},
+    )
+    old_champion_id = repo.create_agent(
+        "G0-Alfa", 0, clamp_dna(DEFAULT_DNA), "", "2026-06", 10_000.0
+    )
+    repo.retire_agent(old_champion_id)
+    repo.set_champion(old_champion_id)
+    winner_id = repo.create_agent(
+        "G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0
+    )
+    repo.create_agent("G1-Beta", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    # il vincitore chiude il mese in positivo
+    assert repo.open_sim_position(winner_id, "AAPL", 1, 1_000.0, 100.0, "t")
+    pos = repo.sim_positions(winner_id)[0]
+    repo.close_sim_position(pos.id, 120.0, "tp")
+    repo.set_setting("arena", {"month": "2026-07"}, source="test")
+
+    deps = make_deps(repo, settings={"watchlist": ["AAPL"]})
+    deps.client = object()  # basta un client non-None: run_replay è mockato
+    summary = maybe_evolve(deps, now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    assert summary is not None
+    assert summary["survivor"] == "G1-Alfa"
+    assert summary["promoted_champion"] is False
+    champion = repo.champion()
+    assert champion is not None and champion.id == old_champion_id
+
+
+def test_evolution_pool_promotes_best_replay_variants(repo, monkeypatch):
+    """Con il vivaio attivo, alla nuova generazione vanno i 2 DNA migliori in replay."""
+    from etoro_bot.arena import evolution as evo
+    from etoro_bot.arena import replay as replay_module
+
+    counter = {"n": 0}
+
+    def fake_mutate(base, rng, **kwargs):
+        counter["n"] += 1
+        return clamp_dna({**base, "strategy": f"variante-{counter['n']}"})
+
+    def fake_replay(deps, dna, symbols, **kwargs):
+        # la variante col numero più alto rende di più; il clone (senza tag) 0
+        tag = str(dna.get("strategy") or "")
+        score = float(tag.rsplit("-", 1)[-1]) if tag.startswith("variante-") else 0.0
+        return {"return_pct": score, "max_drawdown_pct": 5.0, "trades": 3}
+
+    monkeypatch.setattr(evo, "mutate", fake_mutate)
+    monkeypatch.setattr(replay_module, "run_replay", fake_replay)
+
+    winner_id = repo.create_agent(
+        "G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0
+    )
+    repo.create_agent("G1-Beta", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    assert repo.open_sim_position(winner_id, "AAPL", 1, 1_000.0, 100.0, "t")
+    pos = repo.sim_positions(winner_id)[0]
+    repo.close_sim_position(pos.id, 120.0, "tp")
+    repo.set_setting("arena", {"month": "2026-07"}, source="test")
+
+    deps = make_deps(
+        repo,
+        settings={
+            "watchlist": ["AAPL"],
+            "arena": {
+                "starting_capital_usd": 10_000,
+                "evolution_pool": {"enabled": True, "variants": 4},
+                "walk_forward": {"enabled": False},
+            },
+        },
+    )
+    deps.client = object()
+    summary = maybe_evolve(deps, now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    assert summary is not None
+    new_agents = {a.name: a for a in repo.alive_agents()}
+    # variante-3 (score 3) e variante-2 (score 2) battono clone e variante-1
+    assert new_agents["G2-Alfa"].dna["strategy"] == "variante-3"
+    assert new_agents["G2-Beta"].dna["strategy"] == "variante-2"
+    assert any(e.event == "evolution_pool" for e in repo.arena_events(limit=20))
 
 
 # ------------------------------------------------------------------ stop/take
@@ -366,3 +547,146 @@ def test_agent_equity_marks_open_positions(repo):
     assert agent_equity(agent, positions, {"AAPL": 110.0}) == 1_040.0
     # prezzo mancante: la posizione vale il costo
     assert agent_equity(agent, positions, {}) == 1_000.0
+
+
+def test_new_generation_rebases_capital_to_config(repo):
+    """La nuova generazione nasce col capitale configurato, non con quello dei padri.
+
+    È qui che il capitale si riallinea: gli agenti in corsa tengono la loro
+    base fino a fine mese, i figli ripartono dal valore in `settings`.
+    """
+    a, _b = _finished_month(repo, pnl_a=350.0, pnl_b=80.0)
+    with repo._sf.begin() as s:  # padri nati con una base derivata dal cambio
+        from etoro_bot.db.models import Agent
+
+        for agent_id in (a, _b):
+            s.get(Agent, agent_id).starting_capital_usd = 11_485.01
+
+    maybe_evolve(make_deps(repo), now=NOW)
+
+    new_gen = repo.alive_agents()
+    assert len(new_gen) == 2
+    for child in new_gen:
+        assert child.starting_capital_usd == 10_000.0
+        assert child.cash_usd == 10_000.0
+
+
+def test_starting_capital_is_usd_native(repo):
+    """Il capitale iniziale non passa dal cambio: nasce e resta in USD.
+
+    Regressione: convertendo un budget in EUR al cambio del giorno di nascita,
+    mentre la UI riconverte USD→EUR al cambio corrente, un agente in profitto
+    poteva mostrare un'equity sotto il capitale iniziale dichiarato.
+    """
+    from etoro_bot.arena.engine import starting_capital_usd
+
+    deps = make_deps(repo, settings={"arena": {"starting_capital_usd": 12_345.67}})
+    assert starting_capital_usd(deps) == 12_345.67
+
+    # chiave assente o illeggibile: default 10.000 USD, mai un fallback silenzioso
+    # a un importo diverso da quello configurato.
+    assert starting_capital_usd(make_deps(repo, settings={"arena": {}})) == 10_000.0
+    assert (
+        starting_capital_usd(
+            make_deps(repo, settings={"arena": {"starting_capital_usd": "n/d"}})
+        )
+        == 10_000.0
+    )
+
+
+# --------------------------------------------------------- riflessione (2.5)
+
+
+def test_trade_outcomes_alpha_vs_spy():
+    from datetime import date, timedelta
+
+    from etoro_bot.arena.reflection import trade_outcomes
+
+    class T:
+        symbol = "AAPL"
+        direction = "long"
+        amount_usd = 1_000.0
+        pnl_usd = 50.0  # +5%
+        close_reason = "tp"
+        opened_at = NOW - timedelta(days=5)
+        closed_at = NOW
+
+    spy = {
+        (NOW - timedelta(days=5)).date(): 500.0,
+        NOW.date(): 510.0,  # SPY +2% nella stessa finestra
+    }
+    out = trade_outcomes([T()], spy)[0]
+    assert out["ret_pct"] == 5.0
+    assert out["alpha_pct"] == 3.0
+    # short: il benchmark gioca al contrario
+    T.direction = "short"
+    out = trade_outcomes([T()], spy)[0]
+    assert out["alpha_pct"] == 7.0
+    assert isinstance(spy, dict) and date is not None
+
+
+def test_reflection_ledger_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATE_DIR", str(tmp_path))
+    from etoro_bot.arena.reflection import append_outcomes, past_context
+
+    outcomes = [
+        {"symbol": "AAPL", "direction": "long", "ret_pct": 5.0,
+         "alpha_pct": 3.0, "close_reason": "tp", "closed_on": "2026-07-27"},
+    ]
+    append_outcomes("agent-1", outcomes)
+    append_outcomes("agent-1", outcomes)
+    text = past_context("agent-1")
+    assert text.count("AAPL") == 2
+    assert "alpha vs SPY +3.00%" in text
+    assert past_context("altro-agente") == ""
+
+
+# --------------------------------------------------------------- verdict (4.3)
+
+
+def test_extract_verdict_roundtrip():
+    from etoro_bot.arena.verdict import extract_verdict
+
+    text = (
+        "diario aggiornato\n- lezione 1\n\n## Verdict\n"
+        "- AAPL: BUY - momentum e volume\n- ENEL.MI: EXIT - tesi invalidata\n"
+    )
+    body, verdicts, violation = extract_verdict(text)
+    assert violation is None
+    assert body == "diario aggiornato\n- lezione 1"
+    assert verdicts == [
+        {"symbol": "AAPL", "state": "BUY", "reason": "momentum e volume"},
+        {"symbol": "ENEL.MI", "state": "EXIT", "reason": "tesi invalidata"},
+    ]
+
+
+def test_extract_verdict_empty_section_is_no_calls():
+    from etoro_bot.arena.verdict import extract_verdict
+
+    body, verdicts, violation = extract_verdict("diario\n\n## Verdict\n")
+    assert violation is None and verdicts == [] and body == "diario"
+
+
+def test_extract_verdict_violations():
+    from etoro_bot.arena.verdict import extract_verdict
+
+    _, verdicts, violation = extract_verdict("solo diario, niente sezione")
+    assert violation == "missing_verdict" and verdicts is None
+    _, verdicts, violation = extract_verdict(
+        "diario\n## Verdict\n- AAPL: COMPRA SUBITO tanto\n"
+    )
+    assert violation == "malformed_verdict" and verdicts is None
+
+
+def test_eod_reflection_journals_verdict(repo):
+    def llm(system_blocks, user_prompt, model, max_tokens):
+        return "nuovo diario\n\n## Verdict\n- AAPL: HOLD - attendo conferma\n"
+
+    deps = make_deps(repo, llm=llm)
+    bootstrap_if_needed(deps, now=NOW)
+    run_eod(deps, now=NOW)
+    events = [e for e in repo.arena_events(limit=50) if e.event == "eod_verdict"]
+    assert events and events[0].payload["verdicts"][0]["symbol"] == "AAPL"
+    agent = repo.alive_agents()[0]
+    assert "## Verdict" not in agent.memory
+    assert "nuovo diario" in agent.memory

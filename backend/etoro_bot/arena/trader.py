@@ -12,6 +12,7 @@ deciso dal DNA dell'agente, non da questo modulo.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from etoro_bot.llm import extract_json
@@ -22,6 +23,30 @@ MIN_ORDER_USD = 10.0  # sotto: polvere, il broker non la esegue
 
 LONG = "long"
 SHORT = "short"
+
+# Rating a 5 livelli (pattern TradingAgents): la forza del giudizio è parte
+# del verdetto e scala la size. "hold" è un'astensione esplicita: l'apertura
+# viene scartata, e questo è un esito legittimo, non un errore.
+RATINGS = ("buy", "overweight", "hold", "underweight", "sell")
+RATING_SIZE = {"buy": 1.0, "sell": 1.0, "overweight": 0.6, "underweight": 0.6}
+
+
+def normalize_rating(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in RATINGS else None
+
+
+@dataclass
+class DecisionOutcome:
+    """Esito di una chiamata di decisione.
+
+    `violation` distingue il silenzio legittimo (array vuoto = astensione)
+    dal contratto rotto (niente JSON, LLM giù): il secondo finisce a giornale
+    invece di sparire in un [] muto (pattern Verdict di Vibe-Trading).
+    """
+
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    violation: str | None = None
 
 # Sinonimi accettati nell'output LLM per la direzione dell'ordine.
 _SHORT_WORDS = {"short", "sell", "vendi", "ribasso", "bear", "down", "corto"}
@@ -59,6 +84,11 @@ def parse_actions(raw: str) -> list[dict[str, Any]]:
         except (KeyError, TypeError, ValueError):
             size_pct = None
         raw_dir = item.get("direction", item.get("side"))
+        confidence: float | None
+        try:
+            confidence = min(max(float(item["confidence"]), 0.0), 1.0)
+        except (KeyError, TypeError, ValueError):
+            confidence = None
         actions.append(
             {
                 "action": action,
@@ -70,6 +100,8 @@ def parse_actions(raw: str) -> list[dict[str, Any]]:
                     else (normalize_direction(raw_dir, "") or None)
                 ),
                 "size_pct": size_pct,
+                "rating": normalize_rating(item.get("rating")),
+                "confidence": confidence,
                 "reason": str(item.get("reason") or ""),
             }
         )
@@ -143,10 +175,16 @@ def enforce(
             continue
         if open_positions + len(planned) + 1 > max_positions:
             continue
+        rating = act.get("rating")
+        if rating == "hold":
+            continue  # astensione esplicita sul simbolo
         size_pct = act["size_pct"] if act["size_pct"] and act["size_pct"] > 0 else 25.0
         # size_pct è riferita al cash che l'agente vedeva nel prompt (quello
         # iniziale del ciclo); la disponibilità residua fa solo da tetto.
-        requested = max(cash, 0.0) * min(size_pct, 100.0) / 100.0 * scale
+        # Il rating moderato (overweight/underweight) riduce la size: la forza
+        # del giudizio fa parte del verdetto, non è un filtro esterno.
+        rating_scale = RATING_SIZE.get(rating, 1.0)
+        requested = max(cash, 0.0) * min(size_pct, 100.0) / 100.0 * scale * rating_scale
         spendable = max(cash_left - reserve, 0.0)
         amount = round(min(requested, max_amount, spendable), 2)
         if amount < MIN_ORDER_USD:
@@ -241,7 +279,12 @@ def build_prompt(
         f"MERCATO ADESSO ({INLINE_PREAMBLE}):\n{market_text}\n\n"
         "Decidi le azioni di questo ciclo. Rispondi SOLO con un array JSON "
         '[{"action": "open|close", "symbol": "...", "direction": "long|short", '
-        '"size_pct": <float % del cash da impiegare>, "reason": "..."}]. '
+        '"size_pct": <float % del cash da impiegare>, '
+        '"rating": "buy|overweight|hold|underweight|sell", '
+        '"confidence": <float 0-1>, "reason": "..."}]. '
+        'Il rating esprime la forza del giudizio: "buy"/"sell" = convinzione '
+        'piena, "overweight"/"underweight" = moderata (size ridotta), "hold" = '
+        "astensione su quel simbolo. Riserva hold ai casi davvero bilanciati. "
         'Sulle chiusure "direction" è opzionale (omessa = chiudi tutto quel '
         "simbolo). Array vuoto [] se davvero non vuoi fare nulla."
     )
@@ -253,11 +296,21 @@ def decide(
     model: str,
     max_tokens: int,
     prompt: str,
-) -> list[dict[str, Any]]:
-    """Chiama l'LLM e ritorna le azioni normalizzate; [] su qualunque errore."""
+) -> DecisionOutcome:
+    """Chiama l'LLM e ritorna azioni normalizzate + eventuale violazione.
+
+    Nessuna azione su errore, MAI un'eccezione; la violazione di contratto
+    (LLM giù, risposta senza JSON) viene segnalata al chiamante perché
+    finisca a giornale invece di sembrare un'astensione.
+    """
     try:
         raw = llm(system_blocks=[], user_prompt=prompt, model=model, max_tokens=max_tokens)
     except Exception as exc:
         logger.warning("trader: chiamata LLM fallita: %s", exc)
-        return []
-    return parse_actions(raw)
+        return DecisionOutcome(violation=f"llm_error: {exc}")
+    try:
+        extract_json(raw)
+    except ValueError:
+        logger.warning("trader: risposta LLM senza JSON valido")
+        return DecisionOutcome(violation="invalid_json")
+    return DecisionOutcome(actions=parse_actions(raw))

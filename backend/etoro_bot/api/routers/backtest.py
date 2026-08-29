@@ -7,10 +7,11 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
 from etoro_bot.api import dependencies as deps
 from etoro_bot.api import schemas
-from etoro_bot.api.dependencies import UserIdentity, current_user
+from etoro_bot.api.dependencies import UserIdentity, current_user, require_owner
 
 log = logging.getLogger("etoro_bot.api")
 
@@ -116,3 +117,43 @@ def backtest_trades(identity: UserIdentity = Depends(current_user)) -> dict[str,
 @router.get("/backtest/monthly-returns", response_model=schemas.MonthlyReturnsResponse)
 def backtest_monthly_returns(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
     return {"rows": _backtest_service(identity).monthly_returns()}
+
+
+class ReplayRequest(BaseModel):
+    dna: dict[str, Any] | None = None   # None = DNA del campione corrente
+    symbols: list[str] | None = None    # None = watchlist (troncata a 15)
+    days: int = 60
+    starting_capital_usd: float = 10_000.0
+
+
+@router.post("/backtest/replay")
+def backtest_replay(
+    payload: ReplayRequest | None = None,
+    identity: UserIdentity = Depends(current_user),
+) -> dict[str, Any]:
+    """Replay storico di un DNA con lo stesso engine dell'arena (fase 1.2).
+
+    Sincrono e potenzialmente lento (una chiamata LLM per bar): pensato per
+    valutazioni una tantum dalla UI, non per polling.
+    """
+    from etoro_bot.arena.replay import run_replay
+    from etoro_bot.services.deps import build_arena_deps
+
+    require_owner(identity, "lanciare un replay storico")
+    payload = payload or ReplayRequest()
+    repo = deps.get_repo()
+    arena_deps = build_arena_deps(repo)
+    dna = payload.dna
+    if dna is None:
+        champion = repo.champion()
+        if champion is None:
+            return {"error": "nessun campione e nessun dna fornito"}
+        dna = champion.dna
+    symbols = payload.symbols or [
+        str(s).upper() for s in (arena_deps.settings.get("watchlist") or [])
+    ][:15]
+    return run_replay(
+        arena_deps, dna, symbols,
+        days=max(30, min(payload.days, 250)),
+        starting_capital_usd=payload.starting_capital_usd,
+    )

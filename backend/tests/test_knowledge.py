@@ -195,7 +195,9 @@ def test_knowledge_base_degraded_no_exceptions():
     kb.add_trade_memory("trade", {"pnl": 1.0})
     assert kb.search_trade_memory("query") == []
     assert kb.purge_old_news(45) == 0
-    assert kb.status() == {"qdrant_up": False, "collections": {}}
+    st = kb.status()
+    assert st.get("arango_up") is False or st.get("qdrant_up") is False
+    assert st.get("collections") == {}
 
 
 # -- (e) un feed che fallisce non interrompe gli altri ------------------------
@@ -224,3 +226,31 @@ def test_fetch_all_feed_failure_continues(monkeypatch):
     assert len(items) == 2  # solo il feed sano; quello rotto non ha interrotto
     assert all(item["tickers"] == ["AAPL"] for item in items)
     assert all(item["source"] == "feed-ok.invalid" for item in items)
+
+
+# -- (f) Financial Knowledge Graph & Tassonomia ------------------------------
+
+
+def test_taxonomy_consistency():
+    from etoro_bot.knowledge.taxonomy import DEFAULT_MARKET_NODES, DEFAULT_MARKET_EDGES
+
+    node_ids = {n["id"] for n in DEFAULT_MARKET_NODES}
+    assert "NVDA" in node_ids
+    assert "TSM" in node_ids
+    assert "sector_semi" in node_ids
+    assert "macro_rates" in node_ids
+
+    for edge in DEFAULT_MARKET_EDGES:
+        assert edge["from"] in node_ids, f"Nodo 'from' {edge['from']} mancante in tassonomia"
+        assert edge["to"] in node_ids, f"Nodo 'to' {edge['to']} mancante in tassonomia"
+        assert edge["relation"] in ("BELONGS_TO", "SUPPLIER_OF", "COMPETITOR_OF", "IMPACTS", "CORRELATED_WITH")
+
+
+def test_get_ticker_graph_context_degraded():
+    kb = KnowledgeBase(url="http://host-inesistente.invalid:1")
+    ctx = kb.get_ticker_graph_context("NVDA")
+    assert ctx["symbol"] == "NVDA"
+    assert ctx["competitors"] == []
+    assert ctx["suppliers"] == []
+    assert ctx["cross_asset_news"] == []
+    assert ctx["summary_hint"] == ""

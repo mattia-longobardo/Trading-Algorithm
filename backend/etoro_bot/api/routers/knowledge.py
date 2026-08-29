@@ -40,6 +40,28 @@ def knowledge_status(identity: UserIdentity = Depends(current_user)) -> dict[str
     return st
 
 
+@router.get("/knowledge/graph")
+def knowledge_graph(identity: UserIdentity = Depends(current_user)) -> dict[str, Any]:
+    """Ritorna lo stato e la panoramica del Financial Knowledge Graph."""
+    kb = deps.kb()
+    st = kb.status()
+    return {
+        "enabled": bool(st.get("graph")),
+        "graph_name": st.get("graph"),
+        "search_view": st.get("search_view"),
+        "collections": st.get("collections", {}),
+    }
+
+
+@router.get("/knowledge/graph/{symbol}")
+def knowledge_ticker_graph(
+    symbol: str, identity: UserIdentity = Depends(current_user)
+) -> dict[str, Any]:
+    """Ritorna il sub-grafo causale e le news collegate per un ticker specifico."""
+    kb = deps.kb()
+    return kb.get_ticker_graph_context(symbol, max_depth=1, news_limit=3)
+
+
 class RssFeedsBody(BaseModel):
     feeds: list[str]
 

@@ -101,3 +101,53 @@ def test_all_memories_sorted():
         [_item("news su Microsoft", ["MSFT"]), _item("news su Apple", ["AAPL"])], NO_LLM
     )
     assert [m["ticker"] for m in tm.all_memories()] == ["AAPL", "MSFT"]
+
+
+# ------------------------------------------------------------- decay (2.7)
+
+
+def test_entry_weight_halves_at_half_life():
+    from etoro_bot.knowledge.ticker_memory import entry_weight
+
+    now = 1_000_000.0
+    fresh = {"ts": now}
+    old = {"ts": now - 14 * 86400}
+    assert entry_weight(fresh, now) == 1.0
+    assert abs(entry_weight(old, now) - 0.5) < 1e-9
+
+
+def test_entry_weight_access_boost_beats_recency():
+    from etoro_bot.knowledge.ticker_memory import entry_weight
+
+    now = 1_000_000.0
+    old_but_used = {"ts": now - 14 * 86400, "access_count": 12}
+    fresh_never_used = {"ts": now - 1 * 86400}
+    assert entry_weight(old_but_used, now) > entry_weight(fresh_never_used, now)
+
+
+def test_memory_context_records_access(tmp_path, monkeypatch):
+    import json as _json
+    import time as _time
+
+    monkeypatch.setenv("STATE_DIR", str(tmp_path))
+    from etoro_bot.knowledge.ticker_memory import load_memory, memory_context
+
+    path = tmp_path / "ticker_memory"
+    path.mkdir()
+    now = _time.time()
+    (path / "AAPL.json").write_text(_json.dumps({
+        "ticker": "AAPL", "summary": "sintesi",
+        "entries": [
+            {"id": "a", "ts": now - 3600, "date": "2026-08-29", "text": "news 1"},
+            {"id": "b", "ts": now - 7200, "date": "2026-08-29", "text": "news 2"},
+        ],
+    }), encoding="utf-8")
+
+    class NoKB:
+        available = False
+
+    text = memory_context("AAPL", kb=NoKB())
+    assert "news 1" in text
+    memory = load_memory("AAPL")
+    counts = {e["id"]: e.get("access_count", 0) for e in memory["entries"]}
+    assert counts == {"a": 1, "b": 1}

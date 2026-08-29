@@ -294,6 +294,11 @@ def _start_scheduler() -> None:
                 llm=system_llm(),
             )
             mark_fetch(UserIdentity("system"))
+            # Kronos: inferenza giornaliera fuori dal percorso critico del
+            # ciclo; no-op se disabilitato o senza l'extra torch installato.
+            from etoro_bot.forecast.kronos import refresh_forecasts
+
+            refresh_forecasts(system_etoro_client(), full_settings())
 
         start_scheduler(
             get_settings=full_settings,

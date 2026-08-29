@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from etoro_bot.arena.dna import clamp_dna, risk_close_reason
-from etoro_bot.arena.engine import ArenaDeps
+from etoro_bot.arena.engine import ArenaDeps, active_mandate
 from etoro_bot.arena.trader import LONG, SHORT, build_prompt, decide, enforce
 from etoro_bot.domain import (
     ExecutionResult,
@@ -46,6 +46,7 @@ from etoro_bot.domain import (
     order_request_id,
 )
 from etoro_bot.safety.kill_switch import kill_switch_active
+from etoro_bot.safety.mandate import check_open
 
 logger = logging.getLogger(__name__)
 
@@ -1056,7 +1057,25 @@ def _run_live_cycle_locked(
         ],
         market_view=[str(r.get("view", s)) for s, r in market.items()],
     )
-    actions = decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens, prompt=prompt)
+    from etoro_bot.arena.grounding import grounded_decide
+    from etoro_bot.arena.pipeline import pipeline_enabled, run_pipeline
+
+    if pipeline_enabled(deps.settings):
+        outcome = run_pipeline(
+            deps.llm, settings=deps.settings, max_tokens=deps.max_tokens,
+            trader_prompt=prompt, market=market,
+            held={p.symbol for p in positions},
+            journal=lambda stage, payload: deps.repo.add_decision(
+                run_id, "?", stage, payload
+            ),
+        )
+    else:
+        outcome = grounded_decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
+                                  prompt=prompt, market=market)
+    if outcome.violation:
+        # contratto rotto ≠ astensione: a giornale, visibile in UI
+        deps.repo.add_decision(run_id, "?", "trader", {"violation": outcome.violation})
+    actions = outcome.actions
     opens, closes = enforce(
         actions, dna=dna, cash=cash, equity=equity,
         held_symbols={p.symbol for p in positions}, market=market,
@@ -1095,9 +1114,45 @@ def _run_live_cycle_locked(
     # potrebbe già essere a mercato senza comparire nel registry. Con
     # allow_pyramiding attivo held_symbols non basta a fermare il doppione.
     unresolved_symbols = set(reconciled.get("unresolved_symbols") or ())
+    # Mandate pre-trade: policy di sistema da risk_rules.yaml, fuori dalla
+    # portata dell'LLM. Rifiuto = riga REJECTED a giornale, mai un'eccezione.
+    mandate = active_mandate(deps)
+    total_exposure = sum(float(p.amount_usd) for p in positions)
+    symbol_exposure: dict[str, float] = {}
+    for p in positions:
+        symbol_exposure[p.symbol] = symbol_exposure.get(p.symbol, 0.0) + float(p.amount_usd)
+    # ponytail: aperture odierne contate dal registry (posizioni ancora aperte);
+    # le chiusure intraday non contano — basta finché il cap non è stretto.
+    opens_today = sum(
+        1 for p in positions
+        if p.opened_at is not None and p.opened_at.date() == now.date()
+    )
     for order in opens:
         if kill_switch_active() or blocks_openings:
             executed["blocked"] += 1
+            continue
+        denied = check_open(
+            mandate,
+            symbol=order["symbol"],
+            amount_usd=float(order["amount_usd"]),
+            equity_usd=equity,
+            total_exposure_usd=total_exposure,
+            symbol_exposure_usd=symbol_exposure.get(order["symbol"], 0.0),
+            opens_today=opens_today,
+            stop_loss_pct=float(dna["stop_loss_pct"]),
+        )
+        if denied is not None:
+            executed["blocked"] += 1
+            deps.repo.add_execution(
+                run_id,
+                ExecutionResult(
+                    symbol=order["symbol"],
+                    side=Side.SELL if order.get("direction") == SHORT else Side.BUY,
+                    amount_usd=order["amount_usd"],
+                    status=ExecutionStatus.REJECTED,
+                    detail=f"mandate:{denied}",
+                ),
+            )
             continue
         if order["symbol"] in unresolved_symbols:
             logger.error(
@@ -1113,6 +1168,11 @@ def _run_live_cycle_locked(
             _open_real_position(deps, run_id, order, slot, now,
                                 price=prices.get(order["symbol"]))
             executed["opened"] += 1
+            opens_today += 1
+            total_exposure += float(order["amount_usd"])
+            symbol_exposure[order["symbol"]] = (
+                symbol_exposure.get(order["symbol"], 0.0) + float(order["amount_usd"])
+            )
         except ShortNotSupported as exc:
             # niente conversione silenziosa in long: l'ordine non parte e resta
             # a giornale come saltato, così il limite è visibile.
@@ -1263,8 +1323,17 @@ def _run_live_eod_locked(
         }
         exposure = sum(live_position_value(p, prices.get(p.symbol)) for p in positions)
         deps.repo.record_equity_snapshot(now.date(), cash + exposure, cash, exposure)
+        # decay state machine del campione (fase 4.1): valutata sui dati reali
+        # appena scritti; un edge decaduto spegne il live, non aspetta il mese.
+        try:
+            from etoro_bot.arena.champion_health import evaluate_champion_health
+
+            health = evaluate_champion_health(deps, deps.settings)
+        except Exception as exc:
+            logger.warning("live: valutazione salute campione fallita: %s", exc)
+            health = None
         return {"snapshot": True, "equity_usd": round(cash + exposure, 2),
-                "settled": settled}
+                "settled": settled, "champion_health": health}
     except Exception as exc:
         logger.warning("live: snapshot equity fallito: %s", exc)
         return {"snapshot": False, "settled": settled}

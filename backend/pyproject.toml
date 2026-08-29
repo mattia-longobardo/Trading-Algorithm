@@ -18,6 +18,7 @@ dependencies = [
     "alembic>=1.13",
     "python-multipart>=0.0.9",
     "cryptography>=45.0",
+    "python-arango>=8.0",
 ]
 
 [project.optional-dependencies]
@@ -26,8 +27,17 @@ api = [
     "uvicorn[standard]>=0.29",
     "apscheduler>=3.10",
 ]
+# Kronos (forecast/vendor): opzionale perché torch pesa ~2GB sull'immagine.
+forecast = [
+    "torch>=2.0",
+    "pandas>=2.2",
+    "einops>=0.8",
+    "huggingface_hub>=0.23",
+    "safetensors>=0.4",
+    "tqdm>=4",
+]
 rag = [
-    "qdrant-client>=1.9",
+    "python-arango>=8.0",
     "fastembed>=0.3",
     "python-docx>=1.1",
     "python-pptx>=1.0",
@@ -49,3 +59,5 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# codice vendorizzato (Kronos, MIT): non nostro, non si linta
+extend-exclude = ["etoro_bot/forecast/vendor"]

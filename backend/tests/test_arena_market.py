@@ -93,3 +93,58 @@ def test_snapshot_closed_markets_includes_everything_when_requested():
     assert build_snapshot(_client(), SETTINGS, now=night) == {}
     snap = build_snapshot(_client(), SETTINGS, now=night, only_open=False)
     assert set(snap) == {"AAPL", "ENEL.MI"}
+
+
+# ------------------------------------------------------------------ indicatori
+
+
+def _mk_candles(closes, high_off=1.0, low_off=1.0, volume=1000.0):
+    return [
+        {"close": c, "high": c + high_off, "low": c - low_off, "volume": volume}
+        for c in closes
+    ]
+
+
+def test_indicators_from_candles_flat_series():
+    from etoro_bot.arena.market import indicators_from_candles
+
+    candles = _mk_candles([100.0] * 25)
+    ind = indicators_from_candles(100.0, candles)
+    # serie piatta con range 2: ATR = 2% del prezzo, RSI neutro, vol nulla
+    assert ind["atr14_pct"] == 2.0
+    assert ind["rsi14"] == 50.0
+    assert ind["vol20_pct"] == 0.0
+    assert ind["volume_rel"] == 1.0
+
+
+def test_indicators_from_candles_uptrend_rsi_high():
+    from etoro_bot.arena.market import indicators_from_candles
+
+    closes = [100.0 + i for i in range(25)]
+    ind = indicators_from_candles(closes[-1], _mk_candles(closes))
+    assert ind["rsi14"] == 100.0
+    assert ind["vol20_pct"] is not None and ind["vol20_pct"] > 0
+
+
+def test_indicators_from_candles_volume_spike():
+    from etoro_bot.arena.market import indicators_from_candles
+
+    candles = _mk_candles([100.0] * 25)
+    candles[-1]["volume"] = 3000.0
+    ind = indicators_from_candles(100.0, candles)
+    assert ind["volume_rel"] == 3.0
+
+
+def test_indicators_from_candles_short_history_is_none():
+    from etoro_bot.arena.market import indicators_from_candles, indicators_view
+
+    ind = indicators_from_candles(100.0, _mk_candles([100.0] * 5))
+    assert ind == {"atr14_pct": None, "rsi14": None, "vol20_pct": None, "volume_rel": None}
+    assert indicators_view(ind) == ""
+
+
+def test_snapshot_view_includes_indicators():
+    overlap = datetime(2026, 7, 27, 14, 0, tzinfo=timezone.utc)
+    snap = build_snapshot(_client(), SETTINGS, now=overlap)
+    row = snap["AAPL"]
+    assert "atr14_pct" in row and "rsi14" in row

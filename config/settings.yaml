@@ -10,10 +10,48 @@ benchmark_symbol: SPY
 # profitto e davanti al rivale. Lo stato runtime (mese, pausa, live) vive in
 # app_settings sotto la chiave "arena".
 arena:
-  starting_capital_eur: 10000   # budget mensile di ogni agente (convertito in USD)
+  starting_capital_usd: 10000   # budget mensile di ogni agente, in USD (journal USD-nativo)
   cycle_minutes: 15             # un ciclo di decisioni ogni 15 minuti di borsa (era 5)
   max_symbols: 80               # titoli mostrati ai trader per ciclo
   survival_floor_pct: 25        # equity sotto il 25% dell'iniziale = bancarotta immediata (0 = disattivo)
+  # Costi di transazione del conto simulato: senza, il PnL dell'arena (che
+  # decide quale DNA va live con denaro reale) è sistematicamente ottimistico.
+  # Valori prudenti allineati allo screening universo (max spread 1%).
+  costs:
+    spread_pct: 0.2                   # spread pieno; metà applicata per lato
+    fee_usd: 1.0                      # fee fissa per lato
+    short_overnight_pct_per_day: 0.03 # costo per notte degli short sintetici
+  # Walk-forward: il DNA vincitore del mese viene rigiocato in replay storico
+  # out-of-sample prima di diventare campione live. Se fallisce le soglie il
+  # torneo prosegue ma il campione (e quindi il live) resta il precedente.
+  # Pipeline decisionale multi-stadio (TradingAgents): Analyst -> Bull/Bear ->
+  # Trader -> Risk judge. 5 chiamate LLM per agente per ciclo: i candidati
+  # sono pre-filtrati. Disattivata = singola chiamata trader come prima.
+  pipeline:
+    enabled: true
+    candidates: 12
+  # Vivaio evolutivo su replay: al cambio generazione si valutano K varianti
+  # di DNA sullo storico e al mese live vanno le 2 migliori. Costa K replay
+  # con chiamate LLM: attivare quando model_quick è economico.
+  evolution_pool:
+    enabled: false
+    variants: 4
+    days: 45
+    symbols_limit: 15
+  # Decay del campione live (Vibe-Trading): Sharpe/drawdown rolling sotto
+  # soglia per K sere consecutive = monitoring; per 2K = decayed (live off).
+  champion_decay:
+    enabled: true
+    window_days: 30
+    min_sharpe: -0.5
+    max_drawdown_pct: 15
+    breach_days: 3
+  walk_forward:
+    enabled: true
+    days: 60                # finestra storica del replay
+    symbols_limit: 15       # primi N simboli della watchlist (bound sui costi API/LLM)
+    min_return_pct: 0       # ritorno minimo per la promozione
+    max_drawdown_pct: 30    # drawdown massimo tollerato
   # Sessioni di borsa (UTC, orari estivi). A fine sessione si chiudono solo le
   # posizioni che hanno esaurito il max_holding_days del DNA: lo swing resta
   # aperto oltre la campanella.
@@ -141,8 +179,28 @@ knowledge:
     max_entries: 40
     use_llm: true                    # sintesi evolutiva via LLM (fallback: headline)
 
+# Kronos (foundation model per candele, vendorizzato in forecast/vendor):
+# opt-in — richiede `pip install -e backend[forecast]` (torch). Il segnale va
+# usato cross-sezionalmente (kronos_rank) e VALIDATO nel replay prima di
+# dargli peso: zero-shot la precisione direzionale su singolo titolo è debole.
+forecast:
+  kronos:
+    enabled: false
+    model: NeoQuasar/Kronos-small
+    tokenizer: NeoQuasar/Kronos-Tokenizer-base
+    lookback: 200
+    pred_len: 5
+    sample_count: 3
+    max_symbols: 40
+
 llm:
   model: gpt-5.6-terra
+  # Due tier (pattern TradingAgents): quick per analista/dibattito, deep per
+  # trader e risk judge. Assenti = si usa `model` per tutto. Impostare un
+  # modello economico su model_quick è la leva di costo principale della
+  # pipeline (5 chiamate/ciclo/agente invece di 1).
+  # model_quick: <modello economico>
+  # model_deep: <modello di punta>
   max_tokens: 2048
 
 news_feeds:

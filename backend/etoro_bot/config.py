@@ -7,12 +7,15 @@ dal database così che risk/safety restino usabili anche a DB giù.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", Path(__file__).resolve().parents[2] / "config"))
 
@@ -44,6 +47,9 @@ class CircuitBreakerRules:
 def load_breaker_rules() -> CircuitBreakerRules:
     """Regole del circuit breaker (unico freno di sopravvivenza su file)."""
     raw = _load_yaml("risk_rules.yaml")
+    if not raw:
+        # Mai più default silenziosi: il file è policy, la sua assenza va vista.
+        logger.warning("risk_rules.yaml assente o vuoto: circuit breaker con default di codice")
     cb = raw.get("circuit_breaker", {}) or {}
     known = {k: v for k, v in cb.items() if k in CircuitBreakerRules.__dataclass_fields__}
     return CircuitBreakerRules(**known)

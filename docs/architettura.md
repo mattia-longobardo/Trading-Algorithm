@@ -2,17 +2,18 @@
 
 ## Servizi
 
-Quattro container (`docker-compose.yml` alla radice del repo):
+Un solo container (`docker-compose.yml` alla radice del repo): `trading`,
+immagine multi-stage con backend FastAPI :8000 + frontend Next.js :3000 sotto
+un entrypoint coordinato, utente `1000:1000`. Il backend non è raggiungibile da
+fuori: si arriva solo passando dal proxy del frontend (`proxy_public` →
+Traefik), che aggiunge lato server l'identità e il token interno.
 
-| Servizio | Immagine | Rete | Note |
-|---|---|---|---|
-| `trading-postgres` | `postgres:18-alpine` | `trading_internal` | journal, agenti, conti simulati. Volume `./data/postgres` |
-| `trading-qdrant` | `qdrant/qdrant:latest` | `trading_internal` | knowledge base vettoriale. Volume `./data/qdrant` |
-| `trading-backend` | build `./backend` | `trading_internal` | FastAPI :8000 + APScheduler. Non esposto a Traefik |
-| `trading-frontend` | build `./frontend` | `proxy_public`, `trading_internal` | Next.js :3000, unico servizio pubblicato |
+Persistenza su infrastruttura condivisa dello stack `db/` (rete `db_internal`):
 
-Il backend non è raggiungibile da fuori: si arriva solo passando dal proxy del
-frontend, che aggiunge lato server l'identità e il token interno.
+| Servizio | Dove | Uso |
+|---|---|---|
+| PostgreSQL 18 | `postgres:5432` (centrale, DB `trading`) | journal, agenti, conti simulati |
+| ArangoDB 3.12 | `arangodb:8529` (centrale, DB `trading`) | knowledge base: vettori news, full-text, knowledge graph |
 
 ## Moduli del backend
 
@@ -22,17 +23,27 @@ etoro_bot/
 ├── arena/
 │   ├── dna.py             geni, bound, clamp, mutazione (auto-riscrittura LLM)
 │   ├── engine.py          ciclo di trading simulato, bancarotta, riflessione EOD
-│   ├── evolution.py       selezione mensile, morte, clonazione
+│   ├── evolution.py       selezione mensile, walk-forward, vivaio su replay
 │   ├── live.py            ciclo su denaro reale, reconcile, settle, esecuzione
-│   ├── market.py          snapshot di mercato (prezzi, metriche, memoria news)
-│   └── trader.py          costruzione prompt, parsing azioni, enforce contabile
+│   ├── market.py          snapshot (prezzi, indicatori ATR/RSI/vol, memoria news)
+│   ├── trader.py          prompt, rating a 5 livelli, DecisionOutcome, enforce
+│   ├── pipeline.py        Analyst → Bull/Bear → Trader → Risk judge (2 tier LLM)
+│   ├── grounding.py       gate deterministico sull'output (simboli/prezzi)
+│   ├── replay.py          backtest: stesso engine su candele storiche
+│   ├── reflection.py      esiti valutati (ritorno + alpha vs SPY), registro
+│   ├── verdict.py         contratto '## Verdict' machine-readable dell'EOD
+│   └── champion_health.py decay state machine del campione live
+├── forecast/
+│   ├── kronos.py          forecast Kronos (ranking cross-sezionale, opt-in)
+│   └── vendor/            codice modello Kronos vendorizzato (MIT)
 ├── etoro/
 │   ├── client.py          eToro Public API (market-data, trading info, execution)
 │   └── rate_limiter.py    finestra scorrevole per pool, 80% del budget
 ├── knowledge/
 │   ├── fetch_news.py      RSS/Atom con stdlib, via safe_fetch
 │   ├── safe_fetch.py      difesa SSRF + DNS rebinding
-│   ├── kb.py              Qdrant: news_kb, trade_memory, decadimento per recency
+│   ├── kb.py              ArangoDB: news_kb (ibrido BM25+coseno), trade_memory, market_graph
+│   ├── taxonomy.py        seed del knowledge graph (macro, settori, ticker, edge pesati)
 │   ├── ingest.py          upload documenti → chunk → indice
 │   ├── parsers.py         pdf/docx/pptx/xlsx/md/txt
 │   ├── ticker_memory.py   memoria evolutiva per titolo

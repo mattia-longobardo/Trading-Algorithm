@@ -32,6 +32,8 @@ from etoro_bot.arena.dna import (
 )
 from etoro_bot.arena.trader import SHORT, build_prompt, decide, enforce
 from etoro_bot.db.repo import Repository
+from etoro_bot.domain import SimCosts
+from etoro_bot.safety.mandate import Mandate, check_open, load_mandate
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,12 @@ class ArenaDeps:
     llm: Callable[..., str] | None
     model: str
     max_tokens: int
+    # None = policy da config/risk_rules.yaml (fail-closed se assente).
+    mandate: Mandate | None = None
+
+
+def active_mandate(deps: ArenaDeps) -> Mandate:
+    return deps.mandate if deps.mandate is not None else load_mandate()
 
 
 def _utcnow() -> datetime:
@@ -56,6 +64,11 @@ def _utcnow() -> datetime:
 
 def arena_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return settings.get("arena") or {}
+
+
+def sim_costs(settings: dict[str, Any]) -> SimCosts:
+    """Costi di transazione del conto simulato da settings (arena.costs)."""
+    return SimCosts.from_settings(arena_settings(settings))
 
 
 def survival_floor_pct(settings: dict[str, Any]) -> float:
@@ -102,16 +115,20 @@ def position_change_pct(pos, price: float) -> float:
 
 
 def starting_capital_usd(deps: ArenaDeps) -> float:
-    """Budget iniziale in USD dal budget in EUR configurato (default 10.000 €)."""
-    eur = float(arena_settings(deps.settings).get("starting_capital_eur", 10_000))
-    try:
-        from etoro_bot.services.fx import rate_for
+    """Budget iniziale di ogni agente, in USD (default 10.000 $).
 
-        rate = float(rate_for("EUR")) or 1.0  # moltiplicatore USD→EUR
-        return round(eur / rate, 2)
-    except Exception as exc:
-        logger.warning("fx non disponibile, capitale 1:1 in USD: %s", exc)
-        return eur
+    Il capitale è USD-nativo come tutto il journal: la valuta scelta nelle
+    Impostazioni resta di sola presentazione. Configurarlo in EUR e convertirlo
+    una volta sola alla nascita dell'agente lo congelava al cambio di quel
+    giorno, mentre la UI riconverte al cambio corrente: bastava un EUR più
+    forte perché un agente in profitto apparisse sotto il capitale iniziale.
+    """
+    try:
+        return round(
+            float(arena_settings(deps.settings).get("starting_capital_usd", 10_000)), 2
+        )
+    except (TypeError, ValueError):
+        return 10_000.0
 
 
 def agent_equity(agent, positions, prices: dict[str, float]) -> float:
@@ -277,10 +294,12 @@ def _run_training_cycle_locked(
 
 def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
     dna = clamp_dna(agent.dna)
+    costs = sim_costs(deps.settings)
     positions = deps.repo.sim_positions(agent.id)
     for pos, reason in auto_risk_closes(dna, positions, prices):
         deps.repo.close_sim_position(
-            pos.id, effective_price(pos, prices[pos.symbol]), reason
+            pos.id, effective_price(pos, prices[pos.symbol]), reason,
+            costs=costs, now=now,
         )
 
     if deps.llm is not None:
@@ -301,8 +320,28 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             ),
             market_view=[str(r.get("view", s)) for s, r in market.items()],
         )
-        actions = decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
-                         prompt=prompt)
+        from etoro_bot.arena.grounding import grounded_decide
+        from etoro_bot.arena.pipeline import pipeline_enabled, run_pipeline
+
+        if pipeline_enabled(deps.settings):
+            outcome = run_pipeline(
+                deps.llm, settings=deps.settings, max_tokens=deps.max_tokens,
+                trader_prompt=prompt, market=market,
+                held={p.symbol for p in positions},
+                journal=lambda stage, payload: deps.repo.add_arena_event(
+                    "pipeline", {"agent": agent.name, "stage": stage, **payload}
+                ),
+            )
+        else:
+            outcome = grounded_decide(deps.llm, model=deps.model,
+                                      max_tokens=deps.max_tokens,
+                                      prompt=prompt, market=market)
+        if outcome.violation:
+            # contratto rotto ≠ astensione: a giornale, visibile in UI
+            deps.repo.add_arena_event(
+                "contract_violation", {"agent": agent.name, "detail": outcome.violation}
+            )
+        actions = outcome.actions
         opens, closes = enforce(
             actions,
             dna=dna,
@@ -323,16 +362,58 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
                 if wanted and position_direction(pos) != wanted:
                     continue
                 deps.repo.close_sim_position(
-                    pos.id, effective_price(pos, price), close["reason"] or "chiusura"
+                    pos.id, effective_price(pos, price), close["reason"] or "chiusura",
+                    costs=costs, now=now,
                 )
+        # Mandate pre-trade (policy di sistema, non negoziabile dall'agente):
+        # esposizioni ricalcolate DOPO le chiusure del ciclo.
+        mandate = active_mandate(deps)
+        open_positions = deps.repo.sim_positions(agent.id)
+        total_exposure = sum(float(p.amount_usd) for p in open_positions)
+        symbol_exposure: dict[str, float] = {}
+        for p in open_positions:
+            symbol_exposure[p.symbol] = symbol_exposure.get(p.symbol, 0.0) + float(p.amount_usd)
+        today = now.date()
+        # ponytail: conteggio aperture odierne = posizioni aperte oggi + trade
+        # aperti oggi tra gli ultimi 200; basta finché un agente non fa
+        # centinaia di trade al giorno.
+        opens_today = sum(1 for p in open_positions if p.opened_at.date() == today) + sum(
+            1
+            for t in deps.repo.sim_trades(agent.id, limit=200)
+            if t.opened_at is not None and t.opened_at.date() == today
+        )
         for order in opens:
             price = prices.get(order["symbol"])
-            if price:
-                deps.repo.open_sim_position(
-                    agent.id, order["symbol"], order["instrument_id"],
-                    order["amount_usd"], price, order["reason"],
-                    opened_at=now,
-                    direction=order["direction"],
+            if not price:
+                continue
+            denied = check_open(
+                mandate,
+                symbol=order["symbol"],
+                amount_usd=float(order["amount_usd"]),
+                equity_usd=equity,
+                total_exposure_usd=total_exposure,
+                symbol_exposure_usd=symbol_exposure.get(order["symbol"], 0.0),
+                opens_today=opens_today,
+                stop_loss_pct=float(dna["stop_loss_pct"]),
+            )
+            if denied is not None:
+                deps.repo.add_arena_event(
+                    "order_denied",
+                    {"agent": agent.name, "symbol": order["symbol"],
+                     "amount_usd": order["amount_usd"], "reason": denied},
+                )
+                continue
+            if deps.repo.open_sim_position(
+                agent.id, order["symbol"], order["instrument_id"],
+                order["amount_usd"], price, order["reason"],
+                opened_at=now,
+                direction=order["direction"],
+                costs=costs,
+            ):
+                opens_today += 1
+                total_exposure += float(order["amount_usd"])
+                symbol_exposure[order["symbol"]] = (
+                    symbol_exposure.get(order["symbol"], 0.0) + float(order["amount_usd"])
                 )
 
     agent = deps.repo.get_agent(agent.id)
@@ -353,12 +434,14 @@ def _enforce_survival_floor(deps: ArenaDeps, agent, equity: float, prices) -> No
     floor = float(agent.starting_capital_usd) * floor_pct / 100.0
     if equity > floor:
         return
+    costs = sim_costs(deps.settings)
     for pos in deps.repo.sim_positions(agent.id):
         price = prices.get(pos.symbol)
         deps.repo.close_sim_position(
             pos.id,
             effective_price(pos, price) if price else float(pos.entry_price),
             "liquidazione per bancarotta",
+            costs=costs,
         )
     reason = (
         f"bancarotta: equity {equity:.2f} USD sotto il pavimento di "
@@ -414,6 +497,7 @@ def close_market_positions(
                 effective_price(pos, price) if price else float(pos.entry_price),
                 f"fine sessione {market_name}: holding massimo raggiunto "
                 f"({held}/{max_days} giorni)",
+                costs=sim_costs(deps.settings), now=now,
             )
             closed += 1
     return {"closed": closed, "market": market_name}
@@ -458,23 +542,46 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
         diary = diary[len(creed):].strip()
     lesson = ""
     if deps.llm is not None:
+        from etoro_bot.arena.reflection import (
+            append_outcomes,
+            outcomes_view,
+            past_context,
+            spy_closes,
+            trade_outcomes,
+        )
+
         trades = deps.repo.sim_trades(agent.id, limit=20)
-        trades_text = "\n".join(
-            f"- {t.symbol}: {t.pnl_usd:+.2f} USD ({t.close_reason})" for t in trades
-        ) or "(nessun trade oggi)"
+        # esiti VALUTATI (ritorno % + alpha vs SPY): il diario impara da numeri
+        # verificati, non dalla propria prosa (pattern TradingAgents Reflector)
+        today_trades = [
+            t for t in trades
+            if t.closed_at is not None and t.closed_at.date() == now.date()
+        ]
+        outcomes = trade_outcomes(today_trades, spy_closes(deps.client))
+        append_outcomes(agent.id, outcomes)
+        from etoro_bot.arena.reflection import index_trade_memory
+
+        index_trade_memory(agent.name, outcomes)
+        history = past_context(agent.id)
+        trades_text = outcomes_view(outcomes)
         pnl_month = agent.cash_usd - agent.starting_capital_usd
         prompt = (
             f"Sei {agent.name}. Giornata chiusa con PnL {day_pnl:+.2f} USD; "
             f"PnL del mese {pnl_month:+.2f} USD. La tua vita dipende dal profitto: "
             f"a fine mese, se non sei in positivo e davanti al rivale, muori.\n"
-            f"Trade recenti:\n{trades_text}\n\n"
-            f"Diario attuale:\n{diary or '(vuoto)'}\n\n"
+            f"Esiti valutati di oggi (alpha = quanto hai battuto SPY):\n{trades_text}\n\n"
+            + (f"Esiti recenti dal registro:\n{history}\n\n" if history else "")
+            + f"Diario attuale:\n{diary or '(vuoto)'}\n\n"
             "Aggiorna il diario: massimo 10 punti, conserva solo le lezioni che "
             "aumentano il profitto di domani. Sei libero di rinnegare qualunque "
             "regola che ti sei dato: puoi cambiare direzione preferita (long o "
             "short), orizzonte (intraday o swing), frequenza e size, e riscrivere "
             "la tua strategia da capo. Se hai operato poco, annota che l'inerzia "
-            "ti sta uccidendo. Rispondi solo col diario."
+            "ti sta uccidendo.\n\n"
+            "Chiudi la risposta con la sezione `## Verdict`: una riga "
+            "`- SIMBOLO: BUY|SELL|HOLD|AVOID|EXIT - motivo` per ogni call che "
+            "porti a domani (sezione vuota = nessuna call). Formato esatto, "
+            "verrà letto da una macchina."
         )
         try:
             lesson = deps.llm(
@@ -483,6 +590,21 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
             ).strip()
         except Exception as exc:
             logger.warning("arena: riflessione fallita per %s: %s", agent.name, exc)
+        if lesson:
+            # contratto Verdict (Vibe-Trading): parse rigido, malformato =
+            # violazione a giornale; il diario si salva comunque senza sezione.
+            from etoro_bot.arena.verdict import extract_verdict
+
+            lesson, verdicts, verdict_violation = extract_verdict(lesson)
+            if verdict_violation is not None:
+                deps.repo.add_arena_event(
+                    "contract_violation",
+                    {"agent": agent.name, "detail": f"eod_{verdict_violation}"},
+                )
+            else:
+                deps.repo.add_arena_event(
+                    "eod_verdict", {"agent": agent.name, "verdicts": verdicts}
+                )
     new_diary = lesson or diary
     memory = f"{creed}\n\nDIARIO:\n{new_diary}".strip()
     deps.repo.update_agent_memory(agent.id, memory[:MEMORY_MAX_CHARS])
