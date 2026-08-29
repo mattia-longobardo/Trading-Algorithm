@@ -237,6 +237,12 @@ def build_snapshot(
             **ind,
             "view": view,
         }
+    try:
+        from etoro_bot.forecast.kronos import annotate_snapshot
+
+        annotate_snapshot(snapshot)  # no-op senza forecast in cache
+    except Exception as exc:
+        logger.debug("kronos: annotazione snapshot saltata: %s", exc)
     return snapshot
 
 
