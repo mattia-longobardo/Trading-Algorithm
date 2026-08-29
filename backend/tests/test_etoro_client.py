@@ -8,6 +8,15 @@ import uuid
 import pytest
 
 from etoro_bot.etoro import EtoroClient, EtoroError, RateLimiter
+from etoro_bot.etoro import client as client_module
+
+
+@pytest.fixture(autouse=True)
+def _clear_rates_cache():
+    """La cache dei rates è condivisa a livello di modulo: ogni test parte pulito."""
+    client_module.clear_rates_cache()
+    yield
+    client_module.clear_rates_cache()
 
 
 class FakeResponse:
@@ -224,6 +233,29 @@ def test_get_rates_skips_instruments_without_a_quote():
     ])
     rates = client.get_rates([7, 8])
     assert set(rates) == {8}
+
+
+def test_get_rates_serves_from_shared_cache_within_ttl():
+    """Con ~80 simboli per ciclo il pool market-data (120/60s) va protetto:
+    entro il TTL lo stesso instrumentId non rifà la chiamata HTTP, anche da
+    un'istanza client diversa (la cache è di modulo, come il rate limiter)."""
+    rate_payload = FakeResponse(payload={"rates": [{"instrumentID": 7, "ask": 1.0, "bid": 0.9}]})
+    client, session, _ = make_client([rate_payload])
+    assert client.get_rates([7])[7]["ask"] == 1.0
+    other_client, other_session, _ = make_client([])
+    assert other_client.get_rates([7])[7]["ask"] == 1.0
+    assert len(session.calls) == 1
+    assert other_session.calls == []
+
+
+def test_get_rates_refetches_after_ttl_expiry(monkeypatch):
+    rate_payload = FakeResponse(payload={"rates": [{"instrumentID": 7, "ask": 1.0, "bid": 0.9}]})
+    newer = FakeResponse(payload={"rates": [{"instrumentID": 7, "ask": 2.0, "bid": 1.9}]})
+    client, session, _ = make_client([rate_payload, newer])
+    client.get_rates([7])
+    monkeypatch.setattr(client_module, "_RATES_CACHE_TTL_S", 0.0)
+    assert client.get_rates([7])[7]["ask"] == 2.0
+    assert len(session.calls) == 2
 
 
 def test_get_candles_reads_the_real_payload_shape():

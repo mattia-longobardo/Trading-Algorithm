@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_ARANGO_URL = "http://arangodb:8529"
 DEFAULT_ARANGO_DB = "trading"
 DEFAULT_ARANGO_USER = "root"
-DEFAULT_ARANGO_PASS = "REDACTED-ROTATED"
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 VECTOR_SIZE = 384
@@ -127,15 +126,20 @@ class KnowledgeBase:
     """Accesso unificato a Vettori, Full-text ArangoSearch e Financial Knowledge Graph su ArangoDB."""
 
     def __init__(self, url: str | None = None) -> None:
-        self.url = url or os.environ.get("ARANGO_URL", os.environ.get("QDRANT_URL", DEFAULT_ARANGO_URL))
+        self.url = url or os.environ.get("ARANGO_URL", DEFAULT_ARANGO_URL)
         self.db_name = os.environ.get("ARANGO_DB", DEFAULT_ARANGO_DB)
         self.username = os.environ.get("ARANGO_USER", DEFAULT_ARANGO_USER)
-        self.password = os.environ.get("ARANGO_PASSWORD", DEFAULT_ARANGO_PASS)
+        # Nessun default: il secret arriva solo dall'ambiente. Senza password la KB
+        # degrada a no-op (stesso comportamento di Arango irraggiungibile).
+        self.password = os.environ.get("ARANGO_PASSWORD")
         self.available = False
         self._warned = False
         self._client: Any = None
         self._db: Any = None
         self._embedder: Any = None
+        if not self.password:
+            self._degrade("ARANGO_PASSWORD non impostata: KB disabilitata")
+            return
         try:
             from arango import ArangoClient
 

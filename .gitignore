@@ -43,3 +43,7 @@ backend/*.egg-info/
 backend/.pytest_cache/
 backend/.ruff_cache/
 backend/fx_rates.json
+
+# Stale build artifacts (owned by root, remove with sudo)
+backend/build/
+data/qdrant/
