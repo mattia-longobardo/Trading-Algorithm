@@ -321,9 +321,21 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             market_view=[str(r.get("view", s)) for s, r in market.items()],
         )
         from etoro_bot.arena.grounding import grounded_decide
+        from etoro_bot.arena.pipeline import pipeline_enabled, run_pipeline
 
-        outcome = grounded_decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
-                                  prompt=prompt, market=market)
+        if pipeline_enabled(deps.settings):
+            outcome = run_pipeline(
+                deps.llm, settings=deps.settings, max_tokens=deps.max_tokens,
+                trader_prompt=prompt, market=market,
+                held={p.symbol for p in positions},
+                journal=lambda stage, payload: deps.repo.add_arena_event(
+                    "pipeline", {"agent": agent.name, "stage": stage, **payload}
+                ),
+            )
+        else:
+            outcome = grounded_decide(deps.llm, model=deps.model,
+                                      max_tokens=deps.max_tokens,
+                                      prompt=prompt, market=market)
         if outcome.violation:
             # contratto rotto ≠ astensione: a giornale, visibile in UI
             deps.repo.add_arena_event(
