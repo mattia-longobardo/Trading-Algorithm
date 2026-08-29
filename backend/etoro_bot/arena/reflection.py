@@ -116,6 +116,42 @@ def append_outcomes(agent_id: Any, outcomes: list[dict[str, Any]]) -> None:
         logger.warning("reflection: registro non scrivibile: %s", exc)
 
 
+def index_trade_memory(agent_name: str, outcomes: list[dict[str, Any]]) -> None:
+    """Indicizza gli esiti valutati nella KB (`trade_memory`, mai usata finora).
+
+    La retrieval (`search_trade_memory`) avviene nello stadio Analyst della
+    pipeline decisionale. Degrada a no-op senza ArangoDB.
+    """
+    if not outcomes:
+        return
+    try:
+        from etoro_bot.knowledge.kb import KnowledgeBase
+
+        kb = KnowledgeBase()
+        if not kb.available:
+            return
+        for o in outcomes:
+            alpha = f"{o['alpha_pct']:+.2f}%" if o["alpha_pct"] is not None else "n/d"
+            text = (
+                f"{o['symbol']} {o['direction']}: ritorno {o['ret_pct']:+.2f}%, "
+                f"alpha vs SPY {alpha}, chiusura: {o['close_reason']}"
+            )
+            kb.add_trade_memory(
+                text,
+                {
+                    "agent": agent_name,
+                    "symbol": o["symbol"],
+                    "direction": o["direction"],
+                    "ret_pct": o["ret_pct"],
+                    "alpha_pct": o["alpha_pct"],
+                    "closed_on": o["closed_on"],
+                    "ts": datetime.now(tz=None).timestamp(),
+                },
+            )
+    except Exception as exc:
+        logger.debug("reflection: indicizzazione trade_memory saltata: %s", exc)
+
+
 def past_context(agent_id: Any, limit: int = 8) -> str:
     """Ultime N righe del registro (retrieval deterministico, niente embeddings)."""
     path = _ledger_path(agent_id)
