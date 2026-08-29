@@ -530,17 +530,33 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
         diary = diary[len(creed):].strip()
     lesson = ""
     if deps.llm is not None:
+        from etoro_bot.arena.reflection import (
+            append_outcomes,
+            outcomes_view,
+            past_context,
+            spy_closes,
+            trade_outcomes,
+        )
+
         trades = deps.repo.sim_trades(agent.id, limit=20)
-        trades_text = "\n".join(
-            f"- {t.symbol}: {t.pnl_usd:+.2f} USD ({t.close_reason})" for t in trades
-        ) or "(nessun trade oggi)"
+        # esiti VALUTATI (ritorno % + alpha vs SPY): il diario impara da numeri
+        # verificati, non dalla propria prosa (pattern TradingAgents Reflector)
+        today_trades = [
+            t for t in trades
+            if t.closed_at is not None and t.closed_at.date() == now.date()
+        ]
+        outcomes = trade_outcomes(today_trades, spy_closes(deps.client))
+        append_outcomes(agent.id, outcomes)
+        history = past_context(agent.id)
+        trades_text = outcomes_view(outcomes)
         pnl_month = agent.cash_usd - agent.starting_capital_usd
         prompt = (
             f"Sei {agent.name}. Giornata chiusa con PnL {day_pnl:+.2f} USD; "
             f"PnL del mese {pnl_month:+.2f} USD. La tua vita dipende dal profitto: "
             f"a fine mese, se non sei in positivo e davanti al rivale, muori.\n"
-            f"Trade recenti:\n{trades_text}\n\n"
-            f"Diario attuale:\n{diary or '(vuoto)'}\n\n"
+            f"Esiti valutati di oggi (alpha = quanto hai battuto SPY):\n{trades_text}\n\n"
+            + (f"Esiti recenti dal registro:\n{history}\n\n" if history else "")
+            + f"Diario attuale:\n{diary or '(vuoto)'}\n\n"
             "Aggiorna il diario: massimo 10 punti, conserva solo le lezioni che "
             "aumentano il profitto di domani. Sei libero di rinnegare qualunque "
             "regola che ti sei dato: puoi cambiare direzione preferita (long o "

@@ -542,3 +542,50 @@ def test_starting_capital_is_usd_native(repo):
         )
         == 10_000.0
     )
+
+
+# --------------------------------------------------------- riflessione (2.5)
+
+
+def test_trade_outcomes_alpha_vs_spy():
+    from datetime import date, timedelta
+
+    from etoro_bot.arena.reflection import trade_outcomes
+
+    class T:
+        symbol = "AAPL"
+        direction = "long"
+        amount_usd = 1_000.0
+        pnl_usd = 50.0  # +5%
+        close_reason = "tp"
+        opened_at = NOW - timedelta(days=5)
+        closed_at = NOW
+
+    spy = {
+        (NOW - timedelta(days=5)).date(): 500.0,
+        NOW.date(): 510.0,  # SPY +2% nella stessa finestra
+    }
+    out = trade_outcomes([T()], spy)[0]
+    assert out["ret_pct"] == 5.0
+    assert out["alpha_pct"] == 3.0
+    # short: il benchmark gioca al contrario
+    T.direction = "short"
+    out = trade_outcomes([T()], spy)[0]
+    assert out["alpha_pct"] == 7.0
+    assert isinstance(spy, dict) and date is not None
+
+
+def test_reflection_ledger_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("STATE_DIR", str(tmp_path))
+    from etoro_bot.arena.reflection import append_outcomes, past_context
+
+    outcomes = [
+        {"symbol": "AAPL", "direction": "long", "ret_pct": 5.0,
+         "alpha_pct": 3.0, "close_reason": "tp", "closed_on": "2026-07-27"},
+    ]
+    append_outcomes("agent-1", outcomes)
+    append_outcomes("agent-1", outcomes)
+    text = past_context("agent-1")
+    assert text.count("AAPL") == 2
+    assert "alpha vs SPY +3.00%" in text
+    assert past_context("altro-agente") == ""
