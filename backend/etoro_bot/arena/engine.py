@@ -577,7 +577,11 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
             "regola che ti sei dato: puoi cambiare direzione preferita (long o "
             "short), orizzonte (intraday o swing), frequenza e size, e riscrivere "
             "la tua strategia da capo. Se hai operato poco, annota che l'inerzia "
-            "ti sta uccidendo. Rispondi solo col diario."
+            "ti sta uccidendo.\n\n"
+            "Chiudi la risposta con la sezione `## Verdict`: una riga "
+            "`- SIMBOLO: BUY|SELL|HOLD|AVOID|EXIT - motivo` per ogni call che "
+            "porti a domani (sezione vuota = nessuna call). Formato esatto, "
+            "verrà letto da una macchina."
         )
         try:
             lesson = deps.llm(
@@ -586,6 +590,21 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
             ).strip()
         except Exception as exc:
             logger.warning("arena: riflessione fallita per %s: %s", agent.name, exc)
+        if lesson:
+            # contratto Verdict (Vibe-Trading): parse rigido, malformato =
+            # violazione a giornale; il diario si salva comunque senza sezione.
+            from etoro_bot.arena.verdict import extract_verdict
+
+            lesson, verdicts, verdict_violation = extract_verdict(lesson)
+            if verdict_violation is not None:
+                deps.repo.add_arena_event(
+                    "contract_violation",
+                    {"agent": agent.name, "detail": f"eod_{verdict_violation}"},
+                )
+            else:
+                deps.repo.add_arena_event(
+                    "eod_verdict", {"agent": agent.name, "verdicts": verdicts}
+                )
     new_diary = lesson or diary
     memory = f"{creed}\n\nDIARIO:\n{new_diary}".strip()
     deps.repo.update_agent_memory(agent.id, memory[:MEMORY_MAX_CHARS])

@@ -155,8 +155,37 @@ def _maybe_evolve_locked(deps: ArenaDeps, now: datetime | None) -> dict[str, Any
         parent_id = champion.id if champion else None
         clone_dna = base_dna
 
-    mutant_dna = mutate(base_dna, rng, llm=deps.llm, model=deps.model,
-                        max_tokens=deps.max_tokens)
+    # Vivaio su replay (fase 4.2): N=2 su un mese è statisticamente debole.
+    # Con pool attivo si generano K varianti, si rigiocano sullo storico
+    # (stesso engine, tier LLM configurato) e al mese live vanno le 2 migliori.
+    pool_cfg = (deps.settings.get("arena") or {}).get("evolution_pool") or {}
+    candidates: list[dict[str, Any]] = [clone_dna]
+    pool_size = int(pool_cfg.get("variants", 2)) if pool_cfg.get("enabled") else 2
+    for _ in range(max(pool_size - 1, 1)):
+        candidates.append(
+            mutate(base_dna, rng, llm=deps.llm, model=deps.model,
+                   max_tokens=deps.max_tokens)
+        )
+    if pool_cfg.get("enabled") and len(candidates) > 2 and deps.client is not None:
+        from etoro_bot.arena.replay import run_replay
+
+        symbols = [str(s).upper() for s in deps.settings.get("watchlist") or []]
+        symbols = symbols[: int(pool_cfg.get("symbols_limit", 15))]
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for dna_candidate in candidates:
+            result = run_replay(
+                deps, dna_candidate, symbols,
+                days=int(pool_cfg.get("days", 45)), lock_held=True,
+            )
+            score = float(result.get("return_pct", -999.0)) if "error" not in result else -999.0
+            scored.append((score, dna_candidate))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        candidates = [dna for _, dna in scored[:2]]
+        deps.repo.add_arena_event(
+            "evolution_pool",
+            {"evaluated": len(scored), "scores": [round(s, 2) for s, _ in scored]},
+        )
+    clone_dna, mutant_dna = candidates[0], candidates[1]
     a_id = deps.repo.create_agent(
         f"G{next_gen}-Alfa", next_gen, clone_dna, base_memory, month_now, capital,
         parent_id=parent_id,

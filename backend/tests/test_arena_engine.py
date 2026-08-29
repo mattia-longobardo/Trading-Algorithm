@@ -199,6 +199,56 @@ def test_walk_forward_failure_blocks_champion_promotion(repo, monkeypatch):
     assert champion is not None and champion.id == old_champion_id
 
 
+def test_evolution_pool_promotes_best_replay_variants(repo, monkeypatch):
+    """Con il vivaio attivo, alla nuova generazione vanno i 2 DNA migliori in replay."""
+    from etoro_bot.arena import evolution as evo
+    from etoro_bot.arena import replay as replay_module
+
+    counter = {"n": 0}
+
+    def fake_mutate(base, rng, **kwargs):
+        counter["n"] += 1
+        return clamp_dna({**base, "strategy": f"variante-{counter['n']}"})
+
+    def fake_replay(deps, dna, symbols, **kwargs):
+        # la variante col numero più alto rende di più; il clone (senza tag) 0
+        tag = str(dna.get("strategy") or "")
+        score = float(tag.rsplit("-", 1)[-1]) if tag.startswith("variante-") else 0.0
+        return {"return_pct": score, "max_drawdown_pct": 5.0, "trades": 3}
+
+    monkeypatch.setattr(evo, "mutate", fake_mutate)
+    monkeypatch.setattr(replay_module, "run_replay", fake_replay)
+
+    winner_id = repo.create_agent(
+        "G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0
+    )
+    repo.create_agent("G1-Beta", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    assert repo.open_sim_position(winner_id, "AAPL", 1, 1_000.0, 100.0, "t")
+    pos = repo.sim_positions(winner_id)[0]
+    repo.close_sim_position(pos.id, 120.0, "tp")
+    repo.set_setting("arena", {"month": "2026-07"}, source="test")
+
+    deps = make_deps(
+        repo,
+        settings={
+            "watchlist": ["AAPL"],
+            "arena": {
+                "starting_capital_usd": 10_000,
+                "evolution_pool": {"enabled": True, "variants": 4},
+                "walk_forward": {"enabled": False},
+            },
+        },
+    )
+    deps.client = object()
+    summary = maybe_evolve(deps, now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    assert summary is not None
+    new_agents = {a.name: a for a in repo.alive_agents()}
+    # variante-3 (score 3) e variante-2 (score 2) battono clone e variante-1
+    assert new_agents["G2-Alfa"].dna["strategy"] == "variante-3"
+    assert new_agents["G2-Beta"].dna["strategy"] == "variante-2"
+    assert any(e.event == "evolution_pool" for e in repo.arena_events(limit=20))
+
+
 # ------------------------------------------------------------------ stop/take
 
 
@@ -589,3 +639,54 @@ def test_reflection_ledger_roundtrip(tmp_path, monkeypatch):
     assert text.count("AAPL") == 2
     assert "alpha vs SPY +3.00%" in text
     assert past_context("altro-agente") == ""
+
+
+# --------------------------------------------------------------- verdict (4.3)
+
+
+def test_extract_verdict_roundtrip():
+    from etoro_bot.arena.verdict import extract_verdict
+
+    text = (
+        "diario aggiornato\n- lezione 1\n\n## Verdict\n"
+        "- AAPL: BUY - momentum e volume\n- ENEL.MI: EXIT - tesi invalidata\n"
+    )
+    body, verdicts, violation = extract_verdict(text)
+    assert violation is None
+    assert body == "diario aggiornato\n- lezione 1"
+    assert verdicts == [
+        {"symbol": "AAPL", "state": "BUY", "reason": "momentum e volume"},
+        {"symbol": "ENEL.MI", "state": "EXIT", "reason": "tesi invalidata"},
+    ]
+
+
+def test_extract_verdict_empty_section_is_no_calls():
+    from etoro_bot.arena.verdict import extract_verdict
+
+    body, verdicts, violation = extract_verdict("diario\n\n## Verdict\n")
+    assert violation is None and verdicts == [] and body == "diario"
+
+
+def test_extract_verdict_violations():
+    from etoro_bot.arena.verdict import extract_verdict
+
+    _, verdicts, violation = extract_verdict("solo diario, niente sezione")
+    assert violation == "missing_verdict" and verdicts is None
+    _, verdicts, violation = extract_verdict(
+        "diario\n## Verdict\n- AAPL: COMPRA SUBITO tanto\n"
+    )
+    assert violation == "malformed_verdict" and verdicts is None
+
+
+def test_eod_reflection_journals_verdict(repo):
+    def llm(system_blocks, user_prompt, model, max_tokens):
+        return "nuovo diario\n\n## Verdict\n- AAPL: HOLD - attendo conferma\n"
+
+    deps = make_deps(repo, llm=llm)
+    bootstrap_if_needed(deps, now=NOW)
+    run_eod(deps, now=NOW)
+    events = [e for e in repo.arena_events(limit=50) if e.event == "eod_verdict"]
+    assert events and events[0].payload["verdicts"][0]["symbol"] == "AAPL"
+    agent = repo.alive_agents()[0]
+    assert "## Verdict" not in agent.memory
+    assert "nuovo diario" in agent.memory
