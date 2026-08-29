@@ -34,7 +34,13 @@ from etoro_bot.arena.engine import (
     effective_price,
     sim_costs,
 )
-from etoro_bot.arena.market import MARKET_LABELS, market_of_symbol, metrics_from_closes
+from etoro_bot.arena.market import (
+    MARKET_LABELS,
+    indicators_from_candles,
+    indicators_view,
+    market_of_symbol,
+    metrics_from_closes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,17 +107,22 @@ def snapshot_from_history(
             float(r["close"]) for r in rows[:bar_index] if r.get("close")
         ]
         m = metrics_from_closes(float(price), closes)
+        # stessi indicatori dello snapshot live (parità backtest/live); la
+        # finestra include il bar corrente: al close del bar N i suoi OHLCV
+        # sono noti, il futuro no.
+        ind = indicators_from_candles(float(price), rows[: bar_index + 1])
         market = market_of_symbol(symbol)
         view = (
             f"[{MARKET_LABELS.get(market, market)}] {symbol} {float(price):.2f} | "
             f"oggi {_fmt(m['day_pct'])} | 5g {_fmt(m['week_pct'])} | "
             f"vs SMA20 {_fmt(m['sma20_dist_pct'])}"
-        )
+        ) + indicators_view(ind)
         snapshot[symbol] = {
             "instrument_id": meta.get(symbol, 0),
             "price": float(price),
             "market": market,
             **m,
+            **ind,
             "view": view,
         }
     return snapshot, bar_date
