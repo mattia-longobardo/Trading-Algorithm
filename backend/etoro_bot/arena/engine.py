@@ -547,6 +547,9 @@ def _reflect(deps: ArenaDeps, agent, day_pnl: float, now: datetime) -> None:
         ]
         outcomes = trade_outcomes(today_trades, spy_closes(deps.client))
         append_outcomes(agent.id, outcomes)
+        from etoro_bot.arena.reflection import index_trade_memory
+
+        index_trade_memory(agent.name, outcomes)
         history = past_context(agent.id)
         trades_text = outcomes_view(outcomes)
         pnl_month = agent.cash_usd - agent.starting_capital_usd

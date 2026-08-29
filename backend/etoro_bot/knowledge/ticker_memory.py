@@ -35,7 +35,20 @@ DEFAULTS: dict[str, Any] = {
     "retention_days": 30,
     "max_entries": 40,
     "use_llm": True,
+    # decay di importanza (pattern Vibe-Trading): emivita esponenziale +
+    # boost per gli accessi — una notizia vecchia ma richiamata spesso pesa
+    # più di una fresca mai usata.
+    "half_life_days": 14,
+    "access_boost": 0.1,
 }
+
+
+def entry_weight(entry: dict, now: float, half_life_days: float = 14.0,
+                 access_boost: float = 0.1) -> float:
+    """Peso di una entry: decay esponenziale sull'età × boost degli accessi."""
+    age_days = max(now - float(entry.get("ts") or 0), 0.0) / 86400.0
+    decay = 0.5 ** (age_days / max(half_life_days, 0.1))
+    return decay * (1.0 + access_boost * float(entry.get("access_count") or 0))
 
 _SUMMARY_MAX_WORDS = 150
 _FALLBACK_HEADLINES = 5
@@ -98,12 +111,21 @@ def memory_context(ticker: str, kb: Any | None = None) -> str:
         summary = str(memory.get("summary") or "").strip()
         if summary:
             parts.append(summary)
+        # selezione per PESO (decay a emivita + boost accessi), non per pura
+        # recency; l'accesso viene registrato così le notizie davvero usate
+        # decadono più lentamente.
+        now_ts = time.time()
+        entries = memory.get("entries") or []
+        chosen = sorted(
+            entries, key=lambda e: entry_weight(e, now_ts), reverse=True
+        )[:3]
         latest = [
             f"({e.get('date', '?')}) {str(e.get('text') or '')[:160]}"
-            for e in (memory.get("entries") or [])[-3:]
+            for e in sorted(chosen, key=lambda e: float(e.get("ts") or 0))
         ]
         if latest:
             parts.append("Ultime notizie: " + " | ".join(reversed(latest)))
+            _record_access(ticker, memory, [e.get("id") for e in chosen])
 
     # GraphRAG Context (Settore, Fornitori, Competitor, News correlate)
     try:
@@ -121,6 +143,23 @@ def memory_context(ticker: str, kb: Any | None = None) -> str:
     if not parts:
         return ""
     return sanitize_untrusted("\n".join(parts))
+
+
+def _record_access(ticker: str, memory: dict, entry_ids: list) -> None:
+    """Incrementa access_count delle entry usate in un prompt (best effort)."""
+    path = _memory_file(ticker)
+    if path is None:
+        return
+    try:
+        wanted = set(entry_ids)
+        for e in memory.get("entries") or []:
+            if e.get("id") in wanted:
+                e["access_count"] = int(e.get("access_count") or 0) + 1
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        logger.debug("access_count %s non persistito: %s", ticker, exc)
 
 
 # -- aggiornamento -----------------------------------------------------------
