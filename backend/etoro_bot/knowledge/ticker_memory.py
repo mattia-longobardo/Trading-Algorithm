@@ -83,28 +83,43 @@ def all_memories() -> list[dict]:
     return memories
 
 
-def memory_context(ticker: str) -> str:
-    """Contesto compatto per i prompt: sintesi + ultime headline; "" se assente.
+def memory_context(ticker: str, kb: Any | None = None) -> str:
+    """Contesto compatto per i prompt: sintesi + ultime headline + relazioni del grafo; "" se assente.
 
-    Il contenuto deriva da news esterne: esce già sanificato (marcatori di
+    Il contenuto deriva da news esterne e dal grafo di mercato: esce già sanificato (marcatori di
     ruolo e imperativi di iniezione neutralizzati). Chi lo inserisce in un
     prompt deve comunque delimitarlo — vedi knowledge.untrusted.
     """
     from etoro_bot.knowledge.untrusted import sanitize_untrusted
 
     memory = load_memory(ticker)
-    if not memory:
-        return ""
     parts = []
-    summary = str(memory.get("summary") or "").strip()
-    if summary:
-        parts.append(summary)
-    latest = [
-        f"({e.get('date', '?')}) {str(e.get('text') or '')[:160]}"
-        for e in (memory.get("entries") or [])[-3:]
-    ]
-    if latest:
-        parts.append("Ultime notizie: " + " | ".join(reversed(latest)))
+    if memory:
+        summary = str(memory.get("summary") or "").strip()
+        if summary:
+            parts.append(summary)
+        latest = [
+            f"({e.get('date', '?')}) {str(e.get('text') or '')[:160]}"
+            for e in (memory.get("entries") or [])[-3:]
+        ]
+        if latest:
+            parts.append("Ultime notizie: " + " | ".join(reversed(latest)))
+
+    # GraphRAG Context (Settore, Fornitori, Competitor, News correlate)
+    try:
+        if kb is None:
+            from etoro_bot.knowledge.kb import KnowledgeBase
+            kb = KnowledgeBase()
+        if getattr(kb, "available", False):
+            graph_ctx = kb.get_ticker_graph_context(ticker)
+            hint = graph_ctx.get("summary_hint")
+            if hint:
+                parts.append(f"Contesto di Rete: {hint}")
+    except Exception as exc:
+        logger.debug("Graph context per %s non disponibile: %s", ticker, exc)
+
+    if not parts:
+        return ""
     return sanitize_untrusted("\n".join(parts))
 
 

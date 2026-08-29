@@ -61,23 +61,23 @@ function StatusCards() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <DatabaseIcon className="text-muted-foreground size-4" />
-            Stato Qdrant
+            Stato ArangoDB &amp; Knowledge Graph
           </CardTitle>
           <CardDescription>
-            Vector DB per RAG — se giù, il bot gira senza knowledge base
+            Multi-Model DB &amp; Financial Graph — Vettori, Full-text Search e Relazioni Causali
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
           <div className="flex items-center justify-between">
-            <span className="text-muted-foreground">Qdrant</span>
-            {data.qdrant_up ? (
+            <span className="text-muted-foreground">ArangoDB</span>
+            {data.arango_up || data.qdrant_up ? (
               <Stamp tone="approved">Attivo</Stamp>
             ) : (
               <Stamp tone="rejected">Non raggiungibile</Stamp>
             )}
           </div>
           <div className="flex items-center justify-between">
-            <span className="text-muted-foreground">news_kb</span>
+            <span className="text-muted-foreground">news_kb (Vettori &amp; Fulltext)</span>
             <span className="font-mono tabular-nums">
               {fmtNum(data.collections.news_kb, 0)} documenti
             </span>
@@ -88,6 +88,22 @@ function StatusCards() {
               {fmtNum(data.collections.trade_memory, 0)} documenti
             </span>
           </div>
+          {data.collections.market_nodes !== undefined ? (
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">market_nodes (Grafo)</span>
+              <span className="font-mono tabular-nums">
+                {fmtNum(data.collections.market_nodes, 0)} nodi
+              </span>
+            </div>
+          ) : null}
+          {data.collections.market_edges !== undefined ? (
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">market_edges (Relazioni)</span>
+              <span className="font-mono tabular-nums">
+                {fmtNum(data.collections.market_edges, 0)} archi
+              </span>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -255,9 +271,9 @@ export default function KnowledgePage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="RAG"
+        eyebrow="RAG &amp; GRAPH"
         title="Knowledge base"
-        description="RAG su Qdrant (news_kb, trade_memory) + fonti RSS. La KB è un'aggiunta, mai un requisito."
+        description="RAG &amp; Financial Knowledge Graph su ArangoDB (news_kb, market_graph, trade_memory) + fonti RSS. La KB è un'aggiunta, mai un requisito."
       />
       <StatusCards />
       <IngestCard />

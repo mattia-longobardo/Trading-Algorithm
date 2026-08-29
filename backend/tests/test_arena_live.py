@@ -91,7 +91,7 @@ def open_llm(symbol="AAPL", size_pct=20.0, direction="long"):
 def make_deps(repo, client, llm=None):
     return ArenaDeps(
         repo=repo, client=client,
-        settings={"arena": {"starting_capital_eur": 10_000}},
+        settings={"arena": {"starting_capital_usd": 10_000}},
         llm=llm, model="test-model", max_tokens=512,
     )
 

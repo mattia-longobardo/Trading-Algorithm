@@ -168,17 +168,23 @@ export interface IngestResult {
 }
 
 export interface KnowledgeStatus {
-  qdrant_up: boolean;
+  arango_up?: boolean;
+  qdrant_up?: boolean;
+  graph?: string | null;
+  search_view?: string | null;
   collections: {
-    news_kb: number;
-    trade_memory: number;
+    news_kb?: number;
+    trade_memory?: number;
+    market_nodes?: number;
+    market_edges?: number;
+    [key: string]: number | undefined;
   };
   rss_feeds: string[];
   last_fetch: string | null;
 }
 
 export interface ArenaConfigInfo extends ArenaStateInfo {
-  starting_capital_eur?: number;
+  starting_capital_usd?: number;
   cycle_minutes?: number;
   max_symbols?: number;
   markets?: Record<string, { open_utc?: string; close_utc?: string }>;

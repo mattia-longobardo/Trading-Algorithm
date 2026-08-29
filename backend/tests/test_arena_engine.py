@@ -33,7 +33,7 @@ def make_deps(repo, llm=None, settings=None):
     return ArenaDeps(
         repo=repo,
         client=None,
-        settings={"arena": {"starting_capital_eur": 10_000}, **(settings or {})},
+        settings={"arena": {"starting_capital_usd": 10_000}, **(settings or {})},
         llm=llm,
         model="test-model",
         max_tokens=512,
@@ -366,3 +366,48 @@ def test_agent_equity_marks_open_positions(repo):
     assert agent_equity(agent, positions, {"AAPL": 110.0}) == 1_040.0
     # prezzo mancante: la posizione vale il costo
     assert agent_equity(agent, positions, {}) == 1_000.0
+
+
+def test_new_generation_rebases_capital_to_config(repo):
+    """La nuova generazione nasce col capitale configurato, non con quello dei padri.
+
+    È qui che il capitale si riallinea: gli agenti in corsa tengono la loro
+    base fino a fine mese, i figli ripartono dal valore in `settings`.
+    """
+    a, _b = _finished_month(repo, pnl_a=350.0, pnl_b=80.0)
+    with repo._sf.begin() as s:  # padri nati con una base derivata dal cambio
+        from etoro_bot.db.models import Agent
+
+        for agent_id in (a, _b):
+            s.get(Agent, agent_id).starting_capital_usd = 11_485.01
+
+    maybe_evolve(make_deps(repo), now=NOW)
+
+    new_gen = repo.alive_agents()
+    assert len(new_gen) == 2
+    for child in new_gen:
+        assert child.starting_capital_usd == 10_000.0
+        assert child.cash_usd == 10_000.0
+
+
+def test_starting_capital_is_usd_native(repo):
+    """Il capitale iniziale non passa dal cambio: nasce e resta in USD.
+
+    Regressione: convertendo un budget in EUR al cambio del giorno di nascita,
+    mentre la UI riconverte USD→EUR al cambio corrente, un agente in profitto
+    poteva mostrare un'equity sotto il capitale iniziale dichiarato.
+    """
+    from etoro_bot.arena.engine import starting_capital_usd
+
+    deps = make_deps(repo, settings={"arena": {"starting_capital_usd": 12_345.67}})
+    assert starting_capital_usd(deps) == 12_345.67
+
+    # chiave assente o illeggibile: default 10.000 USD, mai un fallback silenzioso
+    # a un importo diverso da quello configurato.
+    assert starting_capital_usd(make_deps(repo, settings={"arena": {}})) == 10_000.0
+    assert (
+        starting_capital_usd(
+            make_deps(repo, settings={"arena": {"starting_capital_usd": "n/d"}})
+        )
+        == 10_000.0
+    )

@@ -46,6 +46,7 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
+    PYTHONPATH="/app/backend" \
     NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
@@ -58,6 +59,7 @@ COPY --from=backend-builder --chown=1000:1000 /opt/venv /opt/venv
 
 # Copia codice Backend e configurazione alembic
 COPY --chown=1000:1000 backend /app/backend
+RUN pip install --no-cache-dir --no-deps -e /app/backend
 
 # Copia standalone Frontend
 COPY --from=frontend-builder --chown=1000:1000 /app/frontend/public /app/frontend/public
