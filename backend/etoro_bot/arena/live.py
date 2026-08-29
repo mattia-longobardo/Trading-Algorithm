@@ -1323,8 +1323,17 @@ def _run_live_eod_locked(
         }
         exposure = sum(live_position_value(p, prices.get(p.symbol)) for p in positions)
         deps.repo.record_equity_snapshot(now.date(), cash + exposure, cash, exposure)
+        # decay state machine del campione (fase 4.1): valutata sui dati reali
+        # appena scritti; un edge decaduto spegne il live, non aspetta il mese.
+        try:
+            from etoro_bot.arena.champion_health import evaluate_champion_health
+
+            health = evaluate_champion_health(deps, deps.settings)
+        except Exception as exc:
+            logger.warning("live: valutazione salute campione fallita: %s", exc)
+            health = None
         return {"snapshot": True, "equity_usd": round(cash + exposure, 2),
-                "settled": settled}
+                "settled": settled, "champion_health": health}
     except Exception as exc:
         logger.warning("live: snapshot equity fallito: %s", exc)
         return {"snapshot": False, "settled": settled}

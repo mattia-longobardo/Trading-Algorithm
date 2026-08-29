@@ -30,6 +30,22 @@ arena:
   pipeline:
     enabled: true
     candidates: 12
+  # Vivaio evolutivo su replay: al cambio generazione si valutano K varianti
+  # di DNA sullo storico e al mese live vanno le 2 migliori. Costa K replay
+  # con chiamate LLM: attivare quando model_quick è economico.
+  evolution_pool:
+    enabled: false
+    variants: 4
+    days: 45
+    symbols_limit: 15
+  # Decay del campione live (Vibe-Trading): Sharpe/drawdown rolling sotto
+  # soglia per K sere consecutive = monitoring; per 2K = decayed (live off).
+  champion_decay:
+    enabled: true
+    window_days: 30
+    min_sharpe: -0.5
+    max_drawdown_pct: 15
+    breach_days: 3
   walk_forward:
     enabled: true
     days: 60                # finestra storica del replay
