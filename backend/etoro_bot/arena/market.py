@@ -18,7 +18,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 TYPE_IDS = {5: "stock", 6: "etf"}
-CANDLES = 21  # ~1 mese di sedute: bastano per SMA20 e 5 giorni
+CANDLES = 21  # ~1 mese di sedute: bastano per SMA20, ATR14, RSI14 e 5 giorni
 MAX_SYMBOLS = 80  # default se arena.max_symbols non è configurato
 
 # Le candele sono GIORNALIERE: dentro la seduta non cambiano, e con cicli da 5'
@@ -26,7 +26,7 @@ MAX_SYMBOLS = 80  # default se arena.max_symbols non è configurato
 # pool market-data (una chiamata per strumento). Restano in cache per un'ora;
 # i prezzi correnti invece si rileggono sempre.
 _CANDLES_TTL_S = 3600.0
-_candles_cache: dict[int, tuple[float, list[float]]] = {}
+_candles_cache: dict[int, tuple[float, list[dict]]] = {}
 _candles_lock = threading.Lock()
 
 
@@ -36,21 +36,28 @@ def clear_candles_cache() -> None:
         _candles_cache.clear()
 
 
-def _closes(client: Any, instrument_id: int, now_ts: float | None = None) -> list[float]:
-    """Chiusure giornaliere dello strumento, con cache a TTL (vedi sopra)."""
+def _candles(client: Any, instrument_id: int, now_ts: float | None = None) -> list[dict]:
+    """Candele giornaliere complete (OHLCV) dello strumento, con cache a TTL."""
     now_ts = time.monotonic() if now_ts is None else now_ts
     with _candles_lock:
         cached = _candles_cache.get(instrument_id)
         if cached is not None and now_ts - cached[0] < _CANDLES_TTL_S:
             return cached[1]
     try:
-        candles = client.get_candles(instrument_id, interval="OneDay", count=CANDLES)
-        closes = [float(c["close"]) for c in candles if c.get("close")]
+        candles = [
+            c for c in client.get_candles(instrument_id, interval="OneDay", count=CANDLES)
+            if c.get("close")
+        ]
     except Exception:
         return [] if cached is None else cached[1]
     with _candles_lock:
-        _candles_cache[instrument_id] = (now_ts, closes)
-    return closes
+        _candles_cache[instrument_id] = (now_ts, candles)
+    return candles
+
+
+def _closes(client: Any, instrument_id: int, now_ts: float | None = None) -> list[float]:
+    """Chiusure giornaliere dello strumento (dalla stessa cache delle candele)."""
+    return [float(c["close"]) for c in _candles(client, instrument_id, now_ts)]
 
 # Suffissi eToro delle borse europee (symbolFull "ENEL.MI", "SAP.DE", ...).
 # ".US" e ".RTH" sono varianti di quotazione americane; senza punto = USA.
@@ -82,6 +89,57 @@ def metrics_from_closes(price: float, closes: list[float]) -> dict[str, float | 
         sma20 = sum(closes[-20:]) / 20.0
         if sma20:
             out["sma20_dist_pct"] = round((price / sma20 - 1.0) * 100.0, 2)
+    return out
+
+
+def indicators_from_candles(price: float, candles: list[dict]) -> dict[str, float | None]:
+    """Indicatori dal set TradingAgents (pochi e non ridondanti): ATR14 %,
+    RSI14, volatilità realizzata 20g e volume relativo vs media 20g.
+
+    Calcolo puro su candele giornaliere ascendenti; None dove lo storico non
+    basta. Usato sia dallo snapshot live sia dal replay (parità backtest/live).
+    """
+    out: dict[str, float | None] = {
+        "atr14_pct": None, "rsi14": None, "vol20_pct": None, "volume_rel": None,
+    }
+    if not price or not candles:
+        return out
+    closes = [float(c["close"]) for c in candles if c.get("close")]
+
+    # ATR14: true range medio sulle ultime 14 barre, in % del prezzo
+    if len(candles) >= 15:
+        trs = []
+        for prev, cur in zip(candles[-15:-1], candles[-14:]):
+            high = float(cur.get("high") or cur["close"])
+            low = float(cur.get("low") or cur["close"])
+            prev_close = float(prev["close"])
+            trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        out["atr14_pct"] = round(sum(trs) / len(trs) / price * 100.0, 2)
+
+    # RSI14 (media semplice di gain/loss: basta per un segnale di regime)
+    if len(closes) >= 15:
+        deltas = [b - a for a, b in zip(closes[-15:-1], closes[-14:])]
+        gains = sum(d for d in deltas if d > 0) / 14.0
+        losses = sum(-d for d in deltas if d < 0) / 14.0
+        if gains == losses == 0:
+            out["rsi14"] = 50.0
+        else:
+            out["rsi14"] = round(100.0 - 100.0 / (1.0 + gains / losses) if losses else 100.0, 1)
+
+    # Volatilità realizzata: deviazione standard dei ritorni giornalieri (20g), in %
+    if len(closes) >= 21:
+        rets = [b / a - 1.0 for a, b in zip(closes[-21:-1], closes[-20:]) if a]
+        if len(rets) >= 2:
+            mean = sum(rets) / len(rets)
+            var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+            out["vol20_pct"] = round(var**0.5 * 100.0, 2)
+
+    # Volume relativo: ultima barra vs media delle 20 precedenti
+    volumes = [float(c.get("volume") or 0.0) for c in candles]
+    if len(volumes) >= 21 and any(volumes[-21:-1]):
+        avg = sum(volumes[-21:-1]) / 20.0
+        if avg > 0:
+            out["volume_rel"] = round(volumes[-1] / avg, 2)
     return out
 
 
@@ -157,7 +215,10 @@ def build_snapshot(
         price = rate.get("lastExecution") or rate.get("bid") or rate.get("ask")
         if not price:
             continue
-        m = metrics_from_closes(float(price), _closes(client, instrument_id))
+        candles = _candles(client, instrument_id)
+        closes = [float(c["close"]) for c in candles]
+        m = metrics_from_closes(float(price), closes)
+        ind = indicators_from_candles(float(price), candles)
         hint = _memory_hint(symbol)
         market = market_of_symbol(symbol)
         view = (
@@ -165,6 +226,7 @@ def build_snapshot(
             f"oggi {_fmt(m['day_pct'])} | 5g {_fmt(m['week_pct'])} | "
             f"vs SMA20 {_fmt(m['sma20_dist_pct'])}"
         )
+        view += indicators_view(ind)
         if hint:
             view += f" | {hint}"
         snapshot[symbol] = {
@@ -172,6 +234,21 @@ def build_snapshot(
             "price": float(price),
             "market": market,
             **m,
+            **ind,
             "view": view,
         }
     return snapshot
+
+
+def indicators_view(ind: dict[str, float | None]) -> str:
+    """Riga compatta degli indicatori per il prompt; vuota se non calcolabili."""
+    bits = []
+    if ind.get("atr14_pct") is not None:
+        bits.append(f"ATR {ind['atr14_pct']:.1f}%")
+    if ind.get("rsi14") is not None:
+        bits.append(f"RSI {ind['rsi14']:.0f}")
+    if ind.get("vol20_pct") is not None:
+        bits.append(f"vol20g {ind['vol20_pct']:.1f}%")
+    if ind.get("volume_rel") is not None:
+        bits.append(f"volume {ind['volume_rel']:.1f}x")
+    return f" | {' | '.join(bits)}" if bits else ""
