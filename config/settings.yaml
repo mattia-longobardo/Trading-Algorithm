@@ -10,7 +10,7 @@ benchmark_symbol: SPY
 # profitto e davanti al rivale. Lo stato runtime (mese, pausa, live) vive in
 # app_settings sotto la chiave "arena".
 arena:
-  starting_capital_eur: 10000   # budget mensile di ogni agente (convertito in USD)
+  starting_capital_usd: 10000   # budget mensile di ogni agente, in USD (journal USD-nativo)
   cycle_minutes: 15             # un ciclo di decisioni ogni 15 minuti di borsa (era 5)
   max_symbols: 80               # titoli mostrati ai trader per ciclo
   survival_floor_pct: 25        # equity sotto il 25% dell'iniziale = bancarotta immediata (0 = disattivo)

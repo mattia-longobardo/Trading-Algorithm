@@ -97,7 +97,7 @@ def _memory_hint(symbol: str) -> str:
         from etoro_bot.knowledge.untrusted import wrap_untrusted_inline
 
         text = " ".join((memory_context(symbol) or "").split())
-        return wrap_untrusted_inline(text[:160])
+        return wrap_untrusted_inline(text[:220])
     except Exception:
         return ""
 

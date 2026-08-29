@@ -102,16 +102,20 @@ def position_change_pct(pos, price: float) -> float:
 
 
 def starting_capital_usd(deps: ArenaDeps) -> float:
-    """Budget iniziale in USD dal budget in EUR configurato (default 10.000 €)."""
-    eur = float(arena_settings(deps.settings).get("starting_capital_eur", 10_000))
-    try:
-        from etoro_bot.services.fx import rate_for
+    """Budget iniziale di ogni agente, in USD (default 10.000 $).
 
-        rate = float(rate_for("EUR")) or 1.0  # moltiplicatore USD→EUR
-        return round(eur / rate, 2)
-    except Exception as exc:
-        logger.warning("fx non disponibile, capitale 1:1 in USD: %s", exc)
-        return eur
+    Il capitale è USD-nativo come tutto il journal: la valuta scelta nelle
+    Impostazioni resta di sola presentazione. Configurarlo in EUR e convertirlo
+    una volta sola alla nascita dell'agente lo congelava al cambio di quel
+    giorno, mentre la UI riconverte al cambio corrente: bastava un EUR più
+    forte perché un agente in profitto apparisse sotto il capitale iniziale.
+    """
+    try:
+        return round(
+            float(arena_settings(deps.settings).get("starting_capital_usd", 10_000)), 2
+        )
+    except (TypeError, ValueError):
+        return 10_000.0
 
 
 def agent_equity(agent, positions, prices: dict[str, float]) -> float:
