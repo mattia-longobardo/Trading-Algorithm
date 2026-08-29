@@ -163,6 +163,20 @@ knowledge:
     max_entries: 40
     use_llm: true                    # sintesi evolutiva via LLM (fallback: headline)
 
+# Kronos (foundation model per candele, vendorizzato in forecast/vendor):
+# opt-in — richiede `pip install -e backend[forecast]` (torch). Il segnale va
+# usato cross-sezionalmente (kronos_rank) e VALIDATO nel replay prima di
+# dargli peso: zero-shot la precisione direzionale su singolo titolo è debole.
+forecast:
+  kronos:
+    enabled: false
+    model: NeoQuasar/Kronos-small
+    tokenizer: NeoQuasar/Kronos-Tokenizer-base
+    lookback: 200
+    pred_len: 5
+    sample_count: 3
+    max_symbols: 40
+
 llm:
   model: gpt-5.6-terra
   # Due tier (pattern TradingAgents): quick per analista/dibattito, deep per
