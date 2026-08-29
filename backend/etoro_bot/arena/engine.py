@@ -320,8 +320,10 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             ),
             market_view=[str(r.get("view", s)) for s, r in market.items()],
         )
-        outcome = decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
-                         prompt=prompt)
+        from etoro_bot.arena.grounding import grounded_decide
+
+        outcome = grounded_decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
+                                  prompt=prompt, market=market)
         if outcome.violation:
             # contratto rotto ≠ astensione: a giornale, visibile in UI
             deps.repo.add_arena_event(
