@@ -6,6 +6,13 @@
 
 **Data:** 2026-08-29 · **Branch di riferimento:** dev-3.0
 
+> **STATO (2026-08-29): ESEGUITO.** Tutte le fasi implementate su dev-3.0
+> (commit da `90d6edd` a `43f8a36`), 367 test verdi. Restano fuori, come da
+> piano: 3.2 fine-tuning e 3.3 candele sintetiche (solo se il replay
+> giustifica Kronos), tool-calling completo (opzione futura di 2.6),
+> event-bus nautilus (nei non-goal). Kronos e evolution_pool sono opt-in
+> in settings.yaml; il vecchio valore della password Arango va ruotato.
+
 **Obiettivo:** portare il bot da "1 chiamata LLM su 4 scalari + torneo a 2 agenti senza costi di
 transazione" a un sistema con valutazione onesta delle strategie, pipeline decisionale
 multi-stadio, segnali quantitativi veri e guardrail di rischio strutturali — riusando i pattern

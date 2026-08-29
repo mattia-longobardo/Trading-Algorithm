@@ -23,10 +23,19 @@ etoro_bot/
 ├── arena/
 │   ├── dna.py             geni, bound, clamp, mutazione (auto-riscrittura LLM)
 │   ├── engine.py          ciclo di trading simulato, bancarotta, riflessione EOD
-│   ├── evolution.py       selezione mensile, morte, clonazione
+│   ├── evolution.py       selezione mensile, walk-forward, vivaio su replay
 │   ├── live.py            ciclo su denaro reale, reconcile, settle, esecuzione
-│   ├── market.py          snapshot di mercato (prezzi, metriche, memoria news)
-│   └── trader.py          costruzione prompt, parsing azioni, enforce contabile
+│   ├── market.py          snapshot (prezzi, indicatori ATR/RSI/vol, memoria news)
+│   ├── trader.py          prompt, rating a 5 livelli, DecisionOutcome, enforce
+│   ├── pipeline.py        Analyst → Bull/Bear → Trader → Risk judge (2 tier LLM)
+│   ├── grounding.py       gate deterministico sull'output (simboli/prezzi)
+│   ├── replay.py          backtest: stesso engine su candele storiche
+│   ├── reflection.py      esiti valutati (ritorno + alpha vs SPY), registro
+│   ├── verdict.py         contratto '## Verdict' machine-readable dell'EOD
+│   └── champion_health.py decay state machine del campione live
+├── forecast/
+│   ├── kronos.py          forecast Kronos (ranking cross-sezionale, opt-in)
+│   └── vendor/            codice modello Kronos vendorizzato (MIT)
 ├── etoro/
 │   ├── client.py          eToro Public API (market-data, trading info, execution)
 │   └── rate_limiter.py    finestra scorrevole per pool, 80% del budget
