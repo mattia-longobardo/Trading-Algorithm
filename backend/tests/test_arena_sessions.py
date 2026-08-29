@@ -22,10 +22,13 @@ MARKET = {
 
 
 def make_deps(repo, client=None):
+    from etoro_bot.safety.mandate import Mandate
+
     return ArenaDeps(
         repo=repo, client=client,
         settings={"arena": {"starting_capital_usd": 10_000}},
         llm=None, model="m", max_tokens=256,
+        mandate=Mandate.unlimited(),
     )
 
 

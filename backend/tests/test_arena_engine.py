@@ -29,7 +29,9 @@ MARKET = {
 }
 
 
-def make_deps(repo, llm=None, settings=None):
+def make_deps(repo, llm=None, settings=None, mandate=None):
+    from etoro_bot.safety.mandate import Mandate
+
     return ArenaDeps(
         repo=repo,
         client=None,
@@ -37,6 +39,7 @@ def make_deps(repo, llm=None, settings=None):
         llm=llm,
         model="test-model",
         max_tokens=512,
+        mandate=mandate or Mandate.unlimited(),
     )
 
 
@@ -126,6 +129,29 @@ def test_training_cycle_applies_costs_from_settings(repo):
     pos = repo.sim_positions(agent.id)[0]
     # entry peggiorata di mezzo spread: units < amount/price
     assert pos.units < pos.amount_usd / 200.0
+
+
+def test_mandate_denies_oversized_open_and_journals_it(repo):
+    from etoro_bot.safety.mandate import Mandate
+
+    deps = make_deps(
+        repo,
+        llm=open_llm("AAPL", size_pct=50.0),  # 5000 USD > cap 2500
+        mandate=Mandate(
+            trading_state="ACTIVE",
+            max_notional_per_order_usd=2_500.0,
+            max_total_exposure_pct=100.0,
+            max_symbol_exposure_pct=100.0,
+            max_orders_per_day=20,
+            min_stop_loss_pct=0.0,
+        ),
+    )
+    bootstrap_if_needed(deps, now=NOW)
+    run_training_cycle(deps, market=MARKET, now=NOW)
+    for agent in repo.alive_agents():
+        assert repo.sim_positions(agent.id) == []
+    events = [e for e in repo.arena_events(limit=50) if e.event == "order_denied"]
+    assert events and events[0].payload["reason"] == "max_notional"
 
 
 def test_sim_costs_from_settings():
