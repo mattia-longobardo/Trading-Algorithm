@@ -12,7 +12,7 @@ services:
       ARANGO_URL: http://arangodb:8529
       ARANGO_DB: trading
       ARANGO_USER: root
-      ARANGO_PASSWORD: ${DB_ARANGO_PASSWORD:-REDACTED-ROTATED}
+      ARANGO_PASSWORD: ${DB_ARANGO_PASSWORD}
       CONFIG_DIR: /app/config
       KILL_SWITCH_DIR: /app/state
       KNOWLEDGE_BASE_DIR: /app/knowledge_base
@@ -23,7 +23,6 @@ services:
       TRADING_CREDENTIALS_SECRET: ${TRADING_CREDENTIALS_SECRET:-${AUTH_SECRET}}
       AUTH_SECRET: ${AUTH_SECRET}
       TRADING_INTERNAL_TOKEN: ${TRADING_INTERNAL_TOKEN}
-      REPORTS_DIR: /app/reports
       BACKEND_URL: http://127.0.0.1:8000
       PORT: 3000
       HOSTNAME: 0.0.0.0
@@ -37,7 +36,6 @@ services:
       - ./config:/app/config:ro
       - ./state:/app/state
       - ./knowledge_base:/app/knowledge_base
-      - ./reports:/app/reports
     restart: unless-stopped
     init: true
     mem_limit: 2g
