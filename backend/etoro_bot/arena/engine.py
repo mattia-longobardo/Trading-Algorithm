@@ -320,8 +320,14 @@ def _agent_cycle(deps: ArenaDeps, agent, market, prices, now: datetime) -> None:
             ),
             market_view=[str(r.get("view", s)) for s, r in market.items()],
         )
-        actions = decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
+        outcome = decide(deps.llm, model=deps.model, max_tokens=deps.max_tokens,
                          prompt=prompt)
+        if outcome.violation:
+            # contratto rotto ≠ astensione: a giornale, visibile in UI
+            deps.repo.add_arena_event(
+                "contract_violation", {"agent": agent.name, "detail": outcome.violation}
+            )
+        actions = outcome.actions
         opens, closes = enforce(
             actions,
             dna=dna,

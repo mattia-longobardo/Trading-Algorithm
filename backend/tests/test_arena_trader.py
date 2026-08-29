@@ -43,13 +43,13 @@ def test_parse_actions_normalizes_and_discards_garbage():
     assert actions == [
         # senza direzione esplicita un'apertura è long
         {"action": "open", "symbol": "AAPL", "direction": "long", "size_pct": 20.0,
-         "reason": "breakout"},
+         "rating": None, "confidence": None, "reason": "breakout"},
         # sinonimi accettati: "ribasso" è uno short
         {"action": "open", "symbol": "NVDA", "direction": "short", "size_pct": 5.0,
-         "reason": "rottura"},
+         "rating": None, "confidence": None, "reason": "rottura"},
         # sulle chiusure la direzione è un filtro opzionale: None = tutte
         {"action": "close", "symbol": "MSFT", "direction": None, "size_pct": None,
-         "reason": "target raggiunto"},
+         "rating": None, "confidence": None, "reason": "target raggiunto"},
     ]
 
 
@@ -151,3 +151,67 @@ def test_enforce_discards_dust_orders():
         held_symbols=set(), market=MARKET,
     )
     assert opens == []
+
+
+# ------------------------------------------------------- rating e violazioni
+
+
+def test_parse_actions_reads_rating_and_confidence():
+    from etoro_bot.arena.trader import parse_actions
+
+    raw = ('[{"action":"open","symbol":"aapl","direction":"long","size_pct":20,'
+           '"rating":"Overweight","confidence":0.7,"reason":"r"}]')
+    act = parse_actions(raw)[0]
+    assert act["rating"] == "overweight"
+    assert act["confidence"] == 0.7
+
+
+def test_enforce_hold_rating_is_abstention():
+    from etoro_bot.arena.trader import enforce
+
+    actions = [{"action": "open", "symbol": "AAPL", "direction": "long",
+                "size_pct": 50.0, "rating": "hold", "confidence": None, "reason": ""}]
+    opens, _ = enforce(
+        actions, dna=DNA, cash=10_000.0, equity=10_000.0,
+        held_symbols=set(), market=MARKET, held_count=0,
+    )
+    assert opens == []
+
+
+def test_enforce_moderate_rating_scales_size_down():
+    from etoro_bot.arena.trader import enforce
+
+    base = {"action": "open", "symbol": "AAPL", "direction": "long",
+            "size_pct": 20.0, "confidence": None, "reason": ""}
+    full, _ = enforce([{**base, "rating": "buy"}], dna=DNA, cash=10_000.0,
+                      equity=10_000.0, held_symbols=set(), market=MARKET, held_count=0)
+    reduced, _ = enforce([{**base, "rating": "overweight"}], dna=DNA, cash=10_000.0,
+                         equity=10_000.0, held_symbols=set(), market=MARKET, held_count=0)
+    assert reduced[0]["amount_usd"] == round(full[0]["amount_usd"] * 0.6, 2)
+
+
+def test_decide_reports_contract_violation_on_bad_output():
+    from etoro_bot.arena.trader import decide
+
+    outcome = decide(lambda **k: "nessun json qui", model="m", max_tokens=10, prompt="p")
+    assert outcome.actions == []
+    assert outcome.violation == "invalid_json"
+
+
+def test_decide_reports_llm_error():
+    from etoro_bot.arena.trader import decide
+
+    def boom(**kwargs):
+        raise RuntimeError("giù")
+
+    outcome = decide(boom, model="m", max_tokens=10, prompt="p")
+    assert outcome.actions == []
+    assert outcome.violation is not None and outcome.violation.startswith("llm_error")
+
+
+def test_decide_empty_array_is_abstention_not_violation():
+    from etoro_bot.arena.trader import decide
+
+    outcome = decide(lambda **k: "[]", model="m", max_tokens=10, prompt="p")
+    assert outcome.actions == []
+    assert outcome.violation is None
