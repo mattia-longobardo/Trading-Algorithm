@@ -164,6 +164,41 @@ def test_sim_costs_from_settings():
     assert SimCosts.from_settings({}) == SimCosts()
 
 
+def test_walk_forward_failure_blocks_champion_promotion(repo, monkeypatch):
+    """Il vincitore del mese senza walk-forward valido non tocca il campione live."""
+    from etoro_bot.arena import replay as replay_module
+
+    monkeypatch.setattr(
+        replay_module, "run_replay",
+        lambda *a, **k: {"return_pct": -5.0, "max_drawdown_pct": 50.0,
+                         "trades": 3, "final_equity": 9_500.0,
+                         "max_dd": None, "bars": 10},
+    )
+    old_champion_id = repo.create_agent(
+        "G0-Alfa", 0, clamp_dna(DEFAULT_DNA), "", "2026-06", 10_000.0
+    )
+    repo.retire_agent(old_champion_id)
+    repo.set_champion(old_champion_id)
+    winner_id = repo.create_agent(
+        "G1-Alfa", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0
+    )
+    repo.create_agent("G1-Beta", 1, clamp_dna(DEFAULT_DNA), "", "2026-07", 10_000.0)
+    # il vincitore chiude il mese in positivo
+    assert repo.open_sim_position(winner_id, "AAPL", 1, 1_000.0, 100.0, "t")
+    pos = repo.sim_positions(winner_id)[0]
+    repo.close_sim_position(pos.id, 120.0, "tp")
+    repo.set_setting("arena", {"month": "2026-07"}, source="test")
+
+    deps = make_deps(repo, settings={"watchlist": ["AAPL"]})
+    deps.client = object()  # basta un client non-None: run_replay è mockato
+    summary = maybe_evolve(deps, now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    assert summary is not None
+    assert summary["survivor"] == "G1-Alfa"
+    assert summary["promoted_champion"] is False
+    champion = repo.champion()
+    assert champion is not None and champion.id == old_champion_id
+
+
 # ------------------------------------------------------------------ stop/take
 
 

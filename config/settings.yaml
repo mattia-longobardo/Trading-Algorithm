@@ -21,6 +21,15 @@ arena:
     spread_pct: 0.2                   # spread pieno; metà applicata per lato
     fee_usd: 1.0                      # fee fissa per lato
     short_overnight_pct_per_day: 0.03 # costo per notte degli short sintetici
+  # Walk-forward: il DNA vincitore del mese viene rigiocato in replay storico
+  # out-of-sample prima di diventare campione live. Se fallisce le soglie il
+  # torneo prosegue ma il campione (e quindi il live) resta il precedente.
+  walk_forward:
+    enabled: true
+    days: 60                # finestra storica del replay
+    symbols_limit: 15       # primi N simboli della watchlist (bound sui costi API/LLM)
+    min_return_pct: 0       # ritorno minimo per la promozione
+    max_drawdown_pct: 30    # drawdown massimo tollerato
   # Sessioni di borsa (UTC, orari estivi). A fine sessione si chiudono solo le
   # posizioni che hanno esaurito il max_holding_days del DNA: lo swing resta
   # aperto oltre la campanella.
