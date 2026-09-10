@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etoro-bot"
+version = "3.0.0"
+description = "Trading Bot evolutivo: arena di agenti LLM in day trading + live col campione"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.50",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "requests>=2.31",
+    "numpy>=1.26",
+    "sqlalchemy>=2",
+    "psycopg[binary]>=3.1",
+    "alembic>=1.13",
+    "python-multipart>=0.0.9",
+    "cryptography>=45.0",
+    "python-arango>=8.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "apscheduler>=3.10",
+]
+# Kronos (forecast/vendor): opzionale perché torch pesa ~2GB sull'immagine.
+forecast = [
+    "torch>=2.0",
+    "pandas>=2.2",
+    "einops>=0.8",
+    "huggingface_hub>=0.23",
+    "safetensors>=0.4",
+    "tqdm>=4",
+]
+rag = [
+    "python-arango>=8.0",
+    "fastembed>=0.3",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "openpyxl>=3.1",
+    "pypdf>=4.0",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.4",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+include = ["etoro_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# codice vendorizzato (Kronos, MIT): non nostro, non si linta
+extend-exclude = ["etoro_bot/forecast/vendor"]

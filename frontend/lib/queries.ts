@@ -1,0 +1,405 @@
+"use client";
+
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+
+import { api, errorMessage, ApiError } from "@/lib/api";
+import type {
+  AgentDetail,
+  AppSettings,
+  AccountCredentials,
+  ArenaEventsResponse,
+  ArenaOverview,
+  ArenaStateResponse,
+  AuditResponse,
+  BacktestSummary,
+  EquityCurve,
+  ExecutionsResponse,
+  FxRates,
+  IngestResult,
+  KnowledgeStatus,
+  MonthlyReturns,
+  Portfolio,
+  SettingsUpdate,
+  Status,
+  TradesResponse,
+  TradeHistoryItem,
+  TradeItem,
+  NewsItem,
+  DateRangeValue,
+} from "@/lib/types";
+
+/** Intervallo di polling standard: 15 secondi. */
+export const POLL_MS = 15_000;
+
+// ---------------------------------------------------------------- queries
+
+export function useStatus() {
+  return useQuery<Status>({
+    queryKey: ["status"],
+    queryFn: () => api.get<Status>("/status"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useArena() {
+  return useQuery<ArenaOverview>({
+    queryKey: ["arena"],
+    queryFn: () => api.get<ArenaOverview>("/arena"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+/**
+ * `poll: false` per le card della panoramica: lì il dettaglio di ogni agente
+ * accompagna una lista già in polling, e un intervallo per card moltiplicava
+ * le richieste (N+1 di rete). La pagina di dettaglio del singolo agente resta
+ * in polling.
+ */
+export function useArenaAgent(agentId: string | null, poll = true) {
+  return useQuery<AgentDetail>({
+    queryKey: ["arena", "agents", agentId],
+    queryFn: () => api.get<AgentDetail>(`/arena/agents/${agentId}`),
+    refetchInterval: poll ? POLL_MS : false,
+    enabled: Boolean(agentId),
+  });
+}
+
+export function useArenaEvents(limit = 100) {
+  return useQuery<ArenaEventsResponse>({
+    queryKey: ["arena", "events", limit],
+    queryFn: () => api.get<ArenaEventsResponse>(`/arena/events?limit=${limit}`),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useExecutions(limit = 50) {
+  return useQuery<ExecutionsResponse>({
+    queryKey: ["executions", limit],
+    queryFn: () => api.get<ExecutionsResponse>(`/executions?limit=${limit}`),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function usePortfolio() {
+  return useQuery<Portfolio>({
+    queryKey: ["portfolio"],
+    queryFn: () => api.get<Portfolio>("/portfolio"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+function withRange(path: string, range?: DateRangeValue) {
+  if (!range) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}date_from=${encodeURIComponent(range.from)}&date_to=${encodeURIComponent(range.to)}`;
+}
+
+export function useBacktestSummary(range?: DateRangeValue) {
+  return useQuery<BacktestSummary>({
+    queryKey: ["backtest", "summary", range?.from, range?.to],
+    queryFn: () => api.get<BacktestSummary>(withRange("/backtest/summary", range)),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useEquityCurve(benchmark = "spy", range?: DateRangeValue) {
+  return useQuery<EquityCurve>({
+    queryKey: ["backtest", "equity-curve", benchmark, range?.from, range?.to],
+    queryFn: () => api.get<EquityCurve>(withRange(`/backtest/equity-curve?benchmark=${encodeURIComponent(benchmark)}`, range)),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useBacktestTrades() {
+  return useQuery<TradesResponse>({
+    queryKey: ["backtest", "trades"],
+    queryFn: () => api.get<TradesResponse>("/backtest/trades"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useMonthlyReturns() {
+  return useQuery<MonthlyReturns>({
+    queryKey: ["backtest", "monthly-returns"],
+    queryFn: () => api.get<MonthlyReturns>("/backtest/monthly-returns"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useKnowledgeStatus() {
+  return useQuery<KnowledgeStatus>({
+    queryKey: ["knowledge", "status"],
+    queryFn: () => api.get<KnowledgeStatus>("/knowledge/status"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useSettings(enabled = true) {
+  return useQuery<AppSettings>({
+    queryKey: ["settings"],
+    queryFn: () => api.get<AppSettings>("/settings"),
+    refetchInterval: POLL_MS,
+    enabled,
+  });
+}
+
+/**
+ * Tassi USD→valuta per la conversione di visualizzazione.
+ * I cambi BCE si muovono una volta al giorno: inutile il polling a 15s.
+ */
+export function useFxRates(enabled = true) {
+  return useQuery<FxRates>({
+    queryKey: ["fx", "rates"],
+    queryFn: () => api.get<FxRates>("/fx/rates"),
+    staleTime: 30 * 60_000,
+    refetchInterval: 60 * 60_000,
+    enabled,
+  });
+}
+
+export function useSettingsAudit() {
+  return useQuery<AuditResponse>({
+    queryKey: ["settings", "audit"],
+    queryFn: () => api.get<AuditResponse>("/settings/audit"),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useAccountCredentials() {
+  return useQuery<AccountCredentials>({
+    queryKey: ["account", "credentials"],
+    queryFn: () => api.get<AccountCredentials>("/account/credentials"),
+  });
+}
+
+export function useTrades(statuses: string[] = [], symbol = "") {
+  const params = new URLSearchParams({ statuses: statuses.join(","), symbol });
+  return useQuery<{ trades: TradeItem[] }>({
+    queryKey: ["trades", statuses.join(","), symbol],
+    queryFn: () => api.get(`/trades?${params.toString()}`),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useTradeHistory(statuses: string[] = [], range?: DateRangeValue, symbol = "") {
+  const params = new URLSearchParams({ statuses: statuses.join(","), symbol });
+  if (range) {
+    params.set("date_from", range.from);
+    params.set("date_to", range.to);
+  }
+  return useQuery<{ items: TradeHistoryItem[] }>({
+    queryKey: ["trade-history", statuses.join(","), range?.from, range?.to, symbol],
+    queryFn: () => api.get(`/trade-history?${params.toString()}`),
+    refetchInterval: POLL_MS,
+  });
+}
+
+export function useNews() {
+  return useQuery<{ items: NewsItem[]; updated_at: string | null }>({
+    queryKey: ["news"],
+    queryFn: () => api.get("/news"),
+    refetchInterval: 60_000,
+  });
+}
+
+// -------------------------------------------------------------- mutations
+
+export function useTriggerCycle() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<{ status: string }>("/arena/cycle"),
+    onSuccess: () => {
+      toast.success("Ciclo di allenamento avviato", {
+        description: "Gli agenti stanno decidendo: i risultati compaiono a breve",
+      });
+      void qc.invalidateQueries({ queryKey: ["arena"] });
+    },
+    onError: (err) => {
+      toast.error("Avvio ciclo fallito", { description: errorMessage(err) });
+    },
+  });
+}
+
+export function useArenaPause() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (pause: boolean) =>
+      api.post<ArenaStateResponse>(pause ? "/arena/pause" : "/arena/resume"),
+    onSuccess: (_data, pause) => {
+      toast.success(pause ? "Allenamento in pausa" : "Allenamento ripreso");
+      void qc.invalidateQueries({ queryKey: ["arena"] });
+      void qc.invalidateQueries({ queryKey: ["status"] });
+    },
+    onError: (err) =>
+      toast.error("Operazione fallita", { description: errorMessage(err) }),
+  });
+}
+
+export function useLiveToggle() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (enable: boolean) =>
+      enable
+        ? api.post<ArenaStateResponse>("/live/enable", { confirmation: true })
+        : api.post<ArenaStateResponse>("/live/disable"),
+    onSuccess: (_data, enable) => {
+      toast.success(
+        enable ? "TRADING LIVE ATTIVATO" : "Trading live disattivato",
+        enable
+          ? { description: "Il campione opera con denaro reale sul conto eToro" }
+          : undefined,
+      );
+      void qc.invalidateQueries({ queryKey: ["status"] });
+      void qc.invalidateQueries({ queryKey: ["arena"] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 422) {
+        toast.error("Attivazione respinta dal backend", { description: err.detail });
+      } else {
+        toast.error("Operazione live fallita", { description: errorMessage(err) });
+      }
+    },
+  });
+}
+
+export function useKillSwitch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (activate: boolean) =>
+      activate ? api.post<unknown>("/kill-switch") : api.del<unknown>("/kill-switch"),
+    onSuccess: (_data, activate) => {
+      toast.success(
+        activate ? "KILL SWITCH ATTIVATO" : "Kill switch disattivato",
+      );
+      void qc.invalidateQueries({ queryKey: ["status"] });
+    },
+    onError: (err) => {
+      toast.error("Operazione kill switch fallita", {
+        description: errorMessage(err),
+      });
+    },
+  });
+}
+
+export function useUpdateSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (update: SettingsUpdate) =>
+      api.put<AppSettings>("/settings", update),
+    onSuccess: () => {
+      toast.success("Impostazioni aggiornate");
+      void qc.invalidateQueries({ queryKey: ["settings"] });
+      void qc.invalidateQueries({ queryKey: ["status"] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 422) {
+        toast.error("Modifica respinta dal backend", {
+          description: err.detail,
+        });
+      } else {
+        toast.error("Aggiornamento impostazioni fallito", {
+          description: errorMessage(err),
+        });
+      }
+    },
+  });
+}
+
+export function useUpdateCredentials() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      etoro_api_key?: string;
+      etoro_user_key?: string;
+      openai_api_key?: string;
+    }) => api.put<AccountCredentials>("/account/credentials", body),
+    onSuccess: () => {
+      toast.success("Chiavi personali aggiornate");
+      void qc.invalidateQueries({ queryKey: ["account", "credentials"] });
+      void qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (err) => toast.error("Salvataggio chiavi fallito", { description: errorMessage(err) }),
+  });
+}
+
+export function useCloseTrade() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (positionId: string | number) =>
+      api.post(`/trades/${positionId}/close`, { confirmation: "CHIUDI" }),
+    onSuccess: () => {
+      toast.success("Posizione chiusa");
+      void qc.invalidateQueries({ queryKey: ["trades"] });
+      void qc.invalidateQueries({ queryKey: ["trade-history"] });
+      void qc.invalidateQueries({ queryKey: ["portfolio"] });
+    },
+    onError: (err) => toast.error("Chiusura fallita", { description: errorMessage(err) }),
+  });
+}
+
+export function useCancelExecution() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (executionId: string) => api.post(`/executions/${executionId}/cancel`),
+    onSuccess: () => {
+      toast.success("Ordine annullato");
+      void qc.invalidateQueries({ queryKey: ["trades"] });
+      void qc.invalidateQueries({ queryKey: ["trade-history"] });
+    },
+    onError: (err) => toast.error("Annullamento fallito", { description: errorMessage(err) }),
+  });
+}
+
+export function useUpdateRssFeeds() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (feeds: string[]) => api.put<{ rss_feeds: string[] }>("/knowledge/rss-feeds", { feeds }),
+    onSuccess: () => {
+      toast.success("Feed RSS aggiornati");
+      void qc.invalidateQueries({ queryKey: ["knowledge"] });
+    },
+    onError: (err) => toast.error("Aggiornamento feed fallito", { description: errorMessage(err) }),
+  });
+}
+
+export function useFetchNews() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<unknown>("/knowledge/fetch-news"),
+    onSuccess: () => {
+      toast.success("Fetch news avviato");
+      void qc.invalidateQueries({ queryKey: ["knowledge"] });
+    },
+    onError: (err) => {
+      toast.error("Fetch news fallito", { description: errorMessage(err) });
+    },
+  });
+}
+
+/** Upload multipart (file + tickers opzionali): non passa da `lib/api.ts`
+ * (che serializza sempre JSON) — fetch diretto, niente Content-Type esplicito
+ * così il browser imposta il boundary multipart corretto. */
+export function useIngestDocument() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (formData: FormData) =>
+      api.postForm<IngestResult>("/knowledge/ingest", formData),
+    onSuccess: (data) => {
+      const detected = data.tickers?.length
+        ? `titoli rilevati: ${data.tickers.join(", ")}`
+        : "nessun titolo dell'universo rilevato";
+      toast.success("Documento indicizzato nella knowledge base", {
+        description: `${data.chunks_indexed} chunk da ${data.filename} — ${detected}`,
+      });
+      void qc.invalidateQueries({ queryKey: ["knowledge"] });
+    },
+    onError: (err) => {
+      toast.error("Ingestione fallita", { description: errorMessage(err) });
+    },
+  });
+}

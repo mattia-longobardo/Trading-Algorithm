@@ -1,0 +1,240 @@
+# Default di configurazione. Precedenza a runtime: app_settings (DB) > questo file > env.
+# Le chiavi API vivono SOLO nelle credenziali cifrate (UI), mai qui.
+timezone: Europe/Rome      # solo presentazione: orari mostrati in questo fuso
+currency: USD              # valuta di visualizzazione; i dati restano in USD
+risk_free_rate_pct: 5.0    # T-bill 3M, usato da Sharpe/Sortino
+benchmark_symbol: SPY
+
+# Arena evolutiva: due agenti LLM rivali in trading simulato (long e short,
+# intraday o swing, secondo il loro DNA); a fine mese sopravvive solo chi è in
+# profitto e davanti al rivale. Lo stato runtime (mese, pausa, live) vive in
+# app_settings sotto la chiave "arena".
+arena:
+  starting_capital_usd: 10000   # budget mensile di ogni agente, in USD (journal USD-nativo)
+  cycle_minutes: 15             # un ciclo di decisioni ogni 15 minuti di borsa (era 5)
+  max_symbols: 80               # titoli mostrati ai trader per ciclo
+  survival_floor_pct: 25        # equity sotto il 25% dell'iniziale = bancarotta immediata (0 = disattivo)
+  # Costi di transazione del conto simulato: senza, il PnL dell'arena (che
+  # decide quale DNA va live con denaro reale) è sistematicamente ottimistico.
+  # Valori prudenti allineati allo screening universo (max spread 1%).
+  costs:
+    spread_pct: 0.2                   # spread pieno; metà applicata per lato
+    fee_usd: 1.0                      # fee fissa per lato
+    short_overnight_pct_per_day: 0.03 # costo per notte degli short sintetici
+  # Walk-forward: il DNA vincitore del mese viene rigiocato in replay storico
+  # out-of-sample prima di diventare campione live. Se fallisce le soglie il
+  # torneo prosegue ma il campione (e quindi il live) resta il precedente.
+  # Pipeline decisionale multi-stadio (TradingAgents): Analyst -> Bull/Bear ->
+  # Trader -> Risk judge. 5 chiamate LLM per agente per ciclo: i candidati
+  # sono pre-filtrati. Disattivata = singola chiamata trader come prima.
+  pipeline:
+    enabled: true
+    candidates: 12
+  # Vivaio evolutivo su replay: al cambio generazione si valutano K varianti
+  # di DNA sullo storico e al mese live vanno le 2 migliori. Costa K replay
+  # con chiamate LLM: attivare quando model_quick è economico.
+  evolution_pool:
+    enabled: false
+    variants: 4
+    days: 45
+    symbols_limit: 15
+  # Decay del campione live (Vibe-Trading): Sharpe/drawdown rolling sotto
+  # soglia per K sere consecutive = monitoring; per 2K = decayed (live off).
+  champion_decay:
+    enabled: true
+    window_days: 30
+    min_sharpe: -0.5
+    max_drawdown_pct: 15
+    breach_days: 3
+  walk_forward:
+    enabled: true
+    days: 60                # finestra storica del replay
+    symbols_limit: 15       # primi N simboli della watchlist (bound sui costi API/LLM)
+    min_return_pct: 0       # ritorno minimo per la promozione
+    max_drawdown_pct: 30    # drawdown massimo tollerato
+  # Sessioni di borsa (UTC, orari estivi). A fine sessione si chiudono solo le
+  # posizioni che hanno esaurito il max_holding_days del DNA: lo swing resta
+  # aperto oltre la campanella.
+  markets:
+    europe:
+      open_utc: "07:00"         # 09:00 CEST (Milano/Xetra/Parigi/Amsterdam/Londra)
+      close_utc: "15:30"
+    usa:
+      open_utc: "13:30"         # NYSE 9:30 ET
+      close_utc: "20:00"
+
+watchlist:
+  # USA — tech & growth
+  - AAPL
+  - MSFT
+  - NVDA
+  - GOOGL
+  - AMZN
+  - META
+  - TSLA
+  - AVGO
+  - AMD
+  - NFLX
+  - CRM
+  - ORCL
+  - INTC
+  - QCOM
+  - MU
+  - PLTR
+  - UBER
+  - PYPL
+  - COIN
+  # USA — finanza, salute, consumi, energia, industria
+  - JPM
+  - BAC
+  - GS
+  - V
+  - UNH
+  - LLY
+  - MRK
+  - PFE
+  - ABBV
+  - COST
+  - WMT
+  - HD
+  - MCD
+  - NKE
+  - DIS
+  - XOM
+  - COP
+  - CAT
+  - BA
+  - GE
+  # USA — ETF
+  - SPY
+  - QQQ
+  - IWM
+  - XLK
+  - XLE
+  # Europa (symbolFull eToro: suffisso = borsa)
+  - ENEL.MI
+  - ENI.MI
+  - ISP.MI
+  - UCG.MI
+  - RACE.MI
+  - G.MI
+  - LDO.MI
+  - STLAM.MI
+  - SAP.DE
+  - SIE.DE
+  - DTE.DE
+  - ALV.DE
+  - BMW.DE
+  - BAS.DE
+  - IFX.DE
+  - ASML.NV
+  - ADYEN.NV
+  - INGA.NV
+  - MC.PA
+  - TTE.PA
+  - AIR.PA
+  - OR.PA
+  - SAN.PA
+  - BNP.PA
+  - SU.PA
+  - SAN.MC
+  - IBE.MC
+  - BBVA.MC
+  - NESN.ZU
+  - NOVN.ZU
+  - AZN.L
+  - SHEL.L
+  - HSBA.L
+  - ULVR.L
+  - NOVO-B.CO
+
+
+# Scoperta dinamica dell'universo: uno scout LLM legge le news del giorno e
+# propone candidati (con tesi e confidence); le citazioni esplicite nelle news
+# corroborano il punteggio e fanno da fallback se l'LLM non è disponibile.
+# Ogni candidato deve superare uno screening di affidabilità deterministico
+# (prezzo, storico, liquidità, volatilità, spread). Si sommano alla watchlist.
+universe_discovery:
+  enabled: true
+  mode: llm                          # llm (scout + fallback regex) | regex
+  size: 8                            # titoli dinamici oltre alla watchlist
+  llm_max_proposals: 10              # tetto alle proposte dello scout
+  min_confidence: 0.5                # confidence minima di una proposta
+  keep_misses: 3                     # refresh senza riconferma prima di uscire
+  min_mentions: 2                    # item news distinti per candidarsi (regex)
+  max_evaluated: 20                  # candidati ammessi allo screening
+  min_price_usd: 5.0                 # niente penny stock
+  min_history_days: 120              # niente IPO fresche
+  min_avg_dollar_volume_usd: 20000000
+  max_annualized_vol_pct: 60
+  max_spread_pct: 1.0
+  news_half_life_days: 3.0           # peso citazioni: dimezza ogni 3 giorni
+
+knowledge:
+  news_half_life_days: 7.0           # in ricerca le news dimezzano peso ogni 7g
+  news_max_age_days: 45              # oltre: eliminate dalla KB (i documenti restano)
+  ticker_memory:
+    enabled: true
+    retention_days: 30               # le notizie escono dalla memoria dopo 30g
+    max_entries: 40
+    use_llm: true                    # sintesi evolutiva via LLM (fallback: headline)
+
+# Kronos (foundation model per candele, vendorizzato in forecast/vendor):
+# opt-in — richiede `pip install -e backend[forecast]` (torch). Il segnale va
+# usato cross-sezionalmente (kronos_rank) e VALIDATO nel replay prima di
+# dargli peso: zero-shot la precisione direzionale su singolo titolo è debole.
+forecast:
+  kronos:
+    enabled: false
+    model: NeoQuasar/Kronos-small
+    tokenizer: NeoQuasar/Kronos-Tokenizer-base
+    lookback: 200
+    pred_len: 5
+    sample_count: 3
+    max_symbols: 40
+
+llm:
+  model: gpt-5.6-terra
+  # Due tier (pattern TradingAgents): quick per analista/dibattito, deep per
+  # trader e risk judge. Assenti = si usa `model` per tutto. Impostare un
+  # modello economico su model_quick è la leva di costo principale della
+  # pipeline (5 chiamate/ciclo/agente invece di 1).
+  # model_quick: <modello economico>
+  # model_deep: <modello di punta>
+  max_tokens: 2048
+
+news_feeds:
+  generic:
+    - https://feeds.content.dowjones.io/public/rss/mw_topstories
+    - https://www.cnbc.com/id/100003114/device/rss/rss.html
+    # Fintech e mercati tech (contesto per analista sentiment/macro)
+    - https://techcrunch.com/category/fintech/feed/
+    - https://www.cnbc.com/id/19854910/device/rss/rss.html   # CNBC Technology
+    # Avanzamento tecnologico generale (scoperte, ricerca, prodotto)
+    - https://techcrunch.com/feed/
+    - https://www.technologyreview.com/feed/                  # MIT Technology Review
+    - https://www.wired.com/feed/rss
+    - https://feeds.arstechnica.com/arstechnica/index
+    - https://hnrss.org/frontpage                             # Hacker News, prima pagina
+    # Mercati e macro (utili, economia, flash di mercato)
+    - https://www.cnbc.com/id/20910258/device/rss/rss.html    # CNBC Economy
+    - https://www.cnbc.com/id/15839135/device/rss/rss.html    # CNBC Earnings
+    - https://feeds.content.dowjones.io/public/rss/mw_marketpulse
+    # Finanza e banche
+    - https://www.cnbc.com/id/10000664/device/rss/rss.html    # CNBC Finance
+    - https://www.bankingdive.com/feeds/news/
+    # Energia, utility e materie prime
+    - https://www.cnbc.com/id/19836768/device/rss/rss.html    # CNBC Energy
+    - https://oilprice.com/rss/main
+    - https://www.utilitydive.com/feeds/news/
+    - https://www.mining.com/feed/
+    # Salute, pharma e biotech
+    - https://www.cnbc.com/id/10000108/device/rss/rss.html    # CNBC Health Care
+    - https://www.fiercepharma.com/rss/xml
+    - https://www.fiercebiotech.com/rss/xml
+    # Industria e difesa
+    - https://www.defensenews.com/arc/outboundfeeds/rss/?outputType=xml
+    # Consumo e retail
+    - https://www.retaildive.com/feeds/news/
+  per_ticker:
+    - "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
