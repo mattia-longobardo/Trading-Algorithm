@@ -1,3 +1,5 @@
+name: projects
+
 services:
 
 # Trading App (Backend FastAPI + Frontend Next.js Unificato) # -------------------------------------------------------------------
