@@ -30,11 +30,15 @@ frontend/*.tsbuildinfo
 # AI tooling
 .claude/
 .superpowers/
+.codex/
+graphify-out/
+AGENTS.md
+CLAUDE.m
 
 # Runtime v3
 state/*
 !state/.gitkeep
-# Report generati a runtime (per utente): dati, non sorgenti
+# Report generation at runtime (per user): data, not sources
 reports/*
 !reports/.gitkeep
 data/
